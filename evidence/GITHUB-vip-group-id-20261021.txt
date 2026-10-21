@@ -1,0 +1,12 @@
+# GITHUB / VPS DEPLOY — 2026-10-21 16:55:43 +0700
+repo=https://github.com/thanhbn123/vip-group-id
+repo_visibility=public
+repo_branch=main
+repo_commit=2a9d17b
+old_repo=https://github.com/thanhbn123/vip-group-cowork (mirror)
+vps_path=/srv/vip-staging/cowork
+vps_origin=https://github.com/thanhbn123/vip-group-id.git
+vps_commit=2a9d17b
+container=Up 45 hours (healthy)
+public={"ok":true,"data":{"app":"cowork","version":"1.0.0","db":"ok","brain":"bat","gio":"2026-10-21T16:55:44+07:00"}}
+brain={"ok":true,"data":{"phienBan":"g02","gio":"2026-10-21T16:55:44+07:00","db":"ok"}}
