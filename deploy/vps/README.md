@@ -36,7 +36,7 @@ Chỉ sau khi chủ dự án duyệt:
 
 ## Trạng thái đã chạy (19/10/2026 20:18)
 
-- Repo GitHub: `https://github.com/thanhbn123/vip-group-cowork` (public, branch `main`).
+- Repo GitHub: `https://github.com/thanhbn123/vip-group-id` (public, branch `main`).
 - VPS: `/srv/vip-staging/cowork`, container `cowork-staging` healthy, `127.0.0.1:8899`.
 - DB copy production: integrity ok, 7 user, 110 audit, schema 2.
 - Login owner staging: 200 `/`, `/api/me` 200 Super Admin.

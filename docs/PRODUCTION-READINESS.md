@@ -130,7 +130,7 @@
 
 ## 7. VPS STAGING (19/10/2026 20:18)
 
-- GitHub public: `https://github.com/thanhbn123/vip-group-cowork`.
+- GitHub public: `https://github.com/thanhbn123/vip-group-id`.
 - VPS `CIITNRVPlinux`: `/srv/vip-staging/cowork`, container `cowork-staging` healthy, `127.0.0.1:8899`.
 - DB copy production: 7 user, 110 audit, schema 2, integrity ok; login owner 200.
 - **Chưa cutover**: Caddy vẫn 18835 → Studio; Brain internal vẫn Studio.
