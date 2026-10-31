@@ -26,7 +26,12 @@ bên COWORK. Sinh trên máy chủ, chmod 600, KHÔNG dán vào hội thoại/lo
 - **Máy không có quyền root** (vd user `deploy` trên 160.22.170.20): cron.
   `crontab -e` thêm:
   ```
-  */10 * * * * . $HOME/.config/cowork-agent/env && /usr/bin/python3 $HOME/.local/opt/cowork-agent/hatang_agent.py >> $HOME/.local/state/cowork-agent.log 2>&1
+  */10 * * * * set -a; . $HOME/.config/cowork-agent/env; set +a; /usr/bin/python3 $HOME/.local/opt/cowork-agent/hatang_agent.py >> $HOME/.local/state/cowork-agent.log 2>&1
+
+  ⚠ PHẢI có `set -a` quanh lượt nạp env: `.` trong sh chỉ đặt BIẾN SHELL, không
+  export, nên python sẽ không thấy — đã dính thật trên 160.22.170.20 lúc 22:40
+  31/10/2026 (hai lượt cron đầu báo "Thiếu HATANG_MAY_CHU…" trong khi chạy tay
+  với `set -a` thì chạy ngon — đúng dạng §12.1 ca 8: đo thiếu một ca).
   ```
   Phần không đo được vì thiếu quyền (Caddyfile, một số unit) agent tự bỏ qua
   và màn hình hiện "—" — thiếu một phép đo không làm chết cả lượt.
