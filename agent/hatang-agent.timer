@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Hạ tầng COWORK — 10 phút/lượt (anh Thành chốt 31/10/2026)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
