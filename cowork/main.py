@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import config, db, web
 from .errors import AuthRequired, CoworkError, Forbidden, NotFound, ValidationError
-from .routers import (accounts, audit_routes, auth_routes, brain_routes, dashboard,
+from .routers import (accounts, audit_routes, auth_routes, brain_routes, dashboard, hatang,
                       departments, internal, modules, roles, settings_routes)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -40,6 +40,7 @@ app.include_router(departments.router, tags=["departments"])
 app.include_router(roles.router, tags=["roles"])
 app.include_router(modules.router, tags=["modules"])
 app.include_router(audit_routes.router, tags=["audit"])
+app.include_router(hatang.router, tags=["hatang"])
 app.include_router(settings_routes.router, tags=["settings"])
 app.include_router(brain_routes.router, tags=["brain"])
 app.include_router(internal.router, tags=["internal"])

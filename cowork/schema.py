@@ -1,7 +1,7 @@
 """Schema + dữ liệu nền COWORK. Idempotent: chạy nhiều lần không nhân đôi dữ liệu."""
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -216,6 +216,23 @@ CREATE TABLE IF NOT EXISTS settings(
     updated_by TEXT,
     PRIMARY KEY(tenant_id, key)
 );
+
+-- Hạ tầng: sổ máy chủ được phép báo cáo (danh sách TRẮNG — agent lạ bị từ chối)
+-- và ảnh chụp cuối của mỗi máy. V1 chỉ giữ ảnh chụp cuối, không giữ lịch sử.
+CREATE TABLE IF NOT EXISTS hatang_may_chu(
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    ip TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hatang_bao_cao(
+    may_chu TEXT PRIMARY KEY REFERENCES hatang_may_chu(code) ON DELETE CASCADE,
+    do_luc TEXT,
+    nhan_luc TEXT NOT NULL,
+    du_lieu TEXT NOT NULL
+);
 """
 
 #: Module registry mặc định. `route` là đường dẫn COWORK; module cần Brain sẽ mở qua ticket.
@@ -234,6 +251,7 @@ MODULES = [
     ("roles", "Vai trò", "Ma trận quyền theo vai trò", "/vai-tro", "shield", "admin", 130, 0, 80),
     ("permissions", "Phân quyền module", "Quyền riêng của từng nhân sự", "/phan-quyen", "key", "admin", 140, 0, 80),
     ("modules", "Module", "Bật/tắt và cấu hình module", "/module-registry", "grid", "admin", 150, 0, 80),
+    ("hatang", "Hạ tầng", "Cấu hình và trạng thái các máy chủ", "/ha-tang", "server", "admin", 155, 0, 100),
     ("audit", "Nhật ký", "Sổ kiểm toán quản trị", "/nhat-ky", "list", "admin", 160, 0, 80),
     ("settings", "Cài đặt", "Tenant, phiên, kết nối VIP AI Brain", "/cai-dat", "gear", "admin", 170, 0, 80),
 ]
@@ -271,6 +289,7 @@ PERMISSIONS = [
     ("permissions", "grant", "Cấp/thu hồi quyền module"),
     ("modules", "view", "Xem module registry"),
     ("modules", "manage", "Bật/tắt và cấu hình module"),
+    ("hatang", "view", "Xem hạ tầng máy chủ"),
     ("audit", "view", "Xem nhật ký quản trị"),
     ("settings", "view", "Xem cài đặt"),
     ("settings", "manage", "Sửa cài đặt"),

@@ -1,0 +1,12 @@
+# Agent Hạ tầng → COWORK. Cài cho máy chạy bằng root (vd VPS 160.22.171.228):
+#   cp hatang_agent.py /opt/cowork-agent/ ; cp *.service *.timer /etc/systemd/system/
+#   tạo /etc/cowork-agent/env (xem README) ; systemctl daemon-reload
+#   systemctl enable --now hatang-agent.timer
+[Unit]
+Description=Đo máy chủ và gửi ảnh chụp về COWORK
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/cowork-agent/env
+ExecStart=/usr/bin/python3 /opt/cowork-agent/hatang_agent.py

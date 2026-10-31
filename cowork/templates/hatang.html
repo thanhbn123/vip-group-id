@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% import "macros.html" as ui %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">HẠ TẦNG</p>
+    <h1>Máy chủ</h1>
+    <p class="muted">{{ may_chu|length }} máy trong sổ · agent tự đo và gửi về 10 phút/lượt ·
+      quá {{ tre_phut }} phút không có tin là <b>MẤT TÍN HIỆU</b>.</p>
+  </div>
+</section>
+
+{% if tong_cb > 0 %}
+<section class="card" style="border-color:var(--red);margin-bottom:14px">
+  <div class="card-head">
+    <h2>{{ ui.icon('alert', 18) }} {{ tong_cb }} cảnh báo</h2>
+  </div>
+  <div class="card-body">
+    <ul style="margin:0;padding-left:18px">
+      {% for m in may_chu %}{% for cb in m.canh_bao %}
+      <li><b>{{ m.name }}</b> ({{ m.ip }}): {{ cb }}</li>
+      {% endfor %}{% endfor %}
+    </ul>
+  </div>
+</section>
+{% endif %}
+
+{% for m in may_chu %}
+{% set dl = m.du_lieu or {} %}
+{% set ch = dl.get('cauHinh') or {} %}
+{% set tt = dl.get('trangThai') or {} %}
+{% set dich_vu = dl.get('dichVu') or [] %}
+{% set dv_chay = dich_vu | selectattr('act', 'equalto', 'active') | list %}
+{% set docker = dl.get('docker') or [] %}
+{% set vault = dl.get('vault') or {} %}
+<section class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <h2>{{ ui.icon('server', 18) }} {{ m.name }}
+      {% if m.trang_thai == 'on-dinh' %}<span class="badge status-ok">ỔN ĐỊNH</span>
+      {% elif m.trang_thai == 'mat-tin-hieu' %}<span class="badge status-danger">MẤT TÍN HIỆU</span>
+      {% else %}<span class="badge status-warn">CẢNH BÁO</span>{% endif %}
+    </h2>
+    <span class="muted mono">{{ m.ip }} · đo lúc {{ m.do_luc or '—' }} · COWORK nhận {{ m.nhan_luc or '—' }}</span>
+  </div>
+  <div class="card-body">
+    {% if not dl %}
+    <p class="muted">Chưa có báo cáo nào từ máy này.</p>
+    {% else %}
+    <div class="stat-grid">
+      <article class="stat-card">
+        <span class="stat-ico green">{{ ui.icon('clock', 20) }}</span>
+        <div><small>Chạy liên tục</small>
+          <b>{{ (tt.get('uptimeGiay', 0) / 86400) | round | int }} ngày</b>
+          <span>tải 1 phút: {{ tt.get('load1', '—') }}</span></div>
+      </article>
+      <article class="stat-card">
+        <span class="stat-ico blue">{{ ui.icon('chart', 20) }}</span>
+        <div><small>RAM</small>
+          <b>{{ (tt.get('ramDungMb', 0) / 1024) | round(1) }} / {{ (ch.get('ramMb', 0) / 1024) | round(1) }} GB</b>
+          <span>{{ ch.get('cpu', '—') }}</span></div>
+      </article>
+      <article class="stat-card">
+        <span class="stat-ico teal">{{ ui.icon('grid', 20) }}</span>
+        <div><small>Đĩa</small>
+          <b>{{ tt.get('diaDung', '—') }} / {{ ch.get('diaTong', '—') }}</b>
+          <span>{{ tt.get('diaDungPhanTram', '—') }}% đã dùng</span></div>
+      </article>
+      <article class="stat-card">
+        <span class="stat-ico gold">{{ ui.icon('check-circle', 20) }}</span>
+        <div><small>Đang phục vụ</small>
+          <b>{{ dv_chay|length }}{% if dich_vu %} / {{ dich_vu|length }}{% endif %} dịch vụ</b>
+          <span>{{ docker|length }} container docker</span></div>
+      </article>
+    </div>
+
+    <details class="detail-toggle">
+      <summary>Thông số cấu hình</summary>
+      <div class="table-wrap">
+        <table class="table">
+          <tbody>
+            <tr><th>Máy</th><td>{{ ch.get('hostname', '—') }} · {{ m.ip }}{% if ch.get('tailscale') %} · Tailscale {{ ch.get('tailscale') }}{% endif %}</td></tr>
+            <tr><th>Hệ điều hành</th><td>{{ ch.get('os', '—') }} · kernel {{ ch.get('kernel', '—') }}</td></tr>
+            <tr><th>CPU</th><td>{{ ch.get('cpu', '—') }} — {{ ch.get('nhanCpu', '—') }} nhân</td></tr>
+            <tr><th>RAM / Swap</th><td>{{ (ch.get('ramMb', 0) / 1024) | round(1) }} GB / {{ (ch.get('swapMb', 0) / 1024) | round | int }} GB swap</td></tr>
+            {% if ch.get('postgres') %}<tr><th>PostgreSQL</th><td>{{ ch.get('postgres') }}</td></tr>{% endif %}
+            {% if ch.get('caddySite') %}<tr><th>Caddy</th><td>{{ ch.get('caddySite') }} khối site</td></tr>{% endif %}
+            <tr><th>systemd / Docker</th><td>{{ ch.get('unitTuViet', '—') }} unit tự viết · {{ docker|length }} container</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    {% if dv_chay %}
+    <details class="detail-toggle">
+      <summary>Dịch vụ đang chạy ({{ dv_chay|length }})</summary>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th scope="col">Dịch vụ</th><th scope="col">RAM</th><th scope="col">Tự khởi động lại</th></tr></thead>
+          <tbody>
+            {% for d in dv_chay %}
+            <tr><td class="mono">{{ d.ten }}</td>
+                <td>{% if d.memBytes %}{{ (d.memBytes / 1048576) | round | int }} MB{% else %}—{% endif %}</td>
+                <td>{{ d.nr or 0 }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    {% if docker %}
+    <details class="detail-toggle">
+      <summary>Container docker ({{ docker|length }})</summary>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th scope="col">Container</th><th scope="col">Trạng thái</th></tr></thead>
+          <tbody>
+            {% for c in docker %}
+            <tr><td class="mono">{{ c.ten }}</td><td>{{ c.trangThai }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    {% if vault %}
+    <p class="muted" style="margin-top:10px">Sao lưu VIP Vault:
+      {% if vault.get('status') == 'healthy' %}<span class="badge status-ok">healthy</span>
+      {% else %}<span class="badge status-danger">{{ vault.get('status', '?') }}</span>{% endif %}
+      · lượt cuối {{ vault.get('last_backup_iso', '—') }}</p>
+    {% endif %}
+    {% endif %}
+  </div>
+</section>
+{% endfor %}
+
+<p class="muted" style="font-size:12.5px">Mỗi ảnh chụp do agent trên chính máy đó đo
+(systemd, /proc, df, docker, VIP Vault) rồi đẩy về bằng HMAC — COWORK không giữ
+khoá SSH nào. Cảnh báo ở đây là lớp báo THỨ HAI; <code>canh-bao.py</code> trên hệ
+vận hành vẫn là nơi báo thứ nhất (anh Thành chốt 31/10/2026: cả hai cùng báo).</p>
+{% endblock %}

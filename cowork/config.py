@@ -35,6 +35,7 @@ DATA_DIR = _path("COWORK_DATA_DIR", BASE_DIR / "data")
 DB_PATH = _path("COWORK_DB_PATH", DATA_DIR / "cowork.db")
 SECRET_FILE = DATA_DIR / "secret.key"
 BRAIN_SECRET_FILE = DATA_DIR / "brain_secret.key"
+HATANG_SECRET_FILE = DATA_DIR / "hatang_secret.key"
 
 APP_NAME = "VIP GROUP COWORK"
 APP_VERSION = "1.0.0"
@@ -93,6 +94,12 @@ def _secret(path: Path, env_name: str, size: int = 48) -> str:
 
 SECRET_KEY = _secret(SECRET_FILE, "COWORK_SECRET_KEY")
 BRAIN_SHARED_SECRET = _secret(BRAIN_SECRET_FILE, "COWORK_BRAIN_SHARED_SECRET")
+
+# Hạ tầng: bí mật HMAC riêng cho các agent máy chủ (KHÔNG dùng chung với Brain —
+# lộ một bên thì bên kia còn), và ngưỡng coi một máy là MẤT TÍN HIỆU.
+# Agent đo 10 phút/lượt (anh Thành chốt 31/10); trễ = 2,5 chu kỳ.
+HATANG_SHARED_SECRET = _secret(HATANG_SECRET_FILE, "COWORK_HATANG_SHARED_SECRET")
+HATANG_TRE_PHUT = int(os.environ.get("COWORK_HATANG_TRE_PHUT", "25"))
 
 
 def ensure_dirs() -> None:

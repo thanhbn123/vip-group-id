@@ -86,6 +86,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def _seed(conn: sqlite3.Connection) -> None:
     now = now_iso()
+    # Hai máy chủ anh Thành chốt 31/10/2026; thêm máy mới = thêm dòng vào
+    # hatang_may_chu (INSERT OR IGNORE nên không ghi đè máy đã có/đã tắt).
+    for code, name, ip in (
+        ("vps-160-22-171-228", "VPS sản xuất VIP Order", "160.22.171.228"),
+        ("vps-160-22-170-20", "VPS staging & COWORK", "160.22.170.20"),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO hatang_may_chu(code, name, ip, enabled, created_at) "
+            "VALUES(?,?,?,1,?)", (code, name, ip, now))
     conn.execute(
         "INSERT OR IGNORE INTO tenants(id, name, status, created_at) VALUES(?,?, 'active', ?)",
         (config.TENANT_MAC_DINH, "VIP GROUP", now),
