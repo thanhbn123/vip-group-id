@@ -313,6 +313,9 @@ def kiem_cau_hinh() -> None:
             os.environ.get("VIPID_SHARED_SECRET", ""), os.environ.get("COWORK_SHARED_SECRET", "")]
     if any(k and hmac.compare_digest(k, bi_mat) for k in khac):
         loi.append("VIPID_PORTAL_SECRET phải KHÁC mọi bí mật khác (Brain, phiên, hạ tầng).")
+    from . import crm_launch  # nạp lười: crm_launch chỉ import khach bên trong hàm
+    if crm_launch.trung_voi_launch_crm(bi_mat):
+        loi.append("VIPID_PORTAL_SECRET phải KHÁC COWORK_CRM_LAUNCH_SECRET.")
     if la_production():
         for ten, url in (("CRM_PORTAL_PUBLIC_URL", config.CRM_PORTAL_PUBLIC_URL),
                          ("COWORK_KHACH_PUBLIC_URL", config.KHACH_PUBLIC_URL),

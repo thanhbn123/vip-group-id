@@ -287,3 +287,30 @@ def test_lien_thong_voi_verify_cowork_token_cua_crm():
     assert ok == {"payload": p}
     assert hong == {"error": "TOKEN_SIGNATURE"}
     assert sai_khoa == {"error": "TOKEN_SIGNATURE"}
+
+
+# ───────── chiều ngược trong khach.kiem_cau_hinh (vòng 9 B-2) ─────────
+
+@pytest.fixture()
+def realm_khach_bat(monkeypatch):
+    monkeypatch.setattr(config, "KHACH_ENABLED", True)
+    monkeypatch.setattr(config, "KHACH_HOSTS", ["khach.localhost:8898", "khach.localhost"])
+    monkeypatch.setattr(config, "STAFF_HOSTS", ["testserver"])
+    monkeypatch.setattr(config, "CRM_PORTAL_PUBLIC_URL", "http://crm.localhost:8897")
+    monkeypatch.setattr(config, "CRM_PORTAL_INTERNAL_URL", "http://127.0.0.1:8897")
+
+
+def test_khach_tu_choi_portal_secret_trung_launch_crm(monkeypatch, realm_khach_bat):
+    from cowork import khach
+    monkeypatch.setattr(khach, "_bi_mat_cache", BI_MAT)
+    with pytest.raises(RuntimeError, match="KHÁC COWORK_CRM_LAUNCH_SECRET"):
+        khach.kiem_cau_hinh()
+
+
+def test_khach_portal_secret_khac_launch_crm_thi_khong_bao(monkeypatch, realm_khach_bat):
+    from cowork import khach
+    monkeypatch.setattr(khach, "_bi_mat_cache", "portal-" + BI_MAT)
+    try:
+        khach.kiem_cau_hinh()
+    except RuntimeError as e:
+        assert "COWORK_CRM_LAUNCH_SECRET" not in str(e)
