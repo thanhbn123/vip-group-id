@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% import "macros.html" as ui %}
+{% block content %}
+<section class="brain-hero">
+  <div class="brain-hero-main">
+    <span class="brain-orb">{{ ui.icon('users', 30) }}</span>
+    <div>
+      <p class="eyebrow light">CRM VIP GROUP · MỘT CRM THỐNG NHẤT</p>
+      <h1>Quản lý khách hàng</h1>
+      <p class="brain-lead">Duyệt đăng ký, cấp mã khách, kiện hàng và vận đơn. Mở từ COWORK bằng danh tính đã xác thực, không đăng nhập lần hai.</p>
+      <div class="brain-chips">
+        <span class="brain-chip"><i class="live-dot"></i> {{ 'Sẵn sàng' if not loi else 'Chưa cấu hình' }}</span>
+        {% if tenant_crm %}<span class="brain-chip">Đơn vị CRM: {{ tenant_crm }}</span>{% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="brain-hero-side">
+    {% if co_use and not loi %}
+    <form method="post" action="/crm/mo">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn btn-gold btn-lg btn-block" type="submit" autofocus>{{ ui.icon('external', 18) }} Mở CRM</button>
+    </form>
+    <p class="brain-hint">Token một lần · hết hạn sau 60 giây</p>
+    {% elif loi %}
+    <button class="btn btn-ghost btn-lg btn-block" type="button" disabled>CRM chưa sẵn sàng</button>
+    {% else %}
+    <button class="btn btn-ghost btn-lg btn-block" type="button" disabled>Chưa được cấp quyền mở CRM</button>
+    {% endif %}
+  </div>
+</section>
+
+{% if loi %}
+<div class="callout warn">
+  <b>{{ ui.icon('alert', 16) }} Kết nối CRM chưa được cấu hình</b>
+  <p>{{ loi | join(' · ') }}</p>
+</div>
+{% endif %}
+
+<div class="dash-grid">
+  <section class="card span-2">
+    <div class="card-head"><div><h2>Liên kết tài khoản CRM</h2><p class="muted">Quản trị CRM gán mã này vào hồ sơ nhân sự của bạn trong CRM (một lần).</p></div></div>
+    <dl class="kv tight">
+      <div><dt>Mã liên kết</dt><dd class="break"><code>{{ subject }}</code></dd></div>
+      <div><dt>CRM</dt><dd class="break">{{ crm_url }}</dd></div>
+    </dl>
+    <p class="muted">Nếu CRM báo "chưa được ánh xạ", gửi mã liên kết này cho quản trị CRM. Quyền bên trong CRM (đơn vị, đại lý, kho) do CRM quyết định.</p>
+  </section>
+  <aside class="card">
+    <div class="card-head"><div><h2>Lần mở gần đây</h2></div></div>
+    {% if nhat_ky %}
+    <ul class="activity">
+      {% for r in nhat_ky %}
+      <li><span class="act-ico">{{ ui.icon('external', 15) }}</span>
+        <div class="act-body"><p><b>Mở CRM</b> <span class="muted">· {{ r.created_at|dt }}</span></p>
+        <small>{{ r.ip or '—' }} · token một lần</small></div></li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="empty-line">Chưa có lần mở nào.</p>{% endif %}
+  </aside>
+</div>
+{% endblock %}

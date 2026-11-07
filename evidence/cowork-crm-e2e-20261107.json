@@ -1,0 +1,105 @@
+{
+  "title": "E2E thật COWORK → CRM (cowork-launch/1)",
+  "date": "2026-11-07",
+  "cowork": "feature/cowork-crm@a41911d (uvicorn local)",
+  "crm": "vip-group-khoqctq main 66e3470, instance TEST local 127.0.0.1:5197, DB vipcrm5_cowork_e2e (dữ liệu giả, bí mật test)",
+  "verdict": "PASS 9/9",
+  "note": "Cookie CRM local thiếu Secure là do dev http; production bật Secure.",
+  "cases": {
+    "csp_form_action": "form-action 'self' http://127.0.0.1:18892 http://127.0.0.1:5197",
+    "A_owner_launch": {
+      "cowork": 303,
+      "dest": "/api/auth/cowork/launch",
+      "status": 302,
+      "location": "/",
+      "cookie_vip_session": true,
+      "cookie_flags": [
+        "HttpOnly",
+        "SameSite=Strict"
+      ],
+      "crm_me": {
+        "status": 200,
+        "username": "vip.admin",
+        "tenant": "VIP",
+        "role": "vip_admin"
+      }
+    },
+    "B_replay_same_url": {
+      "status": 401,
+      "location": null,
+      "error": {
+        "code": "TOKEN_REPLAYED",
+        "message": "Token COWORK đã được sử dụng"
+      },
+      "cookie_vip_session": false,
+      "cookie_flags": []
+    },
+    "C_staff_kho": {
+      "cowork": 303,
+      "status": 302,
+      "location": "/",
+      "cookie_vip_session": true,
+      "cookie_flags": [
+        "HttpOnly",
+        "SameSite=Strict"
+      ],
+      "crm_me": {
+        "status": 200,
+        "username": "kho.sz",
+        "tenant": "VIP",
+        "role": "warehouse_staff"
+      }
+    },
+    "D_unlinked": {
+      "cowork": 303,
+      "status": 401,
+      "location": null,
+      "error": {
+        "code": "SUBJECT_UNKNOWN",
+        "message": "VIP ID chưa được ánh xạ tới tài khoản CRM hoạt động"
+      },
+      "cookie_vip_session": false,
+      "cookie_flags": []
+    },
+    "E_customer_kind": {
+      "cowork": 303,
+      "status": 403,
+      "location": null,
+      "error": {
+        "code": "CUSTOMER_ON_STAFF_PATH",
+        "message": "Tài khoản khách hàng không đăng nhập được vào CRM nhân viên"
+      },
+      "cookie_vip_session": false,
+      "cookie_flags": []
+    },
+    "F_no_permission": {
+      "get_crm": 403,
+      "post_mo": 403
+    },
+    "G_partner_granted": {
+      "get_crm": 403,
+      "post_mo": 403
+    },
+    "H_expired_62s": {
+      "cowork": 303,
+      "status": 401,
+      "location": null,
+      "error": {
+        "code": "TOKEN_EXPIRED",
+        "message": "Token COWORK đã hết hạn"
+      },
+      "cookie_vip_session": false,
+      "cookie_flags": []
+    },
+    "I_audit": {
+      "rows": 5,
+      "actors": [
+        "anh-thanh",
+        "khach-thu",
+        "nv-chua-lk",
+        "nv-kho-sz"
+      ],
+      "token_in_audit": false
+    }
+  }
+}

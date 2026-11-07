@@ -127,14 +127,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # form-action kiểm tra CẢ đích redirect: POST /brain/mo trả 303 sang
         # ai.vipgroup.com.vn, nên chỉ 'self' sẽ bị Chrome/Safari chặn và người dùng
         # ở lại /brain dù server đã tạo ticket. Chỉ mở đúng origin Brain.
-        brain_origin = ""
-        try:
-            parts = urlsplit(config.BRAIN_PUBLIC_URL)
+        # Tương tự POST /crm/mo → 303 sang crm.vipgroup.com.vn (§15.6).
+        def _origin(url: str) -> str:
+            try:
+                parts = urlsplit(url)
+            except ValueError:
+                return ""
             if parts.scheme in ("http", "https") and parts.netloc:
-                brain_origin = f"{parts.scheme}://{parts.netloc}"
-        except ValueError:
-            brain_origin = ""
-        form_action = "'self'" + (f" {brain_origin}" if brain_origin else "")
+                return f"{parts.scheme}://{parts.netloc}"
+            return ""
+        origins = [o for o in (_origin(config.BRAIN_PUBLIC_URL),
+                               _origin(config.CRM_PUBLIC_URL) if config.CRM_ENABLED else "") if o]
+        form_action = " ".join(["'self'"] + list(dict.fromkeys(origins)))
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
