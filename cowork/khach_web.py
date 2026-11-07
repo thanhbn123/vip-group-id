@@ -184,10 +184,27 @@ def gui_lai(request: Request, email: str = Form(""), csrf_form: str = Form("", a
 
 
 @khach_app.get("/tai-khoan/xac-minh-email")
-def xac_minh_email(request: Request, t: str = ""):
+def xac_minh_email_form(request: Request, t: str = ""):
+    """GET KHÔNG tiêu token (trình quét email mở link trước) — chỉ hiện nút xác nhận."""
     conn = db.connect()
     try:
-        acc = khach.xac_minh_email(conn, t, request)
+        ok = khach.xem_token(conn, t, "kich_hoat_email") is not None
+    finally:
+        conn.close()
+    if not ok:
+        return _render(request, "xac_minh.html", 400, page_title="Xác minh email", ok=False)
+    return _render(request, "xac_minh.html", page_title="Xác minh email", xac_nhan=True,
+                   token=t)
+
+
+@khach_app.post("/tai-khoan/xac-minh-email")
+def xac_minh_email(request: Request, t: str = Form(""),
+                   csrf_form: str = Form("", alias="_csrf")):
+    if not _kiem_csrf(request, csrf_form):
+        return _loi_csrf(request)
+    conn = db.connect()
+    try:
+        acc = khach.xac_minh_email(conn, t[:200], request)
     finally:
         conn.close()
     if not acc:

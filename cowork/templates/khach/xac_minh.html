@@ -1,6 +1,15 @@
 {% extends "khach/base.html" %}
 {% block content %}
-{% if ok %}
+{% if xac_nhan %}
+<p class="kh-eyebrow">Xác minh email</p>
+<h1>Xác nhận email của bạn</h1>
+<p>Bấm nút dưới đây để hoàn tất xác minh email cho tài khoản cổng khách hàng VIP GROUP.</p>
+<form method="post" action="/tai-khoan/xac-minh-email" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="t" value="{{ token }}">
+  <button class="kh-btn" type="submit">Xác nhận email</button>
+</form>
+{% elif ok %}
 <p class="kh-eyebrow">Đã xác minh email</p>
 <h1>Cảm ơn bạn!</h1>
 <div class="kh-alert kh-alert-ok" role="status">Email của bạn đã được xác minh.</div>
