@@ -970,10 +970,31 @@ def xep_hang_crm(conn, kind: str, idem_key: str, subject: str, path: str, payloa
     return row_id
 
 
+CRM_LEASE_GIAY = 60  # > thời gian chờ CRM tối đa; lượt chết giữa chừng ⇒ hết hạn rồi lượt khác nhận
+
+
+def _nhan_dong(conn, row_id: int) -> bool:
+    """Nhận (claim) NGUYÊN TỬ một dòng trước khi gửi: chỉ một lượt (vòng nền, CLI, tiến trình
+    khác) gửi được mỗi dòng trong thời hạn lease ⇒ không gửi trùng."""
+    now = _bay_gio()
+    cur = conn.execute(
+        "UPDATE crm_sync_pending SET claimed_until=? WHERE id=? AND done_at IS NULL "
+        "AND (claimed_until IS NULL OR claimed_until<?)",
+        (_iso(now + timedelta(seconds=CRM_LEASE_GIAY)), row_id, _iso(now)))
+    conn.commit()
+    return cur.rowcount == 1
+
+
 def thu_gui(conn, row_id: int) -> bool:
+    """Gửi một dòng hàng đợi nếu nhận được nó. Trả True chỉ khi CHÍNH lượt này gửi thành công."""
+    return _nhan_dong(conn, row_id) and _gui_da_nhan(conn, row_id)
+
+
+def _gui_da_nhan(conn, row_id: int) -> bool:
+    """Gửi một dòng mà lượt hiện tại ĐÃ nhận (claim)."""
     row = db.one(conn, "SELECT * FROM crm_sync_pending WHERE id=?", (row_id,))
     if not row or row["done_at"]:
-        return bool(row)
+        return False
     body = row["body"].encode("utf-8")
     headers = {"Content-Type": "application/json", "Idempotency-Key": row["idem_key"],
                **ky_portal(HUONG_RA, "POST", row["path"], body)}
@@ -985,11 +1006,12 @@ def thu_gui(conn, row_id: int) -> bool:
         ok, loi = False, f"{type(exc).__name__}: {str(exc)[:150]}"
     n = int(row["attempts"]) + 1
     if ok:
-        conn.execute("UPDATE crm_sync_pending SET attempts=?, done_at=?, last_error=NULL "
-                     "WHERE id=?", (n, db.now_iso(), row_id))
+        conn.execute("UPDATE crm_sync_pending SET attempts=?, done_at=?, last_error=NULL, "
+                     "claimed_until=NULL WHERE id=?", (n, db.now_iso(), row_id))
     else:
         tre = min(3600, 30 * 2 ** min(n, 7))
-        conn.execute("UPDATE crm_sync_pending SET attempts=?, last_error=?, next_at=? WHERE id=?",
+        conn.execute("UPDATE crm_sync_pending SET attempts=?, last_error=?, next_at=?, "
+                     "claimed_until=NULL WHERE id=?",
                      (n, loi, _iso(_bay_gio() + timedelta(seconds=tre)), row_id))
         log.warning("Gửi CRM %s thất bại (lần %s): %s", row["idem_key"], n, loi)
     conn.commit()
@@ -1003,10 +1025,17 @@ def dong_bo_crm(conn, tat_ca: bool = False, gioi_han: int = 100) -> dict:
     if not tat_ca:
         sql += " AND next_at<=?"
         params = (db.now_iso(),)
+    sql += " AND (claimed_until IS NULL OR claimed_until<?)"
+    params = (*params, db.now_iso())
     ids = [r["id"] for r in db.q(conn, sql + " ORDER BY id LIMIT ?", (*params, gioi_han))]
-    ok = sum(1 for i in ids if thu_gui(conn, i))
+    thu = ok = 0
+    for i in ids:
+        if not _nhan_dong(conn, i):
+            continue  # lượt khác đã nhận
+        thu += 1
+        ok += 1 if _gui_da_nhan(conn, i) else 0
     con = int(db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending WHERE done_at IS NULL"))
-    return {"thu": len(ids), "thanh_cong": ok, "con_lai": con}
+    return {"thu": thu, "thanh_cong": ok, "con_lai": con}
 
 
 def bao_crm_thu_hoi(conn, subject: str, reason: str) -> None:

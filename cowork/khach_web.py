@@ -12,6 +12,7 @@ import asyncio
 import functools
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
@@ -245,25 +246,45 @@ async def turnstile_siteverify(secret: str, token: str, remoteip: str) -> dict |
         return None
 
 
-TURNSTILE_DONG_THOI_TOI_DA = 4
+TURNSTILE_DONG_THOI_TOI_DA = 16
+TURNSTILE_CHO_SLOT_GIAY = 3.0
+TURNSTILE_IP_MOI_PHUT = 10
 _ts_dang_goi = 0
 
 
 async def _vuot_turnstile(request: Request, token: str,
-                          action: str = khach.TURNSTILE_ACTION) -> bool:
-    """Gọi siteverify với trần đồng thời (không chờ): quá trần ⇒ coi như chưa vượt thử thách."""
+                          action: str = khach.TURNSTILE_ACTION) -> str:
+    """'ok' | 'sai' | 'qua_tan_suat'.
+
+    - Giới hạn số lượt siteverify theo khoá IP (IPv6 /64) TRƯỚC khi gọi: một IP xả token rác
+      không chiếm được các suất gọi của người khác.
+    - Hết suất đồng thời ⇒ chờ ngắn (≤ 3 giây) rồi mới coi như chưa vượt.
+    """
     global _ts_dang_goi
     if not khach.turnstile_bat() or not token or len(token) > 2048:
-        return False
-    if _ts_dang_goi >= TURNSTILE_DONG_THOI_TOI_DA:
-        log.warning("Turnstile: quá %s lượt siteverify đồng thời", TURNSTILE_DONG_THOI_TOI_DA)
-        return False
+        return "sai"
+    conn = db.connect()
+    try:
+        if khach.vuot_tan_suat(conn, "turnstile_ip", _ip_khoa(request), TURNSTILE_IP_MOI_PHUT, 60):
+            khach._ghi_audit(conn, "khach:anon", "khach.turnstile.qua_tan_suat",
+                             detail={"ip": _ip_khoa(request)}, request=request,
+                             lay_mau=_ip_khoa(request))
+            return "qua_tan_suat"
+    finally:
+        conn.close()
+    han = time.monotonic() + TURNSTILE_CHO_SLOT_GIAY
+    while _ts_dang_goi >= TURNSTILE_DONG_THOI_TOI_DA:
+        if time.monotonic() >= han:
+            log.warning("Turnstile: hết %s suất siteverify sau %ss chờ", TURNSTILE_DONG_THOI_TOI_DA,
+                        TURNSTILE_CHO_SLOT_GIAY)
+            return "sai"
+        await asyncio.sleep(0.05)
     _ts_dang_goi += 1
     try:
         kq = await turnstile_siteverify(khach.turnstile_secret(), token, web.ip_cua(request))
     finally:
         _ts_dang_goi -= 1
-    return khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"), action)
+    return "ok" if khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"), action) else "sai"
 
 
 def _ua(request: Request) -> str:
@@ -307,10 +328,16 @@ async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
         return _loi_csrf(request)
     # Turnstile cấu hình ⇒ BẮT BUỘC cho mọi lượt đăng ký (chống đăng ký/giữ chỗ hàng loạt);
     # chỉ gọi siteverify sau khi CSRF/cùng nguồn đạt.
-    if khach.turnstile_bat() and not (
-            cf_token and await _vuot_turnstile(request, cf_token, khach.TURNSTILE_ACTION_DANG_KY)):
-        return _form_dang_ky(request, 400, loi="Vui lòng xác nhận bạn không phải máy rồi gửi lại.",
-                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
+    if khach.turnstile_bat():
+        kq = (await _vuot_turnstile(request, cf_token, khach.TURNSTILE_ACTION_DANG_KY)
+              if cf_token else "sai")
+        if kq != "ok":
+            form = {"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]}
+            if kq == "qua_tan_suat":
+                return _form_dang_ky(request, 429, form=form,
+                                     loi="Bạn đã thử quá nhiều lần. Vui lòng đợi 1 phút rồi thử lại.")
+            return _form_dang_ky(request, 400, form=form,
+                                 loi="Vui lòng xác nhận bạn không phải máy rồi gửi lại.")
     return await _chay_kdf(request, _dang_ky, request, ho_ten, sdt, email, mat_khau,
                            mat_khau_2, dong_y)
 
@@ -377,7 +404,12 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
         conn.close()
     if thu_thach is not None:
         # CHỈ gọi siteverify sau khi CSRF/cùng nguồn đạt VÀ chính lớp chặn đòi thử thách.
-        if not cf_token or not await _vuot_turnstile(request, cf_token):
+        kq = await _vuot_turnstile(request, cf_token) if cf_token else "sai"
+        if kq == "qua_tan_suat":
+            return _loi_dang_nhap(request, khach.ThuThach(
+                "Bạn đã thử quá nhiều lần. Vui lòng đợi 1 phút rồi thử lại.", 429, "THU_THACH"),
+                dinh_danh)
+        if kq != "ok":
             return _loi_dang_nhap(request, thu_thach, dinh_danh)
         ts_ok = True
     return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi,

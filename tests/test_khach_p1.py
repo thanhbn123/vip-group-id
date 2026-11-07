@@ -2062,3 +2062,120 @@ def test_n5_5_loi_nang_cap_khong_sap_realm_nhan_vien(client, bat, crm, owner):
     # Host khách không được phục vụ (realm coi như tắt; Host không thuộc danh sách nhân viên ⇒ 421).
     r = KC().get("/tai-khoan/dang-nhap")
     assert r.status_code == 421
+
+
+# ================================================================== rà soát vòng 6
+def test_r6_1_ip_xa_token_rac_khong_lam_hong_dang_ky_cua_nguoi_khac(kh, monkeypatch, turnstile):
+    import asyncio
+    import httpx
+    from cowork import khach_web
+    _ip(monkeypatch)
+    cham = {"giay": 0.3}
+    goc = khach_web.turnstile_siteverify
+
+    async def _cham(secret, token, remoteip):
+        await asyncio.sleep(cham["giay"])
+        return await goc(secret, token, remoteip)
+    monkeypatch.setattr(khach_web, "turnstile_siteverify", _cham)
+    tok = csrf_tu(kh.get("/tai-khoan/dang-ky").text)
+    ck = "; ".join(f"{k}={v}" for k, v in kh.cookies.items())
+
+    def form(n, cf):
+        return {"ho_ten": f"Khách {n}", "sdt": f"09000000{n:02d}", "email": "", "mat_khau": MK,
+                "mat_khau_2": MK, "dong_y": "1", "_csrf": tok, "cf-turnstile-response": cf}
+
+    async def chay():
+        tr = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=tr, base_url=HOST_KHACH, timeout=30) as c:
+            h = {"cookie": ck, "origin": HOST_KHACH}
+            rac = [asyncio.create_task(c.post("/tai-khoan/dang-ky", data=form(10, f"rac-{i}"),
+                                              headers={**h, "x-real-ip": "203.0.113.66"}))
+                   for i in range(40)]
+            await asyncio.sleep(0.05)
+            tot = await c.post("/tai-khoan/dang-ky", data=form(11, "tot-dk"),
+                               headers={**h, "x-real-ip": "198.51.100.66"})
+            kq_rac = await asyncio.gather(*rac)
+            return tot, [r.status_code for r in kq_rac]
+
+    tot, codes = asyncio.run(chay())
+    assert tot.status_code == 303, tot.text[:300]
+    assert acc_theo_sdt("+84900000011")["status"] == "cho_duyet"
+    # IP xả rác: tối đa 10 lượt/phút được gọi siteverify, phần còn lại 429 không gọi.
+    assert codes.count(429) == 40 - khach_web.TURNSTILE_IP_MOI_PHUT
+    assert len(turnstile) == khach_web.TURNSTILE_IP_MOI_PHUT  # 'rac-*' rơi vào danh sách chung
+
+
+def test_r6_1_het_suat_thi_cho_ngan_roi_qua(kh, monkeypatch, turnstile):
+    import asyncio
+    import threading
+    from cowork import khach_web
+    _ip(monkeypatch)
+    monkeypatch.setattr(khach_web, "_ts_dang_goi", khach_web.TURNSTILE_DONG_THOI_TOI_DA)
+    # Một suất được trả sau 0.3 giây ⇒ request chờ rồi vẫn vượt được.
+    threading.Timer(0.3, lambda: setattr(khach_web, "_ts_dang_goi",
+                                         khach_web.TURNSTILE_DONG_THOI_TOI_DA - 1)).start()
+    r = dang_ky(KC(), 1, headers={"x-real-ip": "198.51.100.70"})
+    assert r.status_code == 303
+    monkeypatch.setattr(khach_web, "_ts_dang_goi", khach_web.TURNSTILE_DONG_THOI_TOI_DA)
+    monkeypatch.setattr(khach_web, "TURNSTILE_CHO_SLOT_GIAY", 0.2)
+    r = dang_ky(KC(), 2, headers={"x-real-ip": "198.51.100.71"})
+    assert r.status_code == 400  # hết suất quá lâu ⇒ coi như chưa vượt
+
+
+def test_r6_1_dang_nhap_thu_thach_bi_gioi_han_theo_ip(kh, monkeypatch, turnstile):
+    from cowork import khach_web
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    _do_phan_tan()
+    moi = KC()
+    for i in range(khach_web.TURNSTILE_IP_MOI_PHUT):
+        _dang_nhap_ts(moi, "0900000001", MK, "10.99.1.1", cf=f"rac{i}")
+    n = len(turnstile)
+    r = _dang_nhap_ts(moi, "0900000001", MK, "10.99.1.1", cf="tot")
+    assert r.status_code == 429 and "quá nhiều lần" in r.text and len(turnstile) == n
+    token_launch(_dang_nhap_ts(moi, "0900000001", MK, "10.99.2.1", cf="tot"))
+
+
+def test_r6_2_ba_luot_dong_thoi_moi_dong_gui_mot_lan(kh, crm):
+    import threading
+    for n in (1, 2, 3):
+        dang_ky(kh, n)
+    crm.cham = 0.2
+    rao = threading.Barrier(3)
+
+    def luot():
+        conn = db.connect()
+        try:
+            rao.wait()
+            khach.dong_bo_crm(conn, tat_ca=True)
+        finally:
+            conn.close()
+    ts = [threading.Thread(target=luot) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(crm.goi_that) == 3
+    assert len({g["headers"]["Idempotency-Key"] for g in crm.goi_that}) == 3
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending WHERE done_at IS NULL") == 0
+        assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending WHERE claimed_until IS NOT NULL") == 0
+    finally:
+        conn.close()
+
+
+def test_r6_2_lease_het_han_thi_luot_khac_nhan(kh, crm):
+    dang_ky(kh, 1)
+    conn = db.connect()
+    try:
+        row_id = db.scalar(conn, "SELECT id FROM crm_sync_pending")
+        assert khach._nhan_dong(conn, row_id)          # lượt A nhận rồi "chết"
+        assert not khach._nhan_dong(conn, row_id)      # lượt B không nhận được trong lease
+        assert khach.dong_bo_crm(conn, tat_ca=True)["thu"] == 0
+        conn.execute("UPDATE crm_sync_pending SET claimed_until='2020-01-01T00:00:00+07:00'")
+        conn.commit()
+        assert khach.dong_bo_crm(conn, tat_ca=True) == {"thu": 1, "thanh_cong": 1, "con_lai": 0}
+    finally:
+        conn.close()
+    assert len(crm.goi_that) == 1

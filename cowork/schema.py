@@ -332,7 +332,8 @@ CREATE TABLE IF NOT EXISTS crm_sync_pending(
     last_error TEXT,
     next_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    done_at TEXT
+    done_at TEXT,
+    claimed_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_crm_sync_due ON crm_sync_pending(done_at, next_at);
 

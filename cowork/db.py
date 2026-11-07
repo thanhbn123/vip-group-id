@@ -85,6 +85,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _them_cot(conn, "users", "mfa_secret", "TEXT")
     # Realm khách (v4) — cột thêm sau bản đầu của bảng; DB dev cũ được bổ sung.
     _them_cot(conn, "customer_accounts", "phone_conflict_count", "INTEGER NOT NULL DEFAULT 0")
+    _them_cot(conn, "crm_sync_pending", "claimed_until", "TEXT")
     global KHACH_LOI
     KHACH_LOI = None
     try:
