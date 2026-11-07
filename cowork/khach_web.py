@@ -428,6 +428,76 @@ def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | 
     return resp
 
 
+def _dat_cookie_phien(resp: Response, request: Request, token: str, acc: dict) -> None:
+    resp.set_cookie(khach.COOKIE_PHIEN, token, max_age=config.KHACH_SESSION_HOURS * 3600,
+                    path=khach.COOKIE_PATH, httponly=True, samesite="lax",
+                    secure=_secure(request))
+    resp.set_cookie(khach.COOKIE_THIET_BI, khach.tao_thiet_bi(acc),
+                    max_age=config.KHACH_THIET_BI_NGAY * 86400, path=khach.COOKIE_PATH,
+                    httponly=True, samesite="lax", secure=_secure(request))
+
+
+@khach_app.get("/tai-khoan/ho-so")
+def ho_so(request: Request):
+    conn = db.connect()
+    try:
+        ctx = _ctx_phien(request, conn)
+    finally:
+        conn.close()
+    if not ctx:
+        return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
+    acc = ctx["account"]
+    return _render(request, "ho_so.html", page_title="Tài khoản của tôi",
+                   csrf=ctx["session"]["csrf_token"], acc=acc,
+                   sdt_che=khach.che_sdt(acc["phone_e164"]),
+                   da_doi=request.query_params.get("da_doi") == "1")
+
+
+@khach_app.get("/tai-khoan/doi-mat-khau")
+def doi_mat_khau_form(request: Request):
+    conn = db.connect()
+    try:
+        ctx = _ctx_phien(request, conn)
+    finally:
+        conn.close()
+    if not ctx:
+        return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
+    return _render(request, "doi_mat_khau.html", page_title="Đổi mật khẩu",
+                   csrf=ctx["session"]["csrf_token"])
+
+
+@khach_app.post("/tai-khoan/doi-mat-khau")
+async def doi_mat_khau(request: Request, mat_khau_cu: str = Form(""), mat_khau: str = Form(""),
+                       mat_khau_2: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
+    conn = db.connect()
+    try:
+        ctx = _ctx_phien(request, conn)
+        if not ctx:
+            return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
+        if not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
+            return _loi_csrf(request)
+    finally:
+        conn.close()
+    return await _chay_kdf(request, _doi_mat_khau, request, ctx, mat_khau_cu[:200],
+                           mat_khau[:200], mat_khau_2[:200])
+
+
+def _doi_mat_khau(request: Request, ctx: dict, cu: str, moi: str, moi2: str) -> Response:
+    conn = db.connect()
+    try:
+        try:
+            sess, token, acc = khach.doi_mat_khau(conn, ctx, cu, moi, moi2, _ip_khoa(request),
+                                                  _ua(request), request)
+        except khach.KhachLoi as e:
+            return _render(request, "doi_mat_khau.html", e.status, page_title="Đổi mật khẩu",
+                           csrf=ctx["session"]["csrf_token"], loi=e.message)
+    finally:
+        conn.close()
+    resp = RedirectResponse("/tai-khoan/ho-so?da_doi=1", status_code=303)
+    _dat_cookie_phien(resp, request, token, acc)  # phiên mới + cookie thiết bị mới
+    return resp
+
+
 @khach_app.get("/tai-khoan/vao-cong")
 def vao_cong(request: Request):
     conn = db.connect()

@@ -1690,3 +1690,115 @@ def test_migration_v5_dung_khi_co_ma_kieu_cu(client):
     finally:
         conn.close()
     db._initialized = False
+
+
+# ================================================================== hồ sơ + đổi mật khẩu
+def _doi_mk(c, cu, moi, moi2=None, csrf=None, **h):
+    if csrf is None:
+        csrf = csrf_tu(c.get("/tai-khoan/doi-mat-khau").text)
+    return c.post("/tai-khoan/doi-mat-khau", data={"mat_khau_cu": cu, "mat_khau": moi,
+                  "mat_khau_2": moi if moi2 is None else moi2, "_csrf": csrf},
+                  headers=h, follow_redirects=False)
+
+
+def test_ho_so_can_phien_va_hien_thong_tin(kh):
+    for p in ("/tai-khoan/ho-so", "/tai-khoan/doi-mat-khau"):
+        assert kh.get(p, follow_redirects=False).headers["location"] == "/tai-khoan/dang-nhap"
+    tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    r = kh.get("/tai-khoan/ho-so")
+    assert r.status_code == 200
+    t = r.text
+    assert "Khách Thử 1" in t and "VG1001" in t and "khach1@example.test" in t
+    assert khach.che_sdt("+84900000001") in t and "+84900000001" not in t
+    for link in ('href="/tai-khoan/vao-cong"', 'href="/tai-khoan/doi-mat-khau"',
+                 'action="/tai-khoan/dang-xuat"'):
+        assert link in t
+    csp = r.headers["content-security-policy"]
+    assert "script-src 'none'" in csp and "<script" not in t and "style=" not in t
+    assert 'href="/tai-khoan/ho-so"' in kh.get("/tai-khoan/dang-nhap").text
+
+
+def test_doi_mat_khau_thanh_cong(kh, crm):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    khac = KC()  # một thiết bị khác cũng đang đăng nhập
+    token_launch(dang_nhap(khac, "0900000001"))
+    tb_cu = kh.cookies.get("vg_khach_tb")
+    phien_cu = kh.cookies.get("vg_khach")
+    r = _doi_mk(kh, MK, MK_MOI)
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/ho-so?da_doi=1"
+    moi = acc_theo_sdt("+84900000001")
+    assert moi["token_version"] == acc["token_version"] + 1
+    # Phiên hiện tại được thay bằng phiên mới; phiên cũ và thiết bị khác bị đăng xuất.
+    assert kh.cookies.get("vg_khach") != phien_cu
+    assert "Đã đổi mật khẩu" in kh.get("/tai-khoan/ho-so?da_doi=1").text
+    token_launch(kh.get("/tai-khoan/vao-cong", follow_redirects=False))
+    assert khac.get("/tai-khoan/vao-cong", follow_redirects=False).headers["location"] == \
+        "/tai-khoan/dang-nhap"
+    cu = KC()
+    cu.cookies.set("vg_khach", phien_cu, domain="khach.localhost", path="/tai-khoan")
+    assert cu.get("/tai-khoan/vao-cong", follow_redirects=False).headers["location"] == \
+        "/tai-khoan/dang-nhap"
+    # Cookie thiết bị: cũ mất hiệu lực, mới hợp lệ.
+    assert not khach.thiet_bi_hop_le(tb_cu, moi)
+    assert khach.thiet_bi_hop_le(kh.cookies.get("vg_khach_tb"), moi)
+    # Email thông báo, CRM thu hồi phiên portal, audit.
+    mail = outbox("doi_mat_khau", "khach1@example.test")[-1]
+    assert "Mật khẩu vừa được thay đổi" in mail["subject"]
+    assert MK_MOI not in mail["body_text"]
+    assert crm.goi[-1]["url"].endswith("/api/internal/portal/thu-hoi")
+    assert crm.goi[-1]["body"] == {"subject": acc["subject"], "reason": "doi_mat_khau"}
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.doi_mat_khau' "
+                         "AND target_id=?", (acc["subject"],)) == 1
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                         "AND status='active'", (acc["id"],)) == 1
+    finally:
+        conn.close()
+    assert dang_nhap(KC(), "0900000001", MK).status_code == 401
+    token_launch(dang_nhap(KC(), "0900000001", MK_MOI))
+
+
+def test_doi_mat_khau_kiem_du_lieu_csrf_va_cung_nguon(kh):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    for moi, moi2 in (("ngan!A1", None), (MK_MOI, "Khac!Passw0rd-99"), (MK, None),
+                      ("aaaaaaaaaaaaaa", None)):
+        r = _doi_mk(kh, MK, moi, moi2)
+        assert r.status_code == 400, moi
+    assert _doi_mk(kh, MK, MK_MOI, csrf="sai").status_code == 403
+    tok = csrf_tu(kh.get("/tai-khoan/doi-mat-khau").text)
+    assert _doi_mk(kh, MK, MK_MOI, csrf=tok, origin="https://evil.example").status_code == 403
+    tho = TestClient(app, base_url=HOST_KHACH)  # không Origin, không Sec-Fetch-Site
+    tho.cookies.set("vg_khach", kh.cookies.get("vg_khach"), domain="khach.localhost",
+                    path="/tai-khoan")
+    assert _doi_mk(tho, MK, MK_MOI, csrf=tok).status_code == 403
+    # Token CSRF ẩn danh (không phải của phiên) không dùng được.
+    anon = csrf_tu(KC().get("/tai-khoan/dang-nhap").text)
+    assert _doi_mk(kh, MK, MK_MOI, csrf=anon).status_code == 403
+    assert acc_theo_sdt("+84900000001")["token_version"] == acc["token_version"]
+
+
+def test_doi_mat_khau_gioi_han_sai_mat_khau_hien_tai(kh, monkeypatch):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    ip = {"x-real-ip": "203.0.113.20"}
+    token_launch(dang_nhap(kh, "0900000001", headers=ip))
+    for _ in range(khach.DOI_MK_SAI_TOI_DA):
+        assert _doi_mk(kh, "Sai!Passw0rd-xx", MK_MOI, **ip).status_code == 400
+    goi = []
+    orig = khach._scrypt
+    monkeypatch.setattr(khach, "_scrypt", lambda *a: (goi.append(1), orig(*a))[1])
+    r = _doi_mk(kh, MK, MK_MOI, **ip)  # đúng mật khẩu vẫn bị tạm khoá trên IP này
+    assert r.status_code == 429 and goi == []
+    # Theo (tài khoản, IP): IP khác vẫn đổi được.
+    assert _doi_mk(kh, MK, MK_MOI, **{"x-real-ip": "198.51.100.20"}).status_code == 303
+
+
+def test_ten_danh_rieng_moi_tren_host_nhan_vien(client, bat, crm, owner):
+    for n in ("doi-mat-khau", "ho-so"):
+        assert client.get(f"/tai-khoan/{n}", follow_redirects=False).status_code == 404
+        from cowork import security
+        assert security.kiem_tra_id(n)

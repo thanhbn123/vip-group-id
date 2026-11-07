@@ -40,3 +40,8 @@ p{margin:0 0 12px}
 .kh-links{font-size:14px;margin-top:16px}
 .kh-foot{font-size:12.5px;color:var(--muted);padding-bottom:24px;text-align:center}
 @media (min-width:600px){.kh-card{padding:32px 32px}.kh-main{padding-top:48px}}
+.kh-info{display:grid;grid-template-columns:max-content 1fr;gap:8px 16px;margin:16px 0 20px;font-size:15px}
+.kh-info dt{color:var(--muted)}
+.kh-info dd{margin:0}
+.kh-break{word-break:break-all}
+@media (max-width:380px){.kh-info{grid-template-columns:1fr}.kh-info dd{margin-bottom:6px}}

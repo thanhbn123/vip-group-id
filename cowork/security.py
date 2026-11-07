@@ -28,6 +28,7 @@ ID_CAM = {"admin", "root", "system", "cowork", "brain", "superadmin", "super-adm
 TEN_DANH_RIENG_KHACH = {
     "dang-ky", "dang-nhap", "dang-xuat", "quen-mat-khau", "dat-lai", "xac-minh-email",
     "vao-cong", "static", "da-gui-email", "gui-lai-xac-minh", "cho-duyet",
+    "doi-mat-khau", "ho-so",
 }
 MAT_KHAU_CAM = {
     "1234567890", "123456789", "password", "matkhau123", "vipgroup123",

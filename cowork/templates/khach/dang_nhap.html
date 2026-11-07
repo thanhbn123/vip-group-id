@@ -5,6 +5,7 @@
 <h1>Xin chào, {{ da_dang_nhap.display_name }}</h1>
 {% if da_dang_nhap.portal_code %}<p class="kh-muted">Mã khách hàng: <b>{{ da_dang_nhap.portal_code }}</b></p>{% endif %}
 <p><a class="kh-btn" href="/tai-khoan/vao-cong">Vào cổng khách hàng</a></p>
+<p><a class="kh-btn kh-btn-ghost" href="/tai-khoan/ho-so">Tài khoản của tôi</a></p>
 <form method="post" action="/tai-khoan/dang-xuat" class="kh-form-inline">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <button class="kh-btn kh-btn-ghost" type="submit">Đăng xuất</button>

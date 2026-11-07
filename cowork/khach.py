@@ -1237,3 +1237,69 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
               "đăng xuất. Nếu không phải bạn, hãy liên hệ VIP GROUP ngay." + _CHAN_THU)
     bao_crm_thu_hoi(conn, acc["subject"], "dat_lai_mat_khau")
     return acc
+
+
+# ------------------------------------------------------------------ đổi mật khẩu (đã đăng nhập)
+DOI_MK_SAI_TOI_DA = 5
+
+
+def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: str, ip: str,
+                 ua: str | None = None, request=None) -> tuple[dict, str, dict]:
+    """Khách đã đăng nhập đổi mật khẩu. Trả (phiên mới, token phiên mới, account).
+
+    - Sai mật khẩu hiện tại: đếm theo (tài khoản, IP); đủ ngưỡng ⇒ 429 KHÔNG băm.
+    - Thành công: tăng token_version (cookie thiết bị cũ, phiên cũ mất hiệu lực), thu hồi MỌI phiên
+      khác, cấp phiên mới cho trình duyệt hiện tại, email thông báo, báo CRM thu hồi phiên portal.
+    """
+    acc = ctx["account"]
+    khoa = f"{acc['id']}:{ip}"
+    w = config.KHACH_LOGIN_WINDOW_MIN * 60
+    da_sai = int(conn.execute(
+        "SELECT COUNT(*) FROM customer_rate_events WHERE bucket='doi_mk_sai' AND key=? "
+        "AND created_at>=?", (khoa, _truoc(seconds=w))).fetchone()[0])
+    if da_sai >= DOI_MK_SAI_TOI_DA:
+        _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau.tam_khoa", target_id=acc["subject"],
+                   detail={"ip": ip}, request=request, lay_mau=khoa)
+        raise KhachLoi(f"Bạn đã nhập sai mật khẩu hiện tại nhiều lần. Vui lòng thử lại sau "
+                       f"{config.KHACH_LOGIN_WINDOW_MIN} phút.", 429, "TAM_KHOA")
+    mat_khau_cu, mat_khau, mat_khau_2 = mat_khau_cu or "", mat_khau or "", mat_khau_2 or ""
+    if not kiem_mk(mat_khau_cu, acc):
+        conn.execute("INSERT INTO customer_rate_events(bucket, key, created_at) VALUES(?,?,?)",
+                     ("doi_mk_sai", khoa, _iso(_bay_gio())))
+        conn.commit()
+        _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau.sai", target_id=acc["subject"],
+                   detail={"ip": ip}, request=request, lay_mau=khoa)
+        raise KhachLoi("Mật khẩu hiện tại không đúng.", 400, "SAI_MAT_KHAU")
+    loi = security.kiem_tra_do_manh(mat_khau, acc["phone_e164"][3:],
+                                    min_len=config.KHACH_PASSWORD_MIN)
+    if loi:
+        raise KhachLoi(loi)
+    if mat_khau != mat_khau_2:
+        raise KhachLoi("Hai lần nhập mật khẩu mới không khớp.")
+    if hmac.compare_digest(mat_khau, mat_khau_cu):
+        raise KhachLoi("Mật khẩu mới phải khác mật khẩu hiện tại.")
+    hash_b64, salt_b64, algo = bam_mk(mat_khau)
+    now = db.now_iso()
+    cur = conn.execute(
+        "UPDATE customer_accounts SET password_hash=?, password_salt=?, password_algo=?, "
+        "token_version=token_version+1, updated_at=? WHERE id=? AND token_version=? "
+        "AND status='hoat_dong'",
+        (hash_b64, salt_b64, algo, now, acc["id"], acc["token_version"]))
+    conn.commit()
+    if cur.rowcount != 1:  # đổi song song / tài khoản vừa bị khoá
+        raise KhachLoi("Phiên đã thay đổi, vui lòng đăng nhập lại.", 409, "XUNG_DOT")
+    conn.execute("DELETE FROM customer_rate_events WHERE bucket='doi_mk_sai' AND key=?", (khoa,))
+    conn.commit()
+    n = thu_hoi_moi_phien(conn, acc["id"], "Đổi mật khẩu")  # gồm cả phiên hiện tại
+    acc = tai_khoan(conn, acc["id"])
+    sess, token = tao_phien(conn, acc, ip, ua)  # phiên mới cho trình duyệt đang dùng
+    _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau", target_id=acc["subject"],
+               detail={"ip": ip, "phien_khac_thu_hoi": max(0, n - 1)}, request=request)
+    gui_email(conn, acc["id"], acc["email_norm"], "doi_mat_khau",
+              "VIP GROUP — Mật khẩu vừa được thay đổi",
+              f"Chào {acc['display_name']},\n\nMật khẩu cổng khách hàng VIP GROUP của bạn vừa được "
+              "thay đổi. Các phiên đăng nhập trên thiết bị khác đã bị đăng xuất.\n\nNếu không phải "
+              "bạn, hãy đặt lại mật khẩu ngay và liên hệ VIP GROUP:\n"
+              f"{_link('/tai-khoan/quen-mat-khau')}" + _CHAN_THU)
+    bao_crm_thu_hoi(conn, acc["subject"], "doi_mat_khau")
+    return sess, token, acc
