@@ -269,3 +269,11 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
   khi nâng cấp (`scripts/backup.sh`). Tắt cờ `COWORK_KHACH_ENABLED=0` là cách rollback an toàn mà
   không đổi code.
 
+
+### Hợp đồng thu hồi VIP ID → CRM
+`POST {CRM_PORTAL_INTERNAL_URL}/api/internal/portal/thu-hoi` (HMAC `vipid->crm`), body:
+`{subject, reason, revoked_at}` — `reason` ∈ `dang_xuat` | `dat_lai_mat_khau` | `doi_mat_khau`;
+`revoked_at` = **giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**, ghi khi xếp hàng (không
+phải lúc gửi; gửi là bất đồng bộ). CRM từ chối launch token có `iat < revoked_at`. VIP ID lấy
+`revoked_at` TRƯỚC khi tạo phiên mới (đổi mật khẩu), nên launch token phát sau đó có
+`iat >= revoked_at` (cùng giây vẫn hợp lệ).

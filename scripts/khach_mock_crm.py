@@ -1,6 +1,7 @@
 """CRM GIẢ cho thử tay realm khách (chỉ dev, stdlib, nghe 127.0.0.1).
 
-- POST /api/internal/portal/signups, /api/internal/portal/thu-hoi: kiểm HMAC "vipid->crm".
+- POST /api/internal/portal/signups, /api/internal/portal/thu-hoi: kiểm HMAC "vipid->crm";
+  thu-hoi bắt buộc `revoked_at` (giây unix) và chặn launch token có iat < revoked_at.
 - GET  /portal/auth/launch?token=: kiểm launch token HS256 (ver/aud/exp/nonce một lần) và
   hiển thị claims.
 Bí mật đọc từ env VIPID_PORTAL_SECRET hoặc tệp VIPID_PORTAL_SECRET_FILE (không in ra).
@@ -28,6 +29,8 @@ def _secret() -> str:
 
 
 NONCES: set[str] = set()
+#: subject -> revoked_at (giây unix) nhận qua /thu-hoi; launch có iat < revoked_at bị từ chối.
+THU_HOI: dict[str, int] = {}
 
 
 def _b64d(s: str) -> bytes:
@@ -47,6 +50,8 @@ def kiem_launch(token: str) -> dict:
         raise ValueError("ver/aud")
     if not (c["iat"] - 30 <= now < c["exp"]) or c["exp"] - c["iat"] > 60:
         raise ValueError("hết hạn")
+    if c["iat"] < THU_HOI.get(c["sub"], 0):
+        raise ValueError("token phát trước thời điểm thu hồi")
     if c["nonce"] in NONCES:
         raise ValueError("nonce đã dùng")
     NONCES.add(c["nonce"])
@@ -71,6 +76,11 @@ class H(BaseHTTPRequestHandler):
         if not ts.isdigit() or abs(time.time() - int(ts)) > 300 or not hmac.compare_digest(mong, sig):
             return self._tra(401, '{"ok":false}')
         print(f"[mock-crm] {self.path} {raw.decode()}", file=sys.stderr)
+        if urlsplit(self.path).path == "/api/internal/portal/thu-hoi":
+            b = json.loads(raw)
+            if not isinstance(b.get("revoked_at"), int):
+                return self._tra(400, '{"ok":false,"loi":"thiếu revoked_at"}')
+            THU_HOI[b["subject"]] = max(THU_HOI.get(b["subject"], 0), b["revoked_at"])
         return self._tra(200, '{"ok":true}')
 
     def do_GET(self):  # noqa: N802

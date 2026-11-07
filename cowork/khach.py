@@ -871,9 +871,10 @@ def thu_hoi_moi_phien(conn, account_id: str, reason: str) -> int:
 
 def dang_xuat(conn, ctx: dict, request=None) -> None:
     acc = ctx["account"]
+    revoked_at = int(time.time())
     thu_hoi_phien(conn, ctx["session"]["id"], "Khách đăng xuất")
+    bao_crm_thu_hoi(conn, acc["subject"], "dang_xuat", revoked_at)
     _ghi_audit(conn, acc["subject"], "khach.dang_xuat", target_id=acc["subject"], request=request)
-    bao_crm_thu_hoi(conn, acc["subject"], "dang_xuat")
 
 
 # ------------------------------------------------------------------ launch token (HS256)
@@ -1038,9 +1039,13 @@ def dong_bo_crm(conn, tat_ca: bool = False, gioi_han: int = 100) -> dict:
     return {"thu": thu, "thanh_cong": ok, "con_lai": con}
 
 
-def bao_crm_thu_hoi(conn, subject: str, reason: str) -> None:
+def bao_crm_thu_hoi(conn, subject: str, reason: str, revoked_at: int | None = None) -> None:
+    """Xếp hàng thu hồi phiên portal ở CRM. `revoked_at` (giây unix) = lúc thu hồi xảy ra TẠI VIP
+    ID, ghi khi xếp hàng (không phải lúc gửi): CRM từ chối launch token có iat < revoked_at, nên
+    gửi trễ không giết phiên portal mới tạo sau thu hồi. Phải lấy TRƯỚC khi tạo phiên mới."""
+    ts = int(time.time()) if revoked_at is None else int(revoked_at)
     xep_hang_crm(conn, "thu_hoi", f"thu-hoi:{subject}:{reason}:{security.token_moi(6)}",
-                 subject, PATH_THU_HOI, {"subject": subject, "reason": reason})
+                 subject, PATH_THU_HOI, {"subject": subject, "reason": reason, "revoked_at": ts})
 
 
 # ------------------------------------------------------------------ CRM → VIP ID
@@ -1239,15 +1244,16 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
     # Đặt lại thành công ⇒ xoá bộ đếm sai của tài khoản (mọi IP).
     conn.execute("DELETE FROM customer_login_attempts WHERE account_key=? AND success=0", (acc_id,))
     conn.commit()
+    revoked_at = int(time.time())
     n = thu_hoi_moi_phien(conn, acc_id, "Đặt lại mật khẩu")
     acc = tai_khoan(conn, acc_id)
+    bao_crm_thu_hoi(conn, acc["subject"], "dat_lai_mat_khau", revoked_at)
     _ghi_audit(conn, acc["subject"], "khach.dat_lai_mat_khau", target_id=acc["subject"],
                detail={"phien_thu_hoi": n}, request=request)
     gui_email(conn, acc_id, acc["email_norm"], "doi_mat_khau",
               "VIP GROUP — Mật khẩu của bạn vừa được đổi",
               "Mật khẩu cổng khách hàng VIP GROUP vừa được đặt lại và mọi phiên đăng nhập đã bị "
               "đăng xuất. Nếu không phải bạn, hãy liên hệ VIP GROUP ngay." + _CHAN_THU)
-    bao_crm_thu_hoi(conn, acc["subject"], "dat_lai_mat_khau")
     return acc
 
 
@@ -1314,8 +1320,10 @@ def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: s
         raise KhachLoi("Phiên đã thay đổi, vui lòng đăng nhập lại.", 409, "XUNG_DOT")
     conn.execute("DELETE FROM customer_rate_events WHERE bucket='doi_mk_sai' AND key=?", (khoa,))
     conn.commit()
+    revoked_at = int(time.time())  # lấy TRƯỚC khi tạo phiên mới (launch mới có iat >= revoked_at)
     n = thu_hoi_moi_phien(conn, acc["id"], "Đổi mật khẩu")  # gồm cả phiên hiện tại
     acc = tai_khoan(conn, acc["id"])
+    bao_crm_thu_hoi(conn, acc["subject"], "doi_mat_khau", revoked_at)
     sess, token = tao_phien(conn, acc, ip, ua)  # phiên mới cho trình duyệt đang dùng
     _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau", target_id=acc["subject"],
                detail={"ip": ip, "phien_khac_thu_hoi": max(0, n - 1)}, request=request)
@@ -1325,5 +1333,4 @@ def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: s
               "thay đổi. Các phiên đăng nhập trên thiết bị khác đã bị đăng xuất.\n\nNếu không phải "
               "bạn, hãy đặt lại mật khẩu ngay và liên hệ VIP GROUP:\n"
               f"{_link('/tai-khoan/quen-mat-khau')}" + _CHAN_THU)
-    bao_crm_thu_hoi(conn, acc["subject"], "doi_mat_khau")
     return sess, token, acc

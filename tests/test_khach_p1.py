@@ -184,6 +184,14 @@ def dang_nhap(c: TestClient, dinh_danh: str, mk: str = MK, headers=None):
     }, follow_redirects=False, headers=headers or {})
 
 
+def _bo_rv(body: dict) -> dict:
+    """Bỏ `revoked_at` (kiểm riêng: số nguyên, giây unix, không ở tương lai)."""
+    b = dict(body)
+    rv = b.pop("revoked_at")
+    assert isinstance(rv, int) and not isinstance(rv, bool) and rv <= time.time() + 1
+    return b
+
+
 def _b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
@@ -586,7 +594,7 @@ def test_dang_xuat_thu_hoi_va_bao_crm(kh, crm):
         "/tai-khoan/dang-nhap"
     goi = crm.goi[-1]
     assert goi["url"].endswith("/api/internal/portal/thu-hoi")
-    assert goi["body"] == {"subject": acc["subject"], "reason": "dang_xuat"}
+    assert _bo_rv(goi["body"]) == {"subject": acc["subject"], "reason": "dang_xuat"}
 
 
 def test_thu_hoi_tu_crm(kh):
@@ -635,7 +643,7 @@ def test_quen_mat_khau_khong_lo_va_dat_lai_thu_hoi_phien(kh, crm, monkeypatch):
                          "account_key=? AND success=0", (acc["id"],)) == 0
     finally:
         conn.close()
-    assert crm.goi[-1]["body"] == {"subject": acc["subject"], "reason": "dat_lai_mat_khau"}
+    assert _bo_rv(crm.goi[-1]["body"]) == {"subject": acc["subject"], "reason": "dat_lai_mat_khau"}
     # Token cũ không dùng lại được.
     r = kh.post("/tai-khoan/dat-lai", data={"t": t, "mat_khau": "Lan2!Passw0rd-99",
                                            "mat_khau_2": "Lan2!Passw0rd-99", "_csrf": csrf})
@@ -1704,7 +1712,7 @@ def test_doi_mat_khau_thanh_cong(kh, crm, monkeypatch):
     assert "Mật khẩu vừa được thay đổi" in mail["subject"]
     assert MK_MOI not in mail["body_text"]
     assert crm.goi[-1]["url"].endswith("/api/internal/portal/thu-hoi")
-    assert crm.goi[-1]["body"] == {"subject": acc["subject"], "reason": "doi_mat_khau"}
+    assert _bo_rv(crm.goi[-1]["body"]) == {"subject": acc["subject"], "reason": "doi_mat_khau"}
     conn = db.connect()
     try:
         assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.doi_mat_khau' "
@@ -1851,7 +1859,7 @@ def test_tao_link_dat_lai_hmac_mot_lan_het_han_thu_hoi_phien(kh, crm):
     assert kh.post("/tai-khoan/dat-lai", data=d2).status_code == 200
     assert kh.post("/tai-khoan/dat-lai", data=d2).status_code == 400
     assert "dang-nhap" in kh.get("/tai-khoan/vao-cong", follow_redirects=False).headers["location"]
-    assert crm.goi[-1]["body"] == {"subject": acc["subject"], "reason": "dat_lai_mat_khau"}
+    assert _bo_rv(crm.goi[-1]["body"]) == {"subject": acc["subject"], "reason": "dat_lai_mat_khau"}
     token_launch(dang_nhap(KC(), "0900000001", MK_MOI))
     # Hết hạn.
     t3 = link_dat_lai(kh, acc["subject"])
@@ -2179,3 +2187,61 @@ def test_r6_2_lease_het_han_thi_luot_khac_nhan(kh, crm):
     finally:
         conn.close()
     assert len(crm.goi_that) == 1
+
+
+# ================================================================== revoked_at (hợp đồng CRM)
+def test_thu_hoi_mang_revoked_at_luc_thu_hoi_khong_phai_luc_gui(kh, crm, monkeypatch):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    crm.goi  # xả hàng đợi trước
+    t0 = int(time.time())
+    assert _doi_mk(kh, MK, MK_MOI).status_code == 303
+    # Lấy launch token ngay sau khi đổi mật khẩu (phiên mới).
+    tok = token_launch(kh.get("/tai-khoan/vao-cong", follow_redirects=False))
+    iat = crm_xac_minh_launch(tok, khach.portal_secret())["iat"]
+    # Gửi TRỄ 100 giây: revoked_at vẫn là lúc thu hồi, không phải lúc gửi.
+    that = time.time
+    monkeypatch.setattr(time, "time", lambda: that() + 100)
+    goi = [g for g in crm.goi if g["url"].endswith("/thu-hoi")]
+    monkeypatch.setattr(time, "time", that)
+    rv = goi[-1]["body"]["revoked_at"]
+    assert goi[-1]["body"]["reason"] == "doi_mat_khau"
+    assert t0 <= rv <= int(time.time())
+    # Launch phát sau thu hồi: CRM so iat < revoked_at ⇒ token mới KHÔNG bị chặn.
+    assert iat >= rv
+    conn = db.connect()
+    try:
+        # revoked_at lấy trước khi tạo phiên mới.
+        tao = db.scalar(conn, "SELECT created_at FROM customer_sessions WHERE account_id=? "
+                        "AND status='active'", (acc["id"],))
+        from datetime import datetime as _dt
+        assert int(_dt.fromisoformat(tao).timestamp()) >= rv
+        hd = db.q(conn, "SELECT body FROM crm_sync_pending WHERE kind='thu_hoi'")
+        assert all(isinstance(json.loads(h["body"])["revoked_at"], int) for h in hd)
+    finally:
+        conn.close()
+
+
+def test_mock_crm_chan_launch_truoc_thu_hoi(monkeypatch, tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "khach_mock_crm", config.BASE_DIR / "scripts" / "khach_mock_crm.py")
+    mock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mock)
+    sec = "s" * 40
+    monkeypatch.setenv("VIPID_PORTAL_SECRET", sec)
+
+    def tok(iat, sub="cust:kh_a"):
+        h = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=").decode()
+        p = base64.urlsafe_b64encode(json.dumps({
+            "ver": 1, "aud": "vip-crm-portal", "sub": sub, "crm_customer_id": "c",
+            "portal_code": "VG1001", "iat": iat, "exp": iat + 60,
+            "nonce": f"n{iat}{sub}"}).encode()).rstrip(b"=").decode()
+        sig = base64.urlsafe_b64encode(hmac.new(sec.encode(), f"{h}.{p}".encode(),
+                                                hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"{h}.{p}.{sig}"
+    now = int(time.time())
+    mock.THU_HOI["cust:kh_a"] = now
+    with pytest.raises(ValueError, match="thu hồi"):
+        mock.kiem_launch(tok(now - 1))
+    assert mock.kiem_launch(tok(now))["iat"] == now  # cùng giây: được phép
