@@ -208,3 +208,18 @@ Không dùng `docker cp` vào `/etc/caddy` vì mount read-only.
 - Validate OK; public health 200; TLS giữ nguyên.
 - Hash trước `eea7ed56…d86f`; sau `c0ae5314…74ad`.
 - Backup trước cutover: `~/Caddyfile.bak-before-cutover-20261019-202511.txt` và `/data/Caddyfile.bak-before-cutover-20261019-202511`.
+
+## Realm khách (cổng khách hàng) — danh sách host
+
+Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
+
+| Biến | Ý nghĩa |
+|---|---|
+| `COWORK_KHACH_HOSTS` | Host realm khách, ví dụ `khachhang.vipgroup.com.vn` |
+| `COWORK_STAFF_HOSTS` | **Danh sách trắng** host nhân viên, ví dụ `cowork.vipgroup.com.vn,127.0.0.1:8899` |
+
+- Host không thuộc danh sách nào (kể cả thiếu Host) ⇒ **421**, không bao giờ rơi về realm nhân viên.
+- Tên host khách và nhân viên phải **khác nhau** (khác cổng là chưa đủ — cookie không tách theo cổng).
+- `COWORK_STAFF_HOSTS` **chưa đặt**: dev/staging ghi cảnh báo lớn khi khởi động và suy ra từ
+  `COWORK_PUBLIC_URL`/`COWORK_INTERNAL_URL`; **production từ chối khởi động**.
+- CRM gọi `/api/internal/khach/*` phải gửi `Host` là host khách.
