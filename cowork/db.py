@@ -62,8 +62,15 @@ def init_db() -> None:
         try:
             conn.executescript(DDL)
             _migrate(conn)
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                         (str(SCHEMA_VERSION),))
+            # Chỉ ghi phiên bản khi nâng cấp realm khách THÀNH CÔNG. Lỗi ⇒ giữ nguyên số cũ (không
+            # báo sai), realm khách tắt; lần khởi động sau tự thử lại (phát hiện theo định nghĩa
+            # bảng), thành công thì mới ghi.
+            if KHACH_LOI is None:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                             "VALUES('khach_schema_version', ?)", (str(SCHEMA_VERSION),))
+                conn.commit()
             _seed(conn)
             _initialized = True
         finally:

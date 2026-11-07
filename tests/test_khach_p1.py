@@ -2492,3 +2492,47 @@ def test_r8_2_cli_dat_lai_moc(kh, crm, capsys):
         conn.close()
     with pytest.raises(SystemExit):
         cli.main(["khach-dat-lai-moc", "0900000099"])
+
+
+def test_p2b_loi_nang_cap_khong_ghi_schema_version_va_thu_lai(client, bat, crm, owner):
+    conn = db.connect()
+    try:
+        _dung_bang_v4(conn, "VG000001")  # meta.schema_version = '4'
+        conn.execute("DELETE FROM meta WHERE key='khach_schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    def meta(k):
+        conn = db.connect()
+        try:
+            return db.scalar(conn, "SELECT value FROM meta WHERE key=?", (k,))
+        finally:
+            conn.close()
+    for _ in range(2):  # mỗi lần khởi động đều thử lại, vẫn lỗi ⇒ số phiên bản giữ nguyên
+        db._initialized = False
+        db.init_db()
+        assert db.KHACH_LOI and not khach.realm_bat()
+        assert meta("schema_version") == "4" and meta("khach_schema_version") is None
+    assert dang_nhap_nv(client, "anh-thanh", "Owner!Passw0rd").status_code == 303
+    assert client.get("/tai-khoan").status_code == 200
+    assert KC().get("/tai-khoan/dang-nhap").status_code == 421
+    # Sửa dữ liệu (mã hợp lệ cả luật cũ lẫn mới) rồi khởi động lại ⇒ nâng cấp xong.
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_accounts SET portal_code='VG100001' WHERE id='kh_x'")
+        conn.commit()
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()
+    assert db.KHACH_LOI is None and khach.realm_bat()
+    assert meta("schema_version") == "6" and meta("khach_schema_version") == "6"
+    conn = db.connect()
+    try:
+        sql = db.scalar(conn, "SELECT sql FROM sqlite_master WHERE name='customer_accounts'")
+        assert "VG[0-9][0-9][0-9][0-9][0-9][0-9]" not in sql and "email_norm TEXT," in sql
+        assert db.scalar(conn, "SELECT portal_code FROM customer_accounts WHERE id='kh_x'") == "VG100001"
+    finally:
+        conn.close()
+    assert KC().get("/tai-khoan/dang-nhap").status_code == 200
