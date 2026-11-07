@@ -122,6 +122,10 @@ KHACH_ENABLED = os.environ.get("COWORK_KHACH_ENABLED", "0").strip() == "1"
 #: theo cổng. Mặc định dev: khach.localhost:8898.
 KHACH_HOSTS = [h.strip().lower() for h in os.environ.get(
     "COWORK_KHACH_HOSTS", "khach.localhost:8898").split(",") if h.strip()]
+#: COWORK_KHACH_HOSTS có được đặt TƯỜNG MINH không. Chế độ hai host (§15) bỏ giá trị mặc định;
+#: production đặt cả hai kiểu cùng lúc phải xác nhận COWORK_KHACH_HOSTS_CA_HAI=1.
+KHACH_HOSTS_DAT = "COWORK_KHACH_HOSTS" in os.environ and bool(KHACH_HOSTS)
+KHACH_HOSTS_CA_HAI = os.environ.get("COWORK_KHACH_HOSTS_CA_HAI", "0").strip() == "1"
 #: Danh sách TRẮNG host nhân viên. Khi realm khách bật, Host không thuộc hai danh sách ⇒ 421
 #: (không bao giờ rơi về realm nhân viên). Bỏ trống ⇒ lấy host của PUBLIC_URL, INTERNAL_URL.
 #: Realm khách tắt và biến này không đặt ⇒ không kiểm Host (giữ hành vi cũ).

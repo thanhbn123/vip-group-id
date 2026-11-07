@@ -128,3 +128,11 @@ Quản lý danh sách pilot (có audit `khach.pilot.them|bot`, hiệu lực ngay
 **Đóng cổng khách NGAY (không khởi động lại):** `touch /srv/…/data/khach_bao_tri.flag` — mọi request
 host khách trả 503 trang bảo trì (kèm hotline), API nội bộ CRM → VIP ID trả 503 `BAO_TRI` (CRM tự
 thử lại). Realm nhân viên không bị ảnh hưởng. **Mở lại:** `rm /srv/…/data/khach_bao_tri.flag`.
+Kiểm tệp **fail-closed**: lỗi khác "không có tệp" (quyền, IO) ⇒ coi như đang bảo trì.
+
+> **Lưu ý:** bảo trì VIP ID **không** đóng các phiên portal đang mở ở CRM (khachhang). CRM có công tắc
+> riêng (`portal.off`). Muốn đóng hẳn cổng khách: **touch cả hai** (VIP ID + CRM).
+
+Rút một SĐT khỏi pilot (`khach-pilot remove`, hoặc sửa tay tệp) ⇒ thu hồi ngay mọi phiên VIP ID của
+tài khoản đó và xếp hàng thu hồi phiên portal ở CRM (`reason: "rut_pilot"`). Tệp pilot không đọc
+được ⇒ fail-closed (chỉ còn SĐT trong env) + audit `khach.pilot.loi_tep`.

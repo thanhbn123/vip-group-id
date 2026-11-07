@@ -81,23 +81,88 @@ _pilot_cache: dict = {"khoa": None, "ds": frozenset()}
 
 
 def _doc_tep_pilot() -> frozenset:
-    """Đọc tệp pilot (mỗi dòng một SĐT, '#' là chú thích); chỉ đọc lại khi tệp đổi (mtime/size)."""
+    """Đọc tệp pilot (mỗi dòng một SĐT, '#' là chú thích); chỉ đọc lại khi tệp đổi (mtime/size).
+
+    - Không có tệp ⇒ danh sách tệp rỗng (chỉ env).
+    - Tệp KHÔNG đọc được (quyền, mã hoá, lỗi IO) ⇒ fail-closed: coi danh sách tệp rỗng, ghi audit
+      + log ERROR (không 500).
+    - Tệp đổi và có SĐT bị BỎ ⇒ thu hồi phiên VIP ID + báo CRM thu hồi phiên portal của các tài
+      khoản đó (thu_hoi_khi_rut_pilot)."""
     p = config.KHACH_PILOT_FILE
     try:
         st = p.stat()
-    except OSError:
-        _pilot_cache.update(khoa=None, ds=frozenset())
+    except FileNotFoundError:
+        cu = _pilot_cache["ds"]
+        _pilot_cache.update(khoa=("mat", str(p)), ds=frozenset())
+        _xu_ly_bi_rut(cu, frozenset())
         return frozenset()
+    except OSError as exc:
+        return _loi_tep_pilot(exc)
     khoa = (str(p), st.st_mtime_ns, st.st_size)
     if _pilot_cache["khoa"] != khoa:
+        try:
+            noi_dung = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return _loi_tep_pilot(exc)
         ds = set()
-        for dong in p.read_text(encoding="utf-8").splitlines():
+        for dong in noi_dung.splitlines():
             dong = dong.split("#", 1)[0].strip()
             ph = chuan_hoa_sdt(dong)
             if ph:
                 ds.add(ph)
+        cu = _pilot_cache["ds"]
+        da_nap = _pilot_cache["khoa"] is not None
         _pilot_cache.update(khoa=khoa, ds=frozenset(ds))
+        if da_nap:
+            _xu_ly_bi_rut(cu, frozenset(ds))
     return _pilot_cache["ds"]
+
+
+def _loi_tep_pilot(exc: Exception) -> frozenset:
+    _pilot_cache.update(khoa=None, ds=frozenset())
+    log.error("Không đọc được tệp pilot %s: %s — fail-closed (chỉ danh sách env)",
+              config.KHACH_PILOT_FILE, exc)
+    try:
+        conn = db.connect()
+        try:
+            _ghi_audit(conn, "system", "khach.pilot.loi_tep",
+                       detail={"tep": str(config.KHACH_PILOT_FILE), "loi": type(exc).__name__},
+                       lay_mau="pilot_tep")
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        log.exception("Không ghi được audit lỗi tệp pilot")
+    return frozenset()
+
+
+def _xu_ly_bi_rut(cu: frozenset, moi: frozenset) -> None:
+    if not config.KHACH_PILOT:  # pilot tắt: danh sách không ảnh hưởng quyền vào ⇒ không thu hồi
+        return
+    env = {chuan_hoa_sdt(x) for x in config.KHACH_PILOT_PHONES}
+    for ph in sorted(cu - moi - env):
+        try:
+            conn = db.connect()
+            try:
+                thu_hoi_khi_rut_pilot(conn, ph)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - không làm hỏng request đang chạy
+            log.exception("Không thu hồi được phiên khi rút %s khỏi pilot", che_sdt(ph))
+
+
+def thu_hoi_khi_rut_pilot(conn, phone: str, actor: str = "system") -> int:
+    """Rút khỏi pilot ⇒ thu hồi mọi phiên VIP ID (cùng giao dịch với mốc revoked_at_ms) và xếp hàng
+    thu hồi phiên portal ở CRM (reason 'rut_pilot'). Trả số phiên đã thu hồi."""
+    acc = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=?", (phone,))
+    if not acc:
+        return 0
+    n = int(db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                      "AND status='active'", (acc["id"],)) or 0)
+    rv_ms = moc_thu_hoi(conn, acc["id"], tat_ca=True, ly_do="Rút khỏi pilot")
+    bao_crm_thu_hoi(conn, acc["subject"], "rut_pilot", rv_ms)
+    _ghi_audit(conn, actor, "khach.pilot.thu_hoi", target_id=acc["subject"],
+               detail={"phien_thu_hoi": n, "revoked_at_ms": rv_ms})
+    return n
 
 
 def ds_pilot() -> dict[str, str]:
@@ -108,6 +173,11 @@ def ds_pilot() -> dict[str, str]:
         if ph:
             kq[ph] = "env"
     return kq
+
+
+def pilot_cho_phep_khong_bat(phone: str | None) -> bool:
+    """Có trong danh sách pilot không (bất kể cờ pilot đang bật hay tắt)."""
+    return bool(phone) and phone in ds_pilot()
 
 
 def pilot_cho_phep(phone: str | None) -> bool:
@@ -141,11 +211,15 @@ def sua_tep_pilot(phone_raw: str, them: bool, actor: str = "cli") -> tuple[bool,
         for x in sorted(hien):
             fh.write(x + "\n")
     os.replace(tam, p)
-    _pilot_cache.update(khoa=None)
+    # Nạp lại ngay (cập nhật cache) nhưng KHÔNG để vòng phát hiện thay đổi thu hồi lần nữa.
+    _pilot_cache.update(khoa=None, ds=frozenset(hien))
+    _doc_tep_pilot()
     conn = db.connect()
     try:
         _ghi_audit(conn, actor, "khach.pilot.them" if them else "khach.pilot.bot",
                    target_id=ph, detail={"phone": che_sdt(ph)})
+        if not them and config.KHACH_PILOT and not pilot_cho_phep_khong_bat(ph):
+            thu_hoi_khi_rut_pilot(conn, ph, actor)
     finally:
         conn.close()
     return True, ph
@@ -200,6 +274,9 @@ def kiem_cau_hinh() -> None:
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
     if la_production():
+        if hai_host() and host_mot_host() and not config.KHACH_HOSTS_CA_HAI:
+            loi.append("Production đặt cả COWORK_KHACH_HOSTS (một host) lẫn host dangky/dangnhap — "
+                       "bỏ COWORK_KHACH_HOSTS hoặc xác nhận COWORK_KHACH_HOSTS_CA_HAI=1.")
         if config.KHACH_PILOT_RAW not in ("0", "1"):
             loi.append("Production bật realm khách phải đặt tường minh COWORK_KHACH_PILOT=0 hoặc 1 "
                        "(quyết định có chạy thử giới hạn hay không).")
@@ -277,9 +354,20 @@ def _ten_host(h: str) -> str:
     return h.rsplit(":", 1)[0] if _CO_CONG.search(h) else h
 
 
+def hai_host() -> bool:
+    return bool(config.KHACH_HOST_DANGKY or config.KHACH_HOST_DANGNHAP)
+
+
+def host_mot_host() -> list[str]:
+    """Host chế độ một host cũ. Chế độ hai host ⇒ bỏ giá trị MẶC ĐỊNH (chỉ giữ nếu đặt tường minh)."""
+    if hai_host() and not config.KHACH_HOSTS_DAT:
+        return []
+    return list(config.KHACH_HOSTS)
+
+
 def host_khach() -> list[str]:
-    ds = list(config.KHACH_HOSTS) + [h for h in (config.KHACH_HOST_DANGKY,
-                                                 config.KHACH_HOST_DANGNHAP) if h]
+    ds = host_mot_host() + [h for h in (config.KHACH_HOST_DANGKY,
+                                        config.KHACH_HOST_DANGNHAP) if h]
     return [x for x in (chuan_hoa_host(h) for h in ds) if x]
 
 
@@ -293,7 +381,7 @@ def vai_tro_host(host: str | None) -> str | None:
         x = chuan_hoa_host(cau_hinh) if cau_hinh else None
         if x and _khop(h, [x]):
             return vai
-    ds = [x for x in (chuan_hoa_host(e) for e in config.KHACH_HOSTS) if x]
+    ds = [x for x in (chuan_hoa_host(e) for e in host_mot_host()) if x]
     return "tat_ca" if _khop(h, ds) else None
 
 

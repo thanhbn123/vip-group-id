@@ -2631,7 +2631,10 @@ def test_pilot_tep_nap_lai_khi_doi_va_cli(kh, crm, pilot, capsys):
     assert dang_ky(KC(), 4).status_code == 303
     conn = db.connect()
     try:
-        acts = [r[0] for r in conn.execute("SELECT action FROM audit_log WHERE action LIKE 'khach.pilot.%'")]
+        acts = [r[0] for r in conn.execute("SELECT action FROM audit_log WHERE action IN "
+                                           "('khach.pilot.them', 'khach.pilot.bot')")]
+        # 0900000003 đã có tài khoản (chờ duyệt) ⇒ rút khỏi pilot cũng ghi thu hồi.
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.pilot.thu_hoi'") == 1
     finally:
         conn.close()
     assert acts == ["khach.pilot.them", "khach.pilot.bot"]
@@ -2857,3 +2860,131 @@ def test_s15_che_do_mot_host_cu_van_chay(kh):
 
 def test_s15_kiem_cau_hinh_chap_nhan_chi_hai_host(hai_host):
     khach.kiem_cau_hinh()  # KHACH_HOSTS rỗng nhưng có dangky/dangnhap ⇒ hợp lệ
+
+
+# ================================================================== vòng 9
+def test_a1_bao_tri_fail_closed(kh, monkeypatch, tmp_path):
+    from cowork import khach_web
+    monkeypatch.setattr(config, "KHACH_MAINTENANCE_FILE", tmp_path / "khong-co.flag")
+    assert khach_web._dang_bao_tri() is False
+    assert kh.get("/tai-khoan/dang-nhap").status_code == 200
+    import os as _os
+
+    def _loi(p, *a, **k):
+        raise PermissionError("không có quyền")
+    monkeypatch.setattr(khach_web.os, "stat", _loi)
+    assert khach_web._dang_bao_tri() is True
+    assert kh.get("/tai-khoan/dang-nhap").status_code == 503
+    monkeypatch.setattr(khach_web.os, "stat", _os.stat)
+    # Đường dẫn qua một TỆP (không phải thư mục) ⇒ NotADirectoryError ⇒ bảo trì.
+    f = tmp_path / "tep"
+    f.write_text("x")
+    monkeypatch.setattr(config, "KHACH_MAINTENANCE_FILE", f / "con")
+    assert khach_web._dang_bao_tri() is True
+
+
+def test_a2_rut_khoi_pilot_thu_hoi_phien_va_bao_crm(kh, crm, pilot, monkeypatch):
+    from cowork import cli
+    monkeypatch.setattr(config, "KHACH_PILOT", False)
+    acc = tao_khach_hoat_dong(kh, 2)
+    monkeypatch.setattr(config, "KHACH_PILOT", True)
+    assert cli.main(["khach-pilot", "add", "0900000002"]) == 0
+    token_launch(dang_nhap(kh, "0900000002"))
+    crm.goi  # xả
+    crm.goi_that.clear()
+    assert cli.main(["khach-pilot", "remove", "0900000002"]) == 0
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                         "AND status='active'", (acc["id"],)) == 0
+    finally:
+        conn.close()
+    th = [g["body"] for g in crm.goi if g["url"].endswith("/thu-hoi")]
+    assert len(th) == 1 and th[0]["subject"] == acc["subject"] and th[0]["reason"] == "rut_pilot"
+    assert th[0]["revoked_at_ms"] == acc_theo_sdt("+84900000002")["revoked_at_ms"]
+
+
+def test_a2_sua_tay_tep_pilot_cung_thu_hoi(kh, crm, pilot, monkeypatch):
+    import os as _os
+    monkeypatch.setattr(config, "KHACH_PILOT", False)
+    acc = tao_khach_hoat_dong(kh, 3)
+    monkeypatch.setattr(config, "KHACH_PILOT", True)
+    pilot.write_text("0900000003\n")
+    khach._pilot_cache.update(khoa=None)
+    token_launch(dang_nhap(kh, "0900000003"))
+    crm.goi
+    crm.goi_that.clear()
+    pilot.write_text("# đã rút\n")
+    _os.utime(pilot, ns=(time.time_ns(), time.time_ns() + 5_000_000))
+    assert _la_trang_pilot(dang_nhap(KC(), "0900000003"))  # lần đọc kế tiếp phát hiện thay đổi
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                         "AND status='active'", (acc["id"],)) == 0
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.pilot.thu_hoi'") == 1
+    finally:
+        conn.close()
+    th = [g["body"] for g in crm.goi if g["url"].endswith("/thu-hoi")]
+    assert [b["reason"] for b in th] == ["rut_pilot"]
+
+
+def test_a2_dang_xuat_khi_ngoai_pilot_van_thu_hoi(kh, crm, pilot, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_PILOT", False)
+    acc = tao_khach_hoat_dong(kh, 2)
+    token_launch(dang_nhap(kh, "0900000002"))
+    monkeypatch.setattr(config, "KHACH_PILOT", True)  # bật pilot, 0900000002 không có trong danh sách
+    r = kh.get("/tai-khoan/dang-xuat")
+    assert r.status_code == 200 and 'action="/tai-khoan/dang-xuat"' in r.text
+    r = kh.post("/tai-khoan/dang-xuat", data={"_csrf": csrf_tu(r.text)}, follow_redirects=False)
+    assert r.status_code == 303
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                         "AND status='active'", (acc["id"],)) == 0
+    finally:
+        conn.close()
+    th = [g["body"] for g in crm.goi if g["url"].endswith("/thu-hoi")]
+    assert th and th[-1]["reason"] == "dang_xuat" and isinstance(th[-1]["revoked_at_ms"], int)
+
+
+def test_a3_hai_host_bo_mac_dinh_mot_host(hai_host, monkeypatch):
+    dk, dn = hai_host
+    # Giá trị mặc định (không đặt env) bị bỏ ở chế độ hai host.
+    monkeypatch.setattr(config, "KHACH_HOSTS", ["khach.localhost:8898"])
+    monkeypatch.setattr(config, "KHACH_HOSTS_DAT", False)
+    assert khach.vai_tro_host("khach.localhost:8898") is None
+    assert khach.chon_realm("khach.localhost:8898") is None
+    assert KC().get("/tai-khoan/dang-ky").status_code == 421
+    # Đặt tường minh ⇒ giữ; production cần xác nhận.
+    monkeypatch.setattr(config, "KHACH_HOSTS_DAT", True)
+    assert khach.vai_tro_host("khach.localhost:8898") == "tat_ca"
+    monkeypatch.setattr(config, "ENV", "production")
+    with pytest.raises(RuntimeError, match="COWORK_KHACH_HOSTS_CA_HAI=1"):
+        khach.kiem_cau_hinh()
+    monkeypatch.setattr(config, "KHACH_HOSTS_CA_HAI", True)
+    with pytest.raises(RuntimeError) as e:
+        khach.kiem_cau_hinh()
+    assert "COWORK_KHACH_HOSTS_CA_HAI" not in str(e.value)
+
+
+def test_a4_tep_pilot_khong_doc_duoc_fail_closed(kh, crm, pilot, monkeypatch):
+    pilot.write_bytes(b"\xff\xfe\x00 khong phai utf8")
+    khach._pilot_cache.update(khoa=None)
+    r = dang_ky(KC(), 4)  # ngoài env; tệp hỏng ⇒ không ai trong tệp được qua
+    assert _la_trang_pilot(r)
+    assert dang_ky(KC(), 1).status_code == 303  # SĐT trong env vẫn dùng được
+    pilot.write_text("0900000005\n")
+    pilot.chmod(0o000)
+    khach._pilot_cache.update(khoa=None)
+    try:
+        r = dang_ky(KC(), 5)
+        assert r.status_code == 403 and _la_trang_pilot(r)  # không 500
+    finally:
+        pilot.chmod(0o600)
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.pilot.loi_tep'") >= 1
+    finally:
+        conn.close()
+    khach._pilot_cache.update(khoa=None)
+    assert dang_ky(KC(), 5).status_code == 303  # sửa quyền ⇒ hoạt động lại

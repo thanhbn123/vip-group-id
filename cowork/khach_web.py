@@ -12,6 +12,7 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
@@ -90,10 +91,14 @@ def _qua_proxy_cong_khai(hdr: Headers) -> bool:
 
 
 def _dang_bao_tri() -> bool:
+    """Fail-closed: tệp tồn tại ⇒ bảo trì; KHÔNG có tệp ⇒ mở; mọi lỗi khác (quyền, IO) ⇒ bảo trì."""
     try:
-        return config.KHACH_MAINTENANCE_FILE.exists()
-    except OSError:
-        return True  # không kiểm được ⇒ an toàn: đóng cổng
+        os.stat(config.KHACH_MAINTENANCE_FILE)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:  # noqa: BLE001
+        return True
 
 
 _TRANG_BAO_TRI = """<!doctype html><html lang="vi"><head><meta charset="utf-8">
@@ -666,7 +671,8 @@ def vao_cong(request: Request, tiep: str = ""):
 def dang_xuat_form(request: Request):
     conn = db.connect()
     try:
-        ctx = _ctx_phien(request, conn)
+        # Đăng xuất luôn dùng được, kể cả tài khoản đã bị rút khỏi pilot.
+        ctx = khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
     finally:
         conn.close()
     if not ctx:
@@ -681,7 +687,7 @@ def dang_xuat_form(request: Request):
 def dang_xuat(request: Request, csrf_form: str = Form("", alias="_csrf")):
     conn = db.connect()
     try:
-        ctx = _ctx_phien(request, conn)
+        ctx = khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))  # cả ngoài pilot
         if ctx:
             if not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
                 return _loi_csrf(request)

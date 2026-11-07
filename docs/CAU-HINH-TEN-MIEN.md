@@ -272,7 +272,7 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
 ### Hợp đồng thu hồi VIP ID → CRM
 `POST {CRM_PORTAL_INTERNAL_URL}/api/internal/portal/thu-hoi` (HMAC `vipid->crm`), body:
 `{subject, reason, revoked_at, revoked_at_ms}` — `reason` ∈ `dang_xuat` | `dat_lai_mat_khau` |
-`doi_mat_khau`; `revoked_at_ms` = **mili-giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**,
+`doi_mat_khau` | `rut_pilot` (tài khoản bị rút khỏi danh sách pilot); `revoked_at_ms` = **mili-giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**,
 ghi khi xếp hàng (gửi là bất đồng bộ); `revoked_at` = `revoked_at_ms // 1000` (giây, tương thích).
 
 Launch token có thêm claim `iat_ms` (mili-giây unix lúc phát; `iat = iat_ms // 1000`).
@@ -314,7 +314,14 @@ chối launch (mốc `revoked_at_ms` ở tương lai).
   động) — buộc quyết định tường minh.
 - **Công tắc khẩn** `COWORK_KHACH_MAINTENANCE_FILE` (mặc định `data/khach_bao_tri.flag`):
   `touch <tệp>` ⇒ mọi request host khách 503 bảo trì ngay; `rm <tệp>` ⇒ mở lại. Không ảnh hưởng
-  realm nhân viên. Lỗi kiểm tệp ⇒ coi như đang bảo trì (an toàn).
+  realm nhân viên. Kiểm bằng `os.stat`: mọi lỗi khác "không có tệp" ⇒ coi như đang bảo trì.
+  **Không đóng phiên portal CRM đang mở** — CRM có `portal.off` riêng; vận hành phải touch cả hai.
+- Rút SĐT khỏi pilot (CLI hoặc sửa tay tệp — phát hiện khi tệp đổi) ⇒ thu hồi mọi phiên VIP ID + xếp
+  hàng thu hồi portal CRM (`rut_pilot`, có `revoked_at_ms`). Đăng xuất vẫn dùng được với tài khoản
+  ngoài pilot. Tệp pilot không đọc được ⇒ fail-closed (chỉ SĐT env), audit `khach.pilot.loi_tep`.
+  Giới hạn: thay đổi xảy ra khi tiến trình đang tắt (hoặc sửa env) không được phát hiện như "rút" —
+  phiên VIP ID của tài khoản ngoài danh sách vẫn bị chặn ở mỗi request, nhưng phiên portal CRM tồn
+  tại tới khi hết hạn; khi đó chạy `khach-pilot remove` (hoặc `khach-dat-lai-moc`) để báo CRM.
 
 ### §15 — hai tên miền realm khách (dangky / dangnhap)
 | Biến | Ví dụ production |
@@ -325,7 +332,9 @@ chối launch (mốc `revoked_at_ms` ở tương lai).
 | `COWORK_KHACH_TIEP_CHO_PHEP` | `https://khachhang.vipgroup.com.vn/portal` (mặc định `CRM_PORTAL_PUBLIC_URL/portal`) |
 
 - Mỗi host chỉ phục vụ route của nó (còn lại 404). Để trống cả hai ⇒ chế độ một host cũ
-  (`COWORK_KHACH_HOSTS`, dùng cho dev/test).
+  (`COWORK_KHACH_HOSTS`, dùng cho dev/test). Chế độ hai host **bỏ** giá trị mặc định của
+  `COWORK_KHACH_HOSTS`; production đặt cả hai kiểu ⇒ từ chối khởi động trừ khi
+  `COWORK_KHACH_HOSTS_CA_HAI=1`.
 - Cookie luôn host-only (không đặt `Domain`): `vg_khach` chỉ có ở dangnhap.
 - `/api/internal/khach/*` chỉ trên host dangnhap **và** chỉ khi gọi trực tiếp qua mạng nội bộ:
   request mang `X-Forwarded-For` / `X-Real-IP` / `Forwarded` / `Via` (đi qua proxy công khai) ⇒ 404.
