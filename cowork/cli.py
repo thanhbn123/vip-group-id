@@ -5,6 +5,8 @@
     .venv/bin/python -m cowork.cli create-tenant --id tenant-b --name "Tenant B"
     .venv/bin/python -m cowork.cli list-users
     .venv/bin/python -m cowork.cli backup
+    .venv/bin/python -m cowork.cli khach-dong-bo          # cron: thử lại hàng đợi gửi CRM
+    .venv/bin/python -m cowork.cli khach-outbox -n 5      # dev: xem email trong outbox
 
 Mật khẩu KHÔNG nhận qua tham số dòng lệnh (tránh lộ trong `ps`/lịch sử shell):
 đọc từ biến môi trường hoặc hỏi qua getpass.
@@ -204,6 +206,60 @@ def cmd_audit_tail(args) -> int:
     return 0
 
 
+def cmd_khach_dong_bo(args) -> int:
+    """Thử lại các mục gửi CRM (signup, thu hồi) chưa thành công. Chạy được từ cron."""
+    from . import khach
+    db.init_db()
+    conn = db.connect()
+    try:
+        kq = khach.dong_bo_crm(conn, tat_ca=args.tat_ca)
+    finally:
+        conn.close()
+    print(f"Đã thử {kq['thu']} · thành công {kq['thanh_cong']} · còn chờ {kq['con_lai']}")
+    return 0 if kq["thanh_cong"] == kq["thu"] else 1
+
+
+def _chi_dev() -> None:
+    if config.ENV == "production":
+        raise SystemExit("Lệnh này chỉ dùng cho dev/staging.")
+
+
+def cmd_khach_outbox(args) -> int:
+    """DEV: in email trong customer_outbox (chứa link một lần — KHÔNG dùng ở production)."""
+    _chi_dev()
+    db.init_db()
+    conn = db.connect()
+    try:
+        rows = db.q(conn, "SELECT * FROM customer_outbox ORDER BY id DESC LIMIT ?", (args.n,))
+    finally:
+        conn.close()
+    for r in reversed(rows):
+        print(f"--- #{r['id']} {r['created_at']} [{r['kind']}] → {r['to_email']}\n"
+              f"Tiêu đề: {r['subject']}\n{r['body_text']}\n")
+    return 0
+
+
+def cmd_khach_duyet_dev(args) -> int:
+    """DEV: mô phỏng CRM duyệt một đăng ký (đi qua đúng hàm xử lý ket-qua-duyet)."""
+    from . import khach
+    _chi_dev()
+    db.init_db()
+    conn = db.connect()
+    try:
+        acc = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=? OR subject=?",
+                     (khach.chuan_hoa_sdt(args.ai) or "", args.ai))
+        if not acc:
+            raise SystemExit("Không có tài khoản khách này.")
+        status, kq = khach.ket_qua_duyet(conn, {
+            "subject": acc["subject"], "decision": "rejected" if args.tu_choi else "approved",
+            "crm_customer_id": "dev-" + acc["id"], "portal_code": args.portal_code,
+            "customer_code": args.portal_code, "phone_verified_by": "dev-cli"})
+    finally:
+        conn.close()
+    print(status, kq)
+    return 0 if status == 200 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cowork", description="CLI quản trị VIP GROUP COWORK")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -256,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("audit-tail", help="Xem N dòng audit mới nhất")
     s.add_argument("-n", type=int, default=20)
     s.set_defaults(func=cmd_audit_tail)
+
+    s = sub.add_parser("khach-dong-bo", help="Realm khách: thử lại hàng đợi gửi CRM")
+    s.add_argument("--tat-ca", action="store_true", help="Bỏ qua lịch chờ, thử mọi mục")
+    s.set_defaults(func=cmd_khach_dong_bo)
+
+    s = sub.add_parser("khach-outbox", help="DEV: xem email realm khách trong outbox")
+    s.add_argument("-n", type=int, default=5)
+    s.set_defaults(func=cmd_khach_outbox)
+
+    s = sub.add_parser("khach-duyet-dev", help="DEV: mô phỏng CRM duyệt/từ chối đăng ký")
+    s.add_argument("ai", help="SĐT hoặc subject cust:…")
+    s.add_argument("--portal-code", default="VG000001")
+    s.add_argument("--tu-choi", action="store_true")
+    s.set_defaults(func=cmd_khach_duyet_dev)
     return p
 
 
