@@ -188,7 +188,9 @@ def _bo_rv(body: dict) -> dict:
     """Bỏ `revoked_at` (kiểm riêng: số nguyên, giây unix, không ở tương lai)."""
     b = dict(body)
     rv = b.pop("revoked_at")
+    ms = b.pop("revoked_at_ms")
     assert isinstance(rv, int) and not isinstance(rv, bool) and rv <= time.time() + 1
+    assert isinstance(ms, int) and not isinstance(ms, bool) and rv == ms // 1000
     return b
 
 
@@ -438,8 +440,9 @@ def test_dang_nhap_phat_launch_token_hop_le(kh):
     claims = crm_xac_minh_launch(tok, khach.portal_secret())
     assert claims["sub"] == acc["subject"] and claims["crm_customer_id"] == "crm-uuid-1"
     assert claims["portal_code"] == "VG1001"
-    assert set(claims) == {"ver", "aud", "sub", "crm_customer_id", "portal_code", "iat", "exp",
-                           "nonce"}
+    assert set(claims) == {"ver", "aud", "sub", "crm_customer_id", "portal_code", "iat", "iat_ms",
+                           "exp", "nonce"}
+    assert isinstance(claims["iat_ms"], int) and claims["iat"] == claims["iat_ms"] // 1000
     # Hết hạn sau ≤ 60 giây.
     with pytest.raises(AssertionError):
         crm_xac_minh_launch(tok, khach.portal_secret(), now=claims["iat"] + 61)
@@ -2235,16 +2238,16 @@ def test_mock_crm_chan_launch_truoc_thu_hoi(monkeypatch, tmp_path):
         h = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=").decode()
         p = base64.urlsafe_b64encode(json.dumps({
             "ver": 1, "aud": "vip-crm-portal", "sub": sub, "crm_customer_id": "c",
-            "portal_code": "VG1001", "iat": iat, "exp": iat + 60,
+            "portal_code": "VG1001", "iat": iat // 1000, "iat_ms": iat, "exp": iat // 1000 + 60,
             "nonce": f"n{iat}{sub}"}).encode()).rstrip(b"=").decode()
         sig = base64.urlsafe_b64encode(hmac.new(sec.encode(), f"{h}.{p}".encode(),
                                                 hashlib.sha256).digest()).rstrip(b"=").decode()
         return f"{h}.{p}.{sig}"
-    now = int(time.time())
+    now = int(time.time() * 1000)
     mock.THU_HOI["cust:kh_a"] = now
     with pytest.raises(ValueError, match="thu hồi"):
-        mock.kiem_launch(tok(now - 1))
-    assert mock.kiem_launch(tok(now))["iat"] == now  # cùng giây: được phép
+        mock.kiem_launch(tok(now - 1))  # CÙNG GIÂY nhưng sớm hơn 1 ms ⇒ bị thu hồi
+    assert mock.kiem_launch(tok(now))["iat_ms"] == now
 
 
 # ================================================================== rà soát vòng 7
@@ -2321,3 +2324,49 @@ def test_r7_2_lease_va_han_chot_gui(kh, crm, monkeypatch):
     assert tg < khach.crm_han_chot_giay() + 1.0, tg
     assert row["attempts"] == 1 and "hạn chót" in row["last_error"]
     assert row["claimed_until"] is None and row["done_at"] is None
+
+
+# ================================================================== INTEROP-05: mili-giây
+def test_interop05_dang_xuat_cung_giay_voi_launch(kh, crm, monkeypatch):
+    acc = tao_khach_hoat_dong(kh, 1)
+    co_dinh = time.time()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(time, "time", lambda: co_dinh)  # mọi thứ trong CÙNG một mili-giây
+        tok = token_launch(dang_nhap(kh, "0900000001"))
+        c = crm_xac_minh_launch(tok, khach.portal_secret(), now=co_dinh)
+        r = kh.get("/tai-khoan/dang-xuat")
+        assert kh.post("/tai-khoan/dang-xuat", data={"_csrf": csrf_tu(r.text)},
+                       follow_redirects=False).status_code == 303
+    rv = [g for g in crm.goi if g["url"].endswith("/thu-hoi")][-1]["body"]
+    assert rv["revoked_at"] == c["iat"]            # cùng giây ⇒ so theo giây sẽ bỏ sót
+    assert c["iat_ms"] < rv["revoked_at_ms"]       # kể cả cùng mili-giây ⇒ vẫn thu hồi được
+    assert acc_theo_sdt("+84900000001")["revoked_at_ms"] == rv["revoked_at_ms"]
+
+
+@pytest.mark.parametrize("cach", ["doi_mat_khau", "dat_lai"])
+def test_interop05_launch_sau_thu_hoi_co_iat_ms_lon_hon(kh, crm, monkeypatch, cach):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    t_link = link_dat_lai(kh, acc["subject"]) if cach == "dat_lai" else None
+    co_dinh = time.time()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(time, "time", lambda: co_dinh)  # đồng hồ đứng yên: cùng mili-giây
+        if cach == "doi_mat_khau":
+            assert _doi_mk(kh, MK, MK_MOI).status_code == 303
+        else:
+            csrf = _csrf(kh, f"/tai-khoan/dat-lai?t={t_link}")
+            assert kh.post("/tai-khoan/dat-lai", data={"t": t_link, "mat_khau": MK_MOI,
+                           "mat_khau_2": MK_MOI, "_csrf": csrf}).status_code == 200
+            token_launch(dang_nhap(kh, "0900000001", MK_MOI))
+        tok = token_launch(kh.get("/tai-khoan/vao-cong", follow_redirects=False))
+    c = crm_xac_minh_launch(tok, khach.portal_secret(), now=co_dinh)
+    rv = [g for g in crm.goi if g["url"].endswith("/thu-hoi")][-1]["body"]
+    assert c["iat_ms"] > rv["revoked_at_ms"], (c["iat_ms"], rv["revoked_at_ms"])
+    # Hai lần thu hồi liên tiếp cùng mili-giây vẫn tăng ngặt.
+    conn = db.connect()
+    try:
+        a = khach.moc_thu_hoi(conn, acc["id"])
+        b = khach.moc_thu_hoi(conn, acc["id"])
+    finally:
+        conn.close()
+    assert b > a

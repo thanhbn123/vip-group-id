@@ -228,11 +228,10 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
   `challenges.cloudflare.com` chỉ trên trang đó).
 
 ### Giới hạn đã biết (realm khách)
-- **Vượt ngưỡng trong một loạt đồng thời (P2-c, chấp nhận):** các bộ đếm tần suất/khoá được kiểm
-  rồi mới ghi (không khoá nguyên tử). Một loạt request **đồng thời** có thể vượt ngưỡng một ít
-  (ví dụ khoá cặp 5 lần có thể ghi nhận 6–8 lần sai) trước khi bị chặn. Mức vượt bị chặn trên bởi
-  hàng đợi băm (2 luồng, trần 16) và trần siteverify Turnstile (4), nên không mở đường dò mật khẩu
-  không giới hạn.
+- **Vượt ngưỡng trong một loạt đồng thời (P2-c):** bộ giới hạn chung (`vuot_tan_suat`: đăng ký,
+  siteverify theo IP, quên mật khẩu, trần đăng ký…) đếm + ghi trong một giao dịch `BEGIN IMMEDIATE`
+  nên **không** vượt ngưỡng. Riêng bộ đếm đăng nhập sai (khoá cặp/IP) vẫn kiểm rồi mới ghi: một loạt
+  đồng thời có thể vượt ngưỡng một ít, bị chặn trên bởi hàng đợi băm (2 luồng, trần 16).
 - Production bật realm khách bắt buộc `COWORK_TIN_PROXY=1` và `COWORK_COOKIE_SECURE=1`
   (thiếu ⇒ từ chối khởi động).
 
@@ -272,8 +271,13 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
 
 ### Hợp đồng thu hồi VIP ID → CRM
 `POST {CRM_PORTAL_INTERNAL_URL}/api/internal/portal/thu-hoi` (HMAC `vipid->crm`), body:
-`{subject, reason, revoked_at}` — `reason` ∈ `dang_xuat` | `dat_lai_mat_khau` | `doi_mat_khau`;
-`revoked_at` = **giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**, ghi khi xếp hàng (không
-phải lúc gửi; gửi là bất đồng bộ). CRM từ chối launch token có `iat < revoked_at`. VIP ID lấy
-`revoked_at` TRƯỚC khi tạo phiên mới (đổi mật khẩu), nên launch token phát sau đó có
-`iat >= revoked_at` (cùng giây vẫn hợp lệ).
+`{subject, reason, revoked_at, revoked_at_ms}` — `reason` ∈ `dang_xuat` | `dat_lai_mat_khau` |
+`doi_mat_khau`; `revoked_at_ms` = **mili-giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**,
+ghi khi xếp hàng (gửi là bất đồng bộ); `revoked_at` = `revoked_at_ms // 1000` (giây, tương thích).
+
+Launch token có thêm claim `iat_ms` (mili-giây unix lúc phát; `iat = iat_ms // 1000`).
+**CRM so theo mili-giây:** từ chối khi `iat_ms < revoked_at_ms` (INTEROP-05: đăng xuất cùng giây với
+launch). VIP ID bảo đảm bất biến theo từng tài khoản (lưu `revoked_at_ms`, `launch_at_ms`):
+- mọi launch đã phát TRƯỚC một lần thu hồi có `iat_ms < revoked_at_ms` (kể cả cùng mili-giây);
+- mọi launch phát SAU (đổi mật khẩu, đặt lại, đăng nhập lại) có `iat_ms > revoked_at_ms` —
+  mốc thu hồi được lấy TRƯỚC khi tạo phiên mới.
