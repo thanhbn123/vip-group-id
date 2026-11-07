@@ -260,6 +260,26 @@ def cmd_khach_duyet_dev(args) -> int:
     return 0 if status == 200 else 1
 
 
+def cmd_khach_dat_lai_moc(args) -> int:
+    """Ops: đặt lại revoked_at_ms/launch_at_ms của một khách về hiện tại (sau sự cố đồng hồ),
+    thu hồi mọi phiên VIP ID của khách. Xem runbook docs/CAU-HINH-TEN-MIEN.md."""
+    from . import khach
+    db.init_db()
+    conn = db.connect()
+    try:
+        acc = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=? OR subject=? "
+                     "OR portal_code=?", (khach.chuan_hoa_sdt(args.ai) or "", args.ai,
+                                          khach.chuan_hoa_portal_code(args.ai) or ""))
+        if not acc:
+            raise SystemExit("Không có tài khoản khách này.")
+        kq = khach.dat_lai_moc(conn, acc["id"], actor=f"cli:{os.environ.get('USER', 'ops')}")
+    finally:
+        conn.close()
+    print(f"{kq['subject']}: mốc mới {kq['moc_ms']} ms, thu hồi {kq['phien_thu_hoi']} phiên. "
+          "Nhớ yêu cầu CRM đặt lại revoked_at_ms của subject này về cùng mốc.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cowork", description="CLI quản trị VIP GROUP COWORK")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -326,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--portal-code", default="VG1001")
     s.add_argument("--tu-choi", action="store_true")
     s.set_defaults(func=cmd_khach_duyet_dev)
+
+    s = sub.add_parser("khach-dat-lai-moc",
+                       help="Ops: đặt lại mốc thời gian thu hồi/launch của một khách về hiện tại")
+    s.add_argument("ai", help="SĐT, mã khách VG… hoặc subject cust:…")
+    s.set_defaults(func=cmd_khach_dat_lai_moc)
     return p
 
 

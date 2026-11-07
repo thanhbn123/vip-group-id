@@ -2370,3 +2370,125 @@ def test_interop05_launch_sau_thu_hoi_co_iat_ms_lon_hon(kh, crm, monkeypatch, ca
     finally:
         conn.close()
     assert b > a
+
+
+# ================================================================== R8: mốc nguyên tử + kẹp đồng hồ
+def _iat_ms(tok: str) -> int:
+    return json.loads(_b64d(tok.split(".")[1]))["iat_ms"]
+
+
+def test_r8_1_dang_xuat_xen_vao_truoc_khi_phat_launch(kh, crm, monkeypatch):
+    """Cùng kịch bản probe13: đăng xuất chen vào ngay trong lúc phát launch (đồng hồ đứng yên)."""
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    conn = db.connect()
+    try:
+        ctx = khach.xac_thuc_phien(conn, kh.cookies.get("vg_khach"))
+        X = int(time.time() * 1000)
+        da = []
+
+        def dong_ho():
+            if not da:  # lần gọi đầu tiên nằm TRONG phat_launch_token ⇒ đăng xuất chen vào
+                da.append(1)
+                c2 = db.connect()
+                try:
+                    da.append(khach.moc_thu_hoi(c2, acc["id"], session_id=ctx["session"]["id"],
+                                                ly_do="đăng xuất chen"))
+                finally:
+                    c2.close()
+            return X
+        monkeypatch.setattr(khach, "_ms_hien_tai", dong_ho)
+        with pytest.raises(khach.KhachLoi) as e:
+            khach.phat_launch_token(conn, ctx["account"], session_id=ctx["session"]["id"])
+        assert e.value.ma == "HET_PHIEN"  # phiên đã thu hồi ⇒ không phát token
+    finally:
+        conn.close()
+
+
+def test_r8_1_launch_xen_vao_truoc_khi_ghi_thu_hoi(kh, crm, monkeypatch):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    conn = db.connect()
+    try:
+        ctx = khach.xac_thuc_phien(conn, kh.cookies.get("vg_khach"))
+        X = int(time.time() * 1000)
+        da = []
+
+        def dong_ho():
+            if not da:  # lần gọi đầu nằm TRONG moc_thu_hoi ⇒ một launch chen vào trước
+                da.append(1)
+                c2 = db.connect()
+                try:
+                    da.append(khach.phat_launch_token(c2, ctx["account"],
+                                                      session_id=ctx["session"]["id"]))
+                finally:
+                    c2.close()
+            return X
+        monkeypatch.setattr(khach, "_ms_hien_tai", dong_ho)
+        rv = khach.moc_thu_hoi(conn, acc["id"], session_id=ctx["session"]["id"], ly_do="x")
+    finally:
+        conn.close()
+    assert _iat_ms(da[1]) < rv  # cùng mili-giây X: CRM vẫn từ chối token chen vào
+    assert khach.xac_thuc_phien(db.connect(), kh.cookies.get("vg_khach")) is None
+
+
+def test_r8_1_vao_cong_sau_dang_xuat_bi_tu_choi(kh, crm):
+    tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    tok_cu = kh.cookies.get("vg_khach")
+    r = kh.get("/tai-khoan/dang-xuat")
+    kh.post("/tai-khoan/dang-xuat", data={"_csrf": csrf_tu(r.text)})
+    c = KC()
+    c.cookies.set("vg_khach", tok_cu, domain="khach.localhost", path="/tai-khoan")
+    assert c.get("/tai-khoan/vao-cong", follow_redirects=False).headers["location"] == \
+        "/tai-khoan/dang-nhap"
+
+
+def test_r8_2_kep_moc_tuong_lai_va_canh_bao(kh, crm):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    now = int(time.time() * 1000)
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_accounts SET launch_at_ms=? WHERE id=?",
+                     (now + 3600_000, acc["id"]))  # dữ liệu hỏng / đồng hồ từng chạy nhanh
+        conn.commit()
+        rv = khach.moc_thu_hoi(conn, acc["id"], tat_ca=True, ly_do="x")
+        assert rv <= int(time.time() * 1000) + khach.MOC_TRAN_MS
+        assert rv >= now + khach.MOC_TRAN_MS - 1000
+        conn.execute("UPDATE customer_accounts SET revoked_at_ms=?, launch_at_ms=NULL WHERE id=?",
+                     (now + 7200_000, acc["id"]))
+        conn.commit()
+        tok = khach.phat_launch_token(conn, khach.tai_khoan(conn, acc["id"]))
+        assert _iat_ms(tok) <= int(time.time() * 1000) + khach.MOC_TRAN_MS
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE "
+                         "action='khach.canh_bao.dong_ho'") == 2
+    finally:
+        conn.close()
+
+
+def test_r8_2_cli_dat_lai_moc(kh, crm, capsys):
+    from cowork import cli
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_accounts SET revoked_at_ms=?, launch_at_ms=? WHERE id=?",
+                     (int(time.time() * 1000) + 3600_000,) * 2 + (acc["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    t0 = int(time.time() * 1000)
+    assert cli.main(["khach-dat-lai-moc", "VG1001"]) == 0
+    assert "Nhớ yêu cầu CRM" in capsys.readouterr().out
+    a = acc_theo_sdt("+84900000001")
+    assert t0 <= a["revoked_at_ms"] <= int(time.time() * 1000) and a["launch_at_ms"] == a["revoked_at_ms"]
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                         "AND status='active'", (acc["id"],)) == 0
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.ops.dat_lai_moc'") == 1
+    finally:
+        conn.close()
+    with pytest.raises(SystemExit):
+        cli.main(["khach-dat-lai-moc", "0900000099"])

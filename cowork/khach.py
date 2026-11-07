@@ -882,8 +882,7 @@ def thu_hoi_moi_phien(conn, account_id: str, reason: str) -> int:
 
 def dang_xuat(conn, ctx: dict, request=None) -> None:
     acc = ctx["account"]
-    rv_ms = moc_thu_hoi(conn, acc["id"])
-    thu_hoi_phien(conn, ctx["session"]["id"], "Khách đăng xuất")
+    rv_ms = moc_thu_hoi(conn, acc["id"], session_id=ctx["session"]["id"], ly_do="Khách đăng xuất")
     bao_crm_thu_hoi(conn, acc["subject"], "dang_xuat", rv_ms)
     _ghi_audit(conn, acc["subject"], "khach.dang_xuat", target_id=acc["subject"], request=request)
 
@@ -893,18 +892,41 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
 
 
-def phat_launch_token(conn, acc: dict, request=None) -> str:
+def phat_launch_token(conn, acc: dict, request=None, session_id: str | None = None) -> str:
+    """Phát launch token. Gán iat_ms NGUYÊN TỬ (một giao dịch ghi, một UPDATE…RETURNING):
+    iat_ms = MAX(launch_at_ms cũ, revoked_at_ms + 1, now) — luôn > lần thu hồi đã ghi. Có
+    `session_id` ⇒ kiểm phiên VIP ID còn sống TRONG CÙNG giao dịch: đăng xuất (cũng một giao dịch,
+    ghi revoked_at_ms + thu hồi phiên) hoặc xảy ra trước ⇒ từ chối, hoặc sau ⇒ revoked_at_ms >
+    iat_ms ⇒ CRM từ chối token. Không có khe đọc-rồi-ghi."""
     if acc["status"] != "hoat_dong" or not acc["phone_verified_at"] or not acc["crm_customer_id"]:
         raise KhachLoi("Tài khoản chưa được kích hoạt.", 403, "KHONG_DUOC_PHEP")
-    # iat_ms luôn > lần thu hồi gần nhất đã báo CRM (kể cả cùng mili-giây / khác tiến trình):
-    # CRM từ chối token có iat_ms < revoked_at_ms.
-    rv = db.scalar(conn, "SELECT revoked_at_ms FROM customer_accounts WHERE id=?", (acc["id"],))
-    iat_ms = max(_ms_hien_tai(), int(rv or 0) + 1)
+    now = _ms_hien_tai()
+    tran = now + MOC_TRAN_MS
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if session_id is not None and not conn.execute(
+                "SELECT 1 FROM customer_sessions WHERE id=? AND account_id=? AND status='active'",
+                (session_id, acc["id"])).fetchone():
+            conn.execute("ROLLBACK")
+            raise KhachLoi("Phiên đăng nhập đã kết thúc. Vui lòng đăng nhập lại.", 401, "HET_PHIEN")
+        row = conn.execute(
+            "UPDATE customer_accounts SET launch_at_ms = MIN(MAX(COALESCE(launch_at_ms, 0), "
+            "COALESCE(revoked_at_ms, 0) + 1, ?), ?) WHERE id=? AND status='hoat_dong' "
+            "RETURNING launch_at_ms", (now, tran, acc["id"])).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            raise KhachLoi("Tài khoản chưa được kích hoạt.", 403, "KHONG_DUOC_PHEP")
+        conn.execute("COMMIT")
+    except KhachLoi:
+        raise
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    iat_ms = int(row[0])
+    if iat_ms >= tran:
+        _canh_bao_dong_ho(conn, acc["subject"], "launch_at_ms", iat_ms, now)
     iat = iat_ms // 1000
-    # Ghi lại launch mới nhất: lần thu hồi sau đó phải có revoked_at_ms > iat_ms này.
-    conn.execute("UPDATE customer_accounts SET launch_at_ms=MAX(COALESCE(launch_at_ms, 0), ?) "
-                 "WHERE id=?", (iat_ms, acc["id"]))
-    conn.commit()
     payload = {
         "ver": 1, "aud": AUD_LAUNCH, "sub": acc["subject"],
         "crm_customer_id": acc["crm_customer_id"], "portal_code": acc["portal_code"],
@@ -1090,19 +1112,71 @@ def _ms_hien_tai() -> int:
     return int(time.time() * 1000)
 
 
-def moc_thu_hoi(conn, account_id: str) -> int:
-    """Lấy mốc thu hồi (mili-giây unix) và ghi vào tài khoản. Gọi TRƯỚC khi thu hồi phiên/tạo
-    phiên mới. Bất biến: mọi launch phát TRƯỚC có iat_ms < mốc; mọi launch phát SAU có
-    iat_ms > mốc (xem phat_launch_token)."""
-    r = db.one(conn, "SELECT revoked_at_ms, launch_at_ms FROM customer_accounts WHERE id=?",
-               (account_id,)) or {}
-    # Tăng ngặt so với mốc thu hồi cũ VÀ mọi launch token đã phát (đăng xuất cùng mili-giây với
-    # launch vẫn thu hồi được phiên portal đó: CRM so iat_ms < revoked_at_ms).
-    ms = max(_ms_hien_tai(), int(r.get("revoked_at_ms") or 0) + 1,
-             int(r.get("launch_at_ms") or 0) + 1)
-    conn.execute("UPDATE customer_accounts SET revoked_at_ms=? WHERE id=?", (ms, account_id))
-    conn.commit()
+MOC_TRAN_MS = 5 * 60 * 1000  # mốc thời gian lưu không được vượt now + 5 phút
+
+
+def _canh_bao_dong_ho(conn, subject: str, cot: str, gia_tri: int, now: int) -> None:
+    _ghi_audit(conn, "system", "khach.canh_bao.dong_ho", target_id=subject,
+               detail={"cot": cot, "gia_tri_ms": gia_tri, "now_ms": now}, lay_mau=f"{subject}:{cot}")
+    log.warning("CANH_BAO khach: %s của %s bị kẹp ở now+5 phút (đồng hồ lệch/dữ liệu sai); "
+                "xem runbook khach-dat-lai-moc", cot, subject)
+
+
+def moc_thu_hoi(conn, account_id: str, session_id: str | None = None, tat_ca: bool = False,
+                ly_do: str = "") -> int:
+    """Ghi mốc thu hồi (mili-giây unix) VÀ thu hồi phiên VIP ID trong CÙNG một giao dịch ghi.
+
+    revoked_at_ms = MIN(MAX(revoked_at_ms + 1, launch_at_ms + 1, now), now + 5 phút) — một
+    UPDATE…RETURNING. Bất biến: mọi launch phát trước có iat_ms < mốc; mọi launch phát sau có
+    iat_ms > mốc; không launch nào phát được cho phiên đã thu hồi (phat_launch_token kiểm phiên
+    trong giao dịch của nó). `session_id` ⇒ thu hồi phiên đó; `tat_ca` ⇒ mọi phiên của khách."""
+    now = _ms_hien_tai()
+    tran = now + MOC_TRAN_MS
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "UPDATE customer_accounts SET revoked_at_ms = MIN(MAX(COALESCE(revoked_at_ms, 0) + 1, "
+            "COALESCE(launch_at_ms, 0) + 1, ?), ?) WHERE id=? RETURNING revoked_at_ms, subject",
+            (now, tran, account_id)).fetchone()
+        if session_id is not None:
+            conn.execute("UPDATE customer_sessions SET status='revoked', revoked_at=?, "
+                         "revoke_reason=? WHERE id=? AND status='active'",
+                         (db.now_iso(), ly_do[:200], session_id))
+        if tat_ca:
+            conn.execute("UPDATE customer_sessions SET status='revoked', revoked_at=?, "
+                         "revoke_reason=? WHERE account_id=? AND status='active'",
+                         (db.now_iso(), ly_do[:200], account_id))
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    ms = int(row[0]) if row else now
+    if row and ms >= tran:
+        _canh_bao_dong_ho(conn, row[1], "revoked_at_ms", ms, now)
     return ms
+
+
+def dat_lai_moc(conn, account_id: str, actor: str = "ops") -> dict:
+    """Ops: đưa revoked_at_ms/launch_at_ms về `now` (sau sự cố đồng hồ). Thu hồi mọi phiên VIP ID
+    để không launch nào cũ hơn còn dùng được; trả mốc mới để báo CRM đặt lại phía CRM."""
+    now = _ms_hien_tai()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("UPDATE customer_accounts SET revoked_at_ms=?, launch_at_ms=? WHERE id=?",
+                     (now, now, account_id))
+        n = conn.execute("UPDATE customer_sessions SET status='revoked', revoked_at=?, "
+                         "revoke_reason='Ops đặt lại mốc thời gian' WHERE account_id=? "
+                         "AND status='active'", (db.now_iso(), account_id)).rowcount
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    acc = tai_khoan(conn, account_id)
+    _ghi_audit(conn, actor, "khach.ops.dat_lai_moc", target_id=acc["subject"],
+               detail={"moc_ms": now, "phien_thu_hoi": n})
+    return {"subject": acc["subject"], "moc_ms": now, "phien_thu_hoi": n}
 
 
 def bao_crm_thu_hoi(conn, subject: str, reason: str, revoked_at_ms: int | None = None) -> None:
@@ -1311,8 +1385,9 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
     # Đặt lại thành công ⇒ xoá bộ đếm sai của tài khoản (mọi IP).
     conn.execute("DELETE FROM customer_login_attempts WHERE account_key=? AND success=0", (acc_id,))
     conn.commit()
-    rv_ms = moc_thu_hoi(conn, acc_id)
-    n = thu_hoi_moi_phien(conn, acc_id, "Đặt lại mật khẩu")
+    n = db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                  "AND status='active'", (acc_id,))
+    rv_ms = moc_thu_hoi(conn, acc_id, tat_ca=True, ly_do="Đặt lại mật khẩu")
     acc = tai_khoan(conn, acc_id)
     bao_crm_thu_hoi(conn, acc["subject"], "dat_lai_mat_khau", rv_ms)
     _ghi_audit(conn, acc["subject"], "khach.dat_lai_mat_khau", target_id=acc["subject"],
@@ -1387,8 +1462,10 @@ def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: s
         raise KhachLoi("Phiên đã thay đổi, vui lòng đăng nhập lại.", 409, "XUNG_DOT")
     conn.execute("DELETE FROM customer_rate_events WHERE bucket='doi_mk_sai' AND key=?", (khoa,))
     conn.commit()
-    rv_ms = moc_thu_hoi(conn, acc["id"])  # TRƯỚC phiên mới ⇒ launch sau có iat_ms > rv_ms
-    n = thu_hoi_moi_phien(conn, acc["id"], "Đổi mật khẩu")  # gồm cả phiên hiện tại
+    n = db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id=? "
+                  "AND status='active'", (acc["id"],))
+    # Mốc + thu hồi mọi phiên (gồm phiên hiện tại) trong một giao dịch, TRƯỚC phiên mới.
+    rv_ms = moc_thu_hoi(conn, acc["id"], tat_ca=True, ly_do="Đổi mật khẩu")
     acc = tai_khoan(conn, acc["id"])
     bao_crm_thu_hoi(conn, acc["subject"], "doi_mat_khau", rv_ms)
     sess, token = tao_phien(conn, acc, ip, ua)  # phiên mới cho trình duyệt đang dùng

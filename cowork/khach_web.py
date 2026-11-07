@@ -297,8 +297,8 @@ def _ua(request: Request) -> str:
     return request.headers.get("user-agent") or ""
 
 
-def _sang_crm(conn, request: Request, acc: dict) -> RedirectResponse:
-    token = khach.phat_launch_token(conn, acc, request)
+def _sang_crm(conn, request: Request, acc: dict, session_id: str) -> RedirectResponse:
+    token = khach.phat_launch_token(conn, acc, request, session_id=session_id)
     return RedirectResponse(khach.url_launch(token), status_code=303)
 
 
@@ -465,7 +465,7 @@ def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | 
         except khach.KhachLoi as e:
             return _loi_dang_nhap(request, e, dinh_danh)
         sess, token = khach.tao_phien(conn, acc, web.ip_cua(request), _ua(request))
-        resp = _sang_crm(conn, request, acc)
+        resp = _sang_crm(conn, request, acc, sess["id"])
     finally:
         conn.close()
     resp.set_cookie(khach.COOKIE_PHIEN, token, max_age=config.KHACH_SESSION_HOURS * 3600,
@@ -552,7 +552,10 @@ def vao_cong(request: Request):
         ctx = _ctx_phien(request, conn)
         if not ctx:
             return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
-        return _sang_crm(conn, request, ctx["account"])
+        try:  # phiên được kiểm lại TRONG giao dịch phát token (đua với đăng xuất)
+            return _sang_crm(conn, request, ctx["account"], ctx["session"]["id"])
+        except khach.KhachLoi:
+            return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
     finally:
         conn.close()
 

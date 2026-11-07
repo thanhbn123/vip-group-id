@@ -281,3 +281,21 @@ launch). VIP ID bảo đảm bất biến theo từng tài khoản (lưu `revoke
 - mọi launch đã phát TRƯỚC một lần thu hồi có `iat_ms < revoked_at_ms` (kể cả cùng mili-giây);
 - mọi launch phát SAU (đổi mật khẩu, đặt lại, đăng nhập lại) có `iat_ms > revoked_at_ms` —
   mốc thu hồi được lấy TRƯỚC khi tạo phiên mới.
+
+#### Nguyên tử và kẹp đồng hồ (R8)
+- Phát launch: **một giao dịch ghi** — kiểm phiên VIP ID còn sống + một
+  `UPDATE … SET launch_at_ms = MIN(MAX(launch_at_ms, revoked_at_ms + 1, now), now + 5 phút) RETURNING`.
+- Thu hồi (đăng xuất, đặt lại, đổi mật khẩu): **một giao dịch ghi** — một
+  `UPDATE … SET revoked_at_ms = MIN(MAX(revoked_at_ms + 1, launch_at_ms + 1, now), now + 5 phút) RETURNING`
+  + thu hồi phiên VIP ID tương ứng. Không có khe đọc-rồi-ghi giữa launch và thu hồi.
+- Mốc lưu không vượt `now + 5 phút`; khi phải kẹp ⇒ audit `khach.canh_bao.dong_ho` + log WARNING.
+
+#### Runbook: đặt lại mốc thời gian của một khách (sau sự cố đồng hồ)
+Dấu hiệu: audit `khach.canh_bao.dong_ho`, hoặc khách đăng nhập được VIP ID nhưng CRM liên tục từ
+chối launch (mốc `revoked_at_ms` ở tương lai).
+1. Sửa đồng hồ máy chủ (NTP) trước.
+2. `COWORK_DATA_DIR=… COWORK_DB_PATH=… .venv/bin/python -m cowork.cli khach-dat-lai-moc <SĐT|VG…|cust:…>`
+   — đưa `revoked_at_ms`/`launch_at_ms` về hiện tại, thu hồi mọi phiên VIP ID của khách, ghi audit
+   `khach.ops.dat_lai_moc`, in mốc mới.
+3. Yêu cầu phiên CRM đặt lại `revoked_at_ms` của subject đó (phía CRM) về **cùng mốc** đã in.
+4. Khách đăng nhập lại.
