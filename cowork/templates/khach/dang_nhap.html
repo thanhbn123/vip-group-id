@@ -1,0 +1,29 @@
+{% extends "khach/base.html" %}
+{% block content %}
+{% if da_dang_nhap %}
+<p class="kh-eyebrow">Đã đăng nhập</p>
+<h1>Xin chào, {{ da_dang_nhap.display_name }}</h1>
+{% if da_dang_nhap.portal_code %}<p class="kh-muted">Mã khách hàng: <b>{{ da_dang_nhap.portal_code }}</b></p>{% endif %}
+<p><a class="kh-btn" href="/tai-khoan/vao-cong">Vào cổng khách hàng</a></p>
+<form method="post" action="/tai-khoan/dang-xuat" class="kh-form-inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button class="kh-btn kh-btn-ghost" type="submit">Đăng xuất</button>
+</form>
+{% else %}
+<p class="kh-eyebrow">Cổng khách hàng</p>
+<h1>Đăng nhập</h1>
+<p class="kh-muted">Dùng số điện thoại đã xác minh hoặc mã khách hàng (VG…).</p>
+{% if request.query_params.get('da_thoat') %}<div class="kh-alert kh-alert-ok" role="status">Bạn đã đăng xuất.</div>{% endif %}
+{% include "khach/_loi.html" %}
+{% if chua_xac_minh %}<p><a href="/tai-khoan/gui-lai-xac-minh">Gửi lại email xác minh</a></p>{% endif %}
+<form method="post" action="/tai-khoan/dang-nhap" class="kh-form" autocomplete="on">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label class="kh-field"><span>Số điện thoại hoặc mã khách hàng</span>
+    <input type="text" name="dinh_danh" required maxlength="40" autocomplete="username" autocapitalize="characters" spellcheck="false" value="{{ dinh_danh or '' }}"></label>
+  <label class="kh-field"><span>Mật khẩu</span>
+    <input type="password" name="mat_khau" required maxlength="200" autocomplete="current-password"></label>
+  <button class="kh-btn" type="submit">Đăng nhập</button>
+</form>
+<p class="kh-links"><a href="/tai-khoan/quen-mat-khau">Quên mật khẩu?</a> · <a href="/tai-khoan/dang-ky">Đăng ký tài khoản</a></p>
+{% endif %}
+{% endblock %}

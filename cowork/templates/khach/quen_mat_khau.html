@@ -1,0 +1,16 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>Quên mật khẩu</h1>
+{% if da_gui %}
+<div class="kh-alert kh-alert-ok" role="status">Nếu thông tin khớp với một tài khoản, chúng tôi đã gửi liên kết đặt lại mật khẩu tới email đã đăng ký. Liên kết có hiệu lực 30 phút.</div>
+{% else %}
+<p class="kh-muted">Nhập email, số điện thoại hoặc mã khách hàng. Liên kết đặt lại sẽ được gửi tới email đã đăng ký.</p>
+<form method="post" action="/tai-khoan/quen-mat-khau" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label class="kh-field"><span>Email, số điện thoại hoặc mã khách hàng</span>
+    <input type="text" name="dinh_danh" required maxlength="254" autocomplete="username" spellcheck="false"></label>
+  <button class="kh-btn" type="submit">Gửi liên kết</button>
+</form>
+{% endif %}
+<p class="kh-links"><a href="/tai-khoan/dang-nhap">Về trang đăng nhập</a></p>
+{% endblock %}

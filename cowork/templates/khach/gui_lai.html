@@ -1,0 +1,10 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>Gửi lại email xác minh</h1>
+<form method="post" action="/tai-khoan/gui-lai-xac-minh" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label class="kh-field"><span>Email đã đăng ký</span>
+    <input type="email" name="email" required maxlength="254" autocomplete="email"></label>
+  <button class="kh-btn" type="submit">Gửi lại</button>
+</form>
+{% endblock %}

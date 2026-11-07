@@ -1,0 +1,10 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>Đăng xuất</h1>
+<p>Bạn muốn đăng xuất khỏi cổng khách hàng VIP GROUP trên trình duyệt này?</p>
+<form method="post" action="/tai-khoan/dang-xuat" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button class="kh-btn" type="submit">Đăng xuất</button>
+</form>
+<p class="kh-links"><a href="/tai-khoan/vao-cong">Quay lại cổng khách hàng</a></p>
+{% endblock %}

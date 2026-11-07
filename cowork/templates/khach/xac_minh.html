@@ -1,0 +1,14 @@
+{% extends "khach/base.html" %}
+{% block content %}
+{% if ok %}
+<p class="kh-eyebrow">Đã xác minh email</p>
+<h1>Cảm ơn bạn!</h1>
+<div class="kh-alert kh-alert-ok" role="status">Email của bạn đã được xác minh.</div>
+<p>Nhân viên VIP GROUP sẽ <b>gọi điện xác minh số điện thoại</b> và duyệt tài khoản. Khi được kích hoạt, bạn sẽ nhận email kèm mã khách hàng.</p>
+{% else %}
+<h1>Liên kết không hợp lệ</h1>
+<div class="kh-alert kh-alert-err" role="alert">Liên kết xác minh không đúng, đã được dùng hoặc đã hết hạn.</div>
+<p><a href="/tai-khoan/gui-lai-xac-minh">Yêu cầu gửi lại email xác minh</a></p>
+{% endif %}
+<p class="kh-links"><a href="/tai-khoan/dang-nhap">Về trang đăng nhập</a></p>
+{% endblock %}
