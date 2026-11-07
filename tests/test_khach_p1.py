@@ -1339,3 +1339,171 @@ def test_n4_staff_hosts_chua_dat(monkeypatch, bat, caplog):
     monkeypatch.setattr(config, "ENV", "production")
     with pytest.raises(RuntimeError, match="COWORK_STAFF_HOSTS chưa đặt"):
         khach.kiem_cau_hinh()
+
+
+# ================================================================== rà soát vòng 4
+TS_SITE = "1x00000000000000000000AA"            # khoá thử nghiệm Cloudflare (chỉ test)
+TS_SECRET = "1x0000000000000000000000000000000AA"
+
+
+@pytest.fixture()
+def turnstile(monkeypatch):
+    """Turnstile bật bằng khoá thử nghiệm; siteverify GIẢ (không gọi mạng)."""
+    from cowork import khach_web
+    monkeypatch.setattr(config, "KHACH_TURNSTILE_SITE_KEY", TS_SITE)
+    monkeypatch.setenv("COWORK_KHACH_TURNSTILE_SECRET", TS_SECRET)
+    goi: list[tuple] = []
+
+    async def _gia(secret, token, remoteip):
+        goi.append((secret, token, remoteip))
+        if token == "tot":
+            return {"success": True, "hostname": "khach.localhost", "action": "khach_login"}
+        if token == "sai-host":
+            return {"success": True, "hostname": "evil.example", "action": "khach_login"}
+        if token == "sai-action":
+            return {"success": True, "hostname": "khach.localhost", "action": "khac"}
+        return {"success": False, "error-codes": ["invalid-input-response"]}
+
+    monkeypatch.setattr(khach_web, "turnstile_siteverify", _gia)
+    return goi
+
+
+def _dang_nhap_ts(c, dd, mk, ip, cf=None):
+    data = {"dinh_danh": dd, "mat_khau": mk, "_csrf": _csrf(c, "/tai-khoan/dang-nhap")}
+    if cf is not None:
+        data["cf-turnstile-response"] = cf
+    return c.post("/tai-khoan/dang-nhap", data=data, headers={"x-real-ip": ip},
+                  follow_redirects=False)
+
+
+def _do_phan_tan(n=khach.LAM_CHAM_SAU):
+    ke = KC()
+    for i in range(n):
+        dang_nhap(ke, "0900000001", f"Sai!Passw0rd-{i:02d}", headers={"x-real-ip": f"10.{i}.0.1"})
+
+
+def test_r1_turnstile_thu_thach_thay_cho_khoa_cung(kh, monkeypatch, turnstile):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    # Bình thường: không có thử thách, CSP không mở Cloudflare.
+    r = kh.get("/tai-khoan/dang-nhap")
+    assert "cf-turnstile" not in r.text and "challenges.cloudflare.com" not in \
+        r.headers["content-security-policy"]
+    _do_phan_tan()
+    moi = KC()
+    r_dung = _dang_nhap_ts(moi, "0900000001", MK, "10.99.0.1")
+    r_sai = _dang_nhap_ts(moi, "0900000001", "Sai!Passw0rd-zz", "10.99.0.1")
+    for r in (r_dung, r_sai):
+        assert r.status_code == 429
+        assert 'class="cf-turnstile"' in r.text and f'data-sitekey="{TS_SITE}"' in r.text
+        assert 'data-action="khach_login"' in r.text
+        assert '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"' in r.text
+        csp = r.headers["content-security-policy"]
+        assert "script-src https://challenges.cloudflare.com;" in csp
+        assert "frame-src https://challenges.cloudflare.com;" in csp
+        assert "x-khach-turnstile" not in r.headers
+    assert _bo_token(r_dung.text) == _bo_token(r_sai.text)
+    assert turnstile == []  # chưa có token ⇒ không gọi siteverify
+    # Token không hợp lệ / sai hostname / sai action ⇒ vẫn là thử thách, mật khẩu không được kiểm.
+    for tok in ("rac", "sai-host", "sai-action"):
+        r = _dang_nhap_ts(moi, "0900000001", MK, "10.99.0.1", cf=tok)
+        assert r.status_code == 429 and "cf-turnstile" in r.text, tok
+    assert {g[0] for g in turnstile} == {TS_SECRET} and turnstile[0][2] == "10.99.0.1"
+    # Vượt thử thách + sai mật khẩu ⇒ 401, lượt sai VẪN được đếm.
+    conn = db.connect()
+    try:
+        n0 = db.scalar(conn, "SELECT COUNT(*) FROM customer_login_attempts WHERE success=0")
+    finally:
+        conn.close()
+    r = _dang_nhap_ts(moi, "0900000001", "Sai!Passw0rd-yy", "10.99.0.1", cf="tot")
+    assert r.status_code == 401
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_login_attempts WHERE success=0") == n0 + 1
+    finally:
+        conn.close()
+    # Vượt thử thách + đúng mật khẩu ⇒ đăng nhập được từ thiết bị mới.
+    token_launch(_dang_nhap_ts(moi, "0900000001", MK, "10.99.0.1", cf="tot"))
+    # Trang thường sau đó lại khoá CSP chặt.
+    assert "challenges.cloudflare.com" not in kh.get("/tai-khoan/quen-mat-khau").headers[
+        "content-security-policy"]
+
+
+def test_r1_token_turnstile_vo_tac_dung_khi_khong_bi_gioi_han(kh, monkeypatch, turnstile):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    # Token tốt không vượt được khoá theo cặp (tài khoản, IP).
+    for _ in range(config.KHACH_LOGIN_MAX_FAIL):
+        _dang_nhap_ts(kh, "0900000001", "Sai!Passw0rd-xx", "203.0.113.4")
+    r = _dang_nhap_ts(kh, "0900000001", MK, "203.0.113.4", cf="tot")
+    assert r.status_code == 429 and "cf-turnstile" not in r.text
+
+
+def test_r1_khong_cau_hinh_turnstile_giu_429_giong_het(kh, monkeypatch):
+    _ip(monkeypatch)
+    assert not khach.turnstile_bat()
+    tao_khach_hoat_dong(kh, 1)
+    _do_phan_tan()
+    r = _dang_nhap_ts(KC(), "0900000001", MK, "10.99.0.2", cf="tot")
+    assert r.status_code == 429 and "cf-turnstile" not in r.text
+
+
+def test_r1_production_bat_buoc_turnstile_that(monkeypatch, bat):
+    monkeypatch.setattr(config, "ENV", "production")
+    with pytest.raises(RuntimeError, match="Turnstile"):
+        khach.kiem_cau_hinh()
+    monkeypatch.setattr(config, "KHACH_TURNSTILE_SITE_KEY", TS_SITE)
+    monkeypatch.setenv("COWORK_KHACH_TURNSTILE_SECRET", TS_SECRET)
+    with pytest.raises(RuntimeError, match="thử nghiệm"):
+        khach.kiem_cau_hinh()
+
+
+def test_r1_kiem_ket_qua_siteverify():
+    ok = {"success": True, "hostname": "khachhang.vipgroup.com.vn", "action": "khach_login"}
+    assert khach.ket_qua_turnstile_hop_le(ok, "KhachHang.VIPGROUP.com.vn.")
+    assert khach.ket_qua_turnstile_hop_le(ok, "khachhang.vipgroup.com.vn:443")
+    assert not khach.ket_qua_turnstile_hop_le({**ok, "success": "true"}, "khachhang.vipgroup.com.vn")
+    assert not khach.ket_qua_turnstile_hop_le({**ok, "hostname": "x.vn"}, "khachhang.vipgroup.com.vn")
+    assert not khach.ket_qua_turnstile_hop_le({**ok, "action": None}, "khachhang.vipgroup.com.vn")
+    assert not khach.ket_qua_turnstile_hop_le(None, "khachhang.vipgroup.com.vn")
+
+
+def test_r2_khoa_ip_ipv6_64_va_ipv4_mapped():
+    assert khach.khoa_ip("203.0.113.5") == "203.0.113.5"
+    assert khach.khoa_ip("::ffff:203.0.113.5") == "203.0.113.5"
+    assert khach.khoa_ip("2001:db8:1:2::1") == khach.khoa_ip("2001:db8:1:2:ffff:ffff:ffff:ffff") \
+        == "2001:db8:1:2::/64"
+    assert khach.khoa_ip("2001:db8:1:3::1") != khach.khoa_ip("2001:db8:1:2::1")
+    assert khach.khoa_ip("?") == "?"
+
+
+def test_r2_khoa_cap_va_gioi_han_ip_theo_64(kh, monkeypatch):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    for i in range(config.KHACH_LOGIN_MAX_FAIL):  # xoay địa chỉ trong cùng /64
+        dang_nhap(kh, "0900000001", "Sai!Passw0rd-xx", headers={"x-real-ip": f"2001:db8:1:2::{i + 1:x}"})
+    r = dang_nhap(kh, "0900000001", MK, headers={"x-real-ip": "2001:db8:1:2:dead::beef"})
+    assert r.status_code == 429
+    token_launch(dang_nhap(kh, "0900000001", MK, headers={"x-real-ip": "2001:db8:1:3::1"}))
+    # IPv4-mapped dùng chung khoá với IPv4.
+    for _ in range(config.KHACH_LOGIN_MAX_FAIL):
+        dang_nhap(kh, "0900000001", "Sai!Passw0rd-xx", headers={"x-real-ip": "::ffff:198.51.100.9"})
+    assert dang_nhap(kh, "0900000001", MK, headers={"x-real-ip": "198.51.100.9"}).status_code == 429
+    conn = db.connect()
+    try:
+        ips = {r[0] for r in conn.execute("SELECT DISTINCT ip FROM customer_login_attempts")}
+    finally:
+        conn.close()
+    assert "2001:db8:1:2::/64" in ips and "198.51.100.9" in ips
+    assert not any(i.startswith("2001:db8:1:2::") and not i.endswith("/64") for i in ips)
+
+
+def test_r3_x_forwarded_proto_chi_tin_khi_tin_proxy(kh, monkeypatch):
+    tao_khach_hoat_dong(kh, 1)
+    r = dang_nhap(kh, "0900000001", headers={"x-forwarded-proto": "https"})
+    cks = r.headers.get_list("set-cookie")
+    assert cks and not any("secure" in c.lower() for c in cks)
+    assert "strict-transport-security" not in r.headers
+    monkeypatch.setattr(config, "TIN_PROXY", True)
+    r = kh.get("/tai-khoan/dang-nhap", headers={"x-forwarded-proto": "https"})
+    assert "strict-transport-security" in r.headers

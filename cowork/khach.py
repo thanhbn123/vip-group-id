@@ -107,6 +107,13 @@ def kiem_cau_hinh() -> None:
         loi.append("COWORK_KHACH_HOSTS rỗng.")
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
+    if la_production():
+        if not turnstile_bat():
+            loi.append("Production bật realm khách phải cấu hình Cloudflare Turnstile "
+                       "(COWORK_KHACH_TURNSTILE_SITE_KEY + secret) cho thử thách đăng nhập.")
+        elif (config.KHACH_TURNSTILE_SITE_KEY in TURNSTILE_KHOA_THU
+              or turnstile_secret() in TURNSTILE_KHOA_THU):
+            loi.append("Production không được dùng khoá Turnstile thử nghiệm của Cloudflare.")
     if not config.STAFF_HOSTS:
         if la_production():
             loi.append("COWORK_STAFF_HOSTS chưa đặt — production bắt buộc khai báo danh sách "
@@ -196,6 +203,55 @@ def chon_realm(host: str | None) -> str | None:
 
 def la_host_khach(host: str | None) -> bool:
     return chon_realm(host) == "khach"
+
+
+def khoa_ip(ip: str | None) -> str:
+    """Khoá IP cho giới hạn tần suất/khoá: IPv4 giữ nguyên; IPv4-mapped IPv6 ⇒ IPv4;
+    IPv6 gộp theo /64 (một khách hàng/thuê bao thường nắm cả /64)."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return (ip or "?")[:64]
+    if a.version == 6:
+        if a.ipv4_mapped:
+            return str(a.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{a}/64", strict=False))
+    return str(a)
+
+
+# ------------------------------------------------------------------ Turnstile
+def turnstile_secret() -> str:
+    import os
+    v = os.environ.get("COWORK_KHACH_TURNSTILE_SECRET", "").strip()
+    if v:
+        return v
+    try:
+        return config.KHACH_TURNSTILE_SECRET_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def turnstile_bat() -> bool:
+    return bool(config.KHACH_TURNSTILE_SITE_KEY and turnstile_secret())
+
+
+#: Khoá thử nghiệm Cloudflare (luôn qua) — CHỈ dùng trong test/dev.
+TURNSTILE_KHOA_THU = ("1x00000000000000000000AA", "1x0000000000000000000000000000000AA",
+                      "2x00000000000000000000AB", "3x00000000000000000000FF",
+                      "2x0000000000000000000000000000000AA")
+TURNSTILE_ACTION = "khach_login"
+
+
+def ket_qua_turnstile_hop_le(kq: dict | None, host: str | None) -> bool:
+    """Kiểm phản hồi siteverify: success, action đúng, hostname khớp host khách đang phục vụ."""
+    if not isinstance(kq, dict) or kq.get("success") is not True:
+        return False
+    if kq.get("action") != TURNSTILE_ACTION:
+        return False
+    h = chuan_hoa_host(host)
+    ten = _ten_host(h) if h else None
+    return bool(ten) and str(kq.get("hostname") or "").lower().rstrip(".") == ten
 
 
 # ------------------------------------------------------------------ scrypt realm khách
@@ -684,8 +740,12 @@ THONG_BAO_GIOI_HAN = ("Tài khoản này đang tạm giới hạn đăng nhập 
                       "đặt lại mật khẩu qua email để đăng nhập ngay.")
 
 
+class ThuThach(KhachLoi):
+    """Cần vượt thử thách Turnstile trước khi mật khẩu được kiểm."""
+
+
 def kiem_chan(conn, dinh_danh: str, ip: str, thiet_bi: str | None = None,
-              request=None) -> tuple[dict | None, str, bool]:
+              request=None, turnstile_ok: bool = False) -> tuple[dict | None, str, bool]:
     """Các lớp chặn TRƯỚC khi kiểm mật khẩu — rẻ, KHÔNG băm (chống làm nghẽn bằng lượt bị chặn).
 
     Phản hồi chặn không phụ thuộc mật khẩu hay việc tài khoản có tồn tại (khoá đếm theo định
@@ -710,6 +770,15 @@ def kiem_chan(conn, dinh_danh: str, ip: str, thiet_bi: str | None = None,
         raise KhachLoi("Quá nhiều lần đăng nhập sai từ mạng của bạn. Vui lòng thử lại sau "
                        f"{w} phút.", 429, "QUA_TAN_SUAT")
     if not tin_cay and dang_gioi_han_toan_cuc(conn, key):
+        if turnstile_bat():
+            # Thiết bị mới của chủ tài khoản: vượt thử thách thì mới kiểm mật khẩu
+            # (lượt sai vẫn được đếm). Không vượt ⇒ cùng một trang thử thách, không lộ gì.
+            if turnstile_ok:
+                return acc, key, tin_cay
+            _ghi_audit(conn, actor, "khach.dang_nhap.thu_thach", detail={"ip": ip},
+                       request=request, lay_mau=f"{ip}:{key}")
+            raise ThuThach("Vì có nhiều lần đăng nhập sai vào tài khoản này, vui lòng xác nhận "
+                           "bạn không phải máy rồi đăng nhập lại.", 429, "THU_THACH")
         _ghi_audit(conn, actor, "khach.dang_nhap.gioi_han_toan_cuc", detail={"ip": ip},
                    request=request, lay_mau=f"{ip}:{key}")
         raise KhachLoi(THONG_BAO_GIOI_HAN.format(phut=w), 429, "GIOI_HAN")
@@ -717,11 +786,11 @@ def kiem_chan(conn, dinh_danh: str, ip: str, thiet_bi: str | None = None,
 
 
 def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
-              thiet_bi: str | None = None) -> dict:
+              thiet_bi: str | None = None, turnstile_ok: bool = False) -> dict:
     """Trả account khi được phép đăng nhập. Ném KhachLoi/ChoDuyet nếu không (xem kiem_chan)."""
     w = config.KHACH_LOGIN_WINDOW_MIN
     mat_khau = mat_khau or ""
-    acc, key, _tin_cay = kiem_chan(conn, dinh_danh, ip, thiet_bi, request)
+    acc, key, _tin_cay = kiem_chan(conn, dinh_danh, ip, thiet_bi, request, turnstile_ok)
     actor = acc["subject"] if acc else "khach:anon"
 
     hop_le = kiem_mk(mat_khau, acc)

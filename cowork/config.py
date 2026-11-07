@@ -163,3 +163,11 @@ KHACH_SCRYPT_DONG_THOI = int(os.environ.get("COWORK_KHACH_SCRYPT_DONG_THOI", "2"
 KHACH_THIET_BI_NGAY = int(os.environ.get("COWORK_KHACH_THIET_BI_NGAY", "180"))
 KHACH_RESET_ACC_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_RESET_ACC_IP_PER_HOUR", "3"))
 KHACH_TOKEN_TOI_DA = 3
+#: Cloudflare Turnstile cho thử thách đăng nhập khi tài khoản bị dò từ nhiều nơi.
+#: Site key công khai (env); secret: env COWORK_KHACH_TURNSTILE_SECRET hoặc tệp 0600
+#: (COWORK_KHACH_TURNSTILE_SECRET_FILE) — KHÔNG tự sinh. Thiếu một trong hai ⇒ tắt thử thách.
+KHACH_TURNSTILE_SITE_KEY = os.environ.get("COWORK_KHACH_TURNSTILE_SITE_KEY", "").strip()
+KHACH_TURNSTILE_SECRET_FILE = _path("COWORK_KHACH_TURNSTILE_SECRET_FILE",
+                                    DATA_DIR / "turnstile_secret.key")
+KHACH_TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+KHACH_TURNSTILE_TIMEOUT = 5.0

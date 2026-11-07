@@ -78,8 +78,14 @@ class KhachHeaders(BaseHTTPMiddleware):
         h["Referrer-Policy"] = "same-origin"
         h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         crm = _crm_origin()
+        # Chỉ trang thử thách được nạp script/iframe Turnstile của Cloudflare.
+        tt = h.get("x-khach-turnstile") == "1"
+        if "x-khach-turnstile" in h:
+            del h["x-khach-turnstile"]
+        script = f"script-src {TURNSTILE_ORIGIN}; frame-src {TURNSTILE_ORIGIN}; " if tt else \
+            "script-src 'none'; frame-src 'none'; "
         h["Content-Security-Policy"] = (
-            "default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'none'; "
+            "default-src 'none'; img-src 'self' data:; style-src 'self'; " + script +
             f"font-src 'self'; connect-src 'none'; form-action 'self'{(' ' + crm) if crm else ''}; "
             "frame-ancestors 'none'; base-uri 'none'; object-src 'none'")
         h["Cache-Control"] = "no-store"
@@ -196,6 +202,34 @@ def _ctx_phien(request: Request, conn) -> dict | None:
     return khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
 
 
+def _ip_khoa(request: Request) -> str:
+    """Khoá IP cho mọi giới hạn tần suất/khoá (IPv6 gộp /64, IPv4-mapped ⇒ IPv4)."""
+    return khach.khoa_ip(web.ip_cua(request))
+
+
+TURNSTILE_ORIGIN = "https://challenges.cloudflare.com"
+
+
+async def turnstile_siteverify(secret: str, token: str, remoteip: str) -> dict | None:
+    """Gọi siteverify của Cloudflare (async — không chiếm luồng). Test thay thế hàm này."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=config.KHACH_TURNSTILE_TIMEOUT) as c:
+            r = await c.post(config.KHACH_TURNSTILE_VERIFY_URL,
+                             data={"secret": secret, "response": token, "remoteip": remoteip})
+        return r.json() if r.status_code == 200 else None
+    except Exception:  # noqa: BLE001 - lỗi mạng ⇒ coi như không vượt
+        log.warning("Turnstile siteverify lỗi", exc_info=True)
+        return None
+
+
+async def _vuot_turnstile(request: Request, token: str) -> bool:
+    if not khach.turnstile_bat() or not token or len(token) > 2048:
+        return False
+    kq = await turnstile_siteverify(khach.turnstile_secret(), token, web.ip_cua(request))
+    return khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"))
+
+
 def _ua(request: Request) -> str:
     return request.headers.get("user-agent") or ""
 
@@ -233,7 +267,7 @@ def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Respo
     try:
         khach.dang_ky(conn, ho_ten=ho_ten, sdt=sdt, email=email, mat_khau=mat_khau[:200],
                       mat_khau_2=mat_khau_2[:200], dong_y=dong_y == "1",
-                      ip=web.ip_cua(request), request=request)
+                      ip=_ip_khoa(request), request=request)
     except khach.KhachLoi as e:
         return _render(request, "dang_ky.html", e.status, page_title="Đăng ký tài khoản",
                        loi=e.message, form=form)
@@ -258,7 +292,7 @@ def gui_lai(request: Request, email: str = Form(""), csrf_form: str = Form("", a
         return _loi_csrf(request)
     conn = db.connect()
     try:
-        khach.gui_lai_xac_minh(conn, email[:254], web.ip_cua(request), request)
+        khach.gui_lai_xac_minh(conn, email[:254], _ip_khoa(request), request)
     finally:
         conn.close()
     return RedirectResponse("/tai-khoan/da-gui-email", status_code=303)
@@ -313,9 +347,13 @@ def dang_nhap_form(request: Request):
 
 @khach_app.post("/tai-khoan/dang-nhap")
 async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(""),
-                    csrf_form: str = Form("", alias="_csrf")):
+                    csrf_form: str = Form("", alias="_csrf"),
+                    cf_token: str = Form("", alias="cf-turnstile-response")):
     dinh_danh = dinh_danh[:40]
     thiet_bi = request.cookies.get(khach.COOKIE_THIET_BI)
+    # Token Turnstile (nếu có) được kiểm phía máy chủ trước; chỉ có tác dụng khi tài khoản đang
+    # bị giới hạn toàn cục và client chưa là thiết bị tin cậy.
+    ts_ok = await _vuot_turnstile(request, cf_token) if cf_token else False
     conn = db.connect()
     try:
         if not _kiem_csrf(request, csrf_form):
@@ -324,25 +362,33 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
                 return _loi_csrf(request)
         # Lớp chặn rẻ chạy ngay (không băm, không vào hàng đợi băm).
         try:
-            khach.kiem_chan(conn, dinh_danh, web.ip_cua(request), thiet_bi, request)
+            khach.kiem_chan(conn, dinh_danh, _ip_khoa(request), thiet_bi, request, ts_ok)
         except khach.KhachLoi as e:
             return _loi_dang_nhap(request, e, dinh_danh)
     finally:
         conn.close()
-    return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi)
+    return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi,
+                           ts_ok)
 
 
 def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
-    return _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
-                   dinh_danh=dinh_danh, chua_xac_minh=e.ma == "CHUA_XAC_MINH_EMAIL")
+    thu_thach = isinstance(e, khach.ThuThach)
+    resp = _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
+                   dinh_danh=dinh_danh, chua_xac_minh=e.ma == "CHUA_XAC_MINH_EMAIL",
+                   thu_thach=thu_thach, turnstile_site_key=config.KHACH_TURNSTILE_SITE_KEY,
+                   turnstile_action=khach.TURNSTILE_ACTION)
+    if thu_thach:
+        resp.headers["x-khach-turnstile"] = "1"  # KhachHeaders mở CSP cho riêng trang này
+    return resp
 
 
-def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | None) -> Response:
+def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | None,
+               ts_ok: bool = False) -> Response:
     conn = db.connect()
     try:
         try:
-            acc = khach.dang_nhap(conn, dinh_danh, mat_khau, web.ip_cua(request), request,
-                                  thiet_bi=thiet_bi)
+            acc = khach.dang_nhap(conn, dinh_danh, mat_khau, _ip_khoa(request), request,
+                                  thiet_bi=thiet_bi, turnstile_ok=ts_ok)
         except khach.ChoDuyet:
             return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)
         except khach.KhachLoi as e:
@@ -417,7 +463,7 @@ def quen(request: Request, dinh_danh: str = Form(""), csrf_form: str = Form("", 
         return _loi_csrf(request)
     conn = db.connect()
     try:
-        khach.yeu_cau_khoi_phuc(conn, dinh_danh[:254], web.ip_cua(request), request)
+        khach.yeu_cau_khoi_phuc(conn, dinh_danh[:254], _ip_khoa(request), request)
     finally:
         conn.close()
     return _render(request, "quen_mat_khau.html", page_title="Quên mật khẩu", da_gui=True)
@@ -498,7 +544,7 @@ async def _noi_bo(request: Request, xu_ly) -> JSONResponse:
             return _jloi(409, "PHAT_LAI", "Chữ ký này đã được dùng; ký lại với X-Portal-Ts mới.")
         if kq_ky != "ok":
             khach._ghi_audit(conn, "crm", "khach.hmac.sai", detail={"path": request.url.path},
-                             request=request, lay_mau=web.ip_cua(request))
+                             request=request, lay_mau=_ip_khoa(request))
             return _jloi(401, "CHU_KY_SAI", "Chữ ký nội bộ không hợp lệ hoặc đã hết hạn.")
         try:
             data = json.loads(raw.decode("utf-8"))

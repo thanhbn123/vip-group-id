@@ -22,8 +22,12 @@
     <input type="text" name="dinh_danh" required maxlength="40" autocomplete="username" autocapitalize="characters" spellcheck="false" value="{{ dinh_danh or '' }}"></label>
   <label class="kh-field"><span>Mật khẩu</span>
     <input type="password" name="mat_khau" required maxlength="200" autocomplete="current-password"></label>
+  {% if thu_thach %}
+  <div class="cf-turnstile" data-sitekey="{{ turnstile_site_key }}" data-action="{{ turnstile_action }}"></div>
+  {% endif %}
   <button class="kh-btn" type="submit">Đăng nhập</button>
 </form>
+{% if thu_thach %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
 <p class="kh-links"><a href="/tai-khoan/quen-mat-khau">Quên mật khẩu?</a> · <a href="/tai-khoan/dang-ky">Đăng ký tài khoản</a></p>
 {% endif %}
 {% endblock %}
