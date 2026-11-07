@@ -187,3 +187,16 @@ KHACH_PILOT_FILE = _path("COWORK_KHACH_PILOT_FILE", DATA_DIR / "khach_pilot.txt"
 #: Công tắc khẩn: tệp này TỒN TẠI ⇒ mọi request host khách trả 503 bảo trì (không cần khởi động
 #: lại). `touch` để đóng cổng, `rm` để mở lại. Realm nhân viên không bị ảnh hưởng.
 KHACH_MAINTENANCE_FILE = _path("COWORK_KHACH_MAINTENANCE_FILE", DATA_DIR / "khach_bao_tri.flag")
+
+# ---- §15: hai tên miền realm khách ----
+#: Host chỉ đăng ký (dangky.vipgroup.com.vn) và host đăng nhập/tài khoản (dangnhap.vipgroup.com.vn).
+#: Để trống cả hai ⇒ chế độ một host cũ (COWORK_KHACH_HOSTS phục vụ mọi route khách).
+KHACH_HOST_DANGKY = os.environ.get("COWORK_KHACH_HOST_DANGKY", "").strip().lower()
+KHACH_HOST_DANGNHAP = os.environ.get("COWORK_KHACH_HOST_DANGNHAP", "").strip().lower()
+#: URL tuyệt đối dùng cho liên kết chéo giữa hai host (mặc định suy từ host).
+KHACH_DANGKY_URL = os.environ.get("COWORK_KHACH_DANGKY_URL", "").strip().rstrip("/")
+KHACH_DANGNHAP_URL = os.environ.get("COWORK_KHACH_DANGNHAP_URL", "").strip().rstrip("/")
+#: Danh sách tiền tố URL được phép cho `tiep` sau đăng nhập (vd https://khachhang.vipgroup.com.vn/portal).
+#: Trống ⇒ mặc định CRM_PORTAL_PUBLIC_URL + "/portal".
+KHACH_TIEP_CHO_PHEP = [u.strip() for u in os.environ.get("COWORK_KHACH_TIEP_CHO_PHEP", "").split(",")
+                       if u.strip()]

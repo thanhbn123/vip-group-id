@@ -46,12 +46,47 @@ class KhachHostDispatch:
             if _dang_bao_tri():  # công tắc khẩn: tệp tồn tại ⇒ đóng toàn bộ host khách
                 await _bao_tri(scope, receive, send)
                 return
+            hdr = Headers(scope=scope)
+            vai = khach.vai_tro_host(hdr.get("host"))
+            path = scope.get("path") or ""
+            if not duoc_phuc_vu(vai, path) or (path.startswith("/api/internal/")
+                                               and _qua_proxy_cong_khai(hdr)):
+                # Mỗi host chỉ phục vụ route của nó; /api/internal/* chỉ qua mạng nội bộ ⇒ 404.
+                scope = dict(scope)
+                scope["path"] = "/api/__404__" if path.startswith("/api/") else "/tai-khoan/__404__"
+                scope["raw_path"] = scope["path"].encode()
             await khach_app(scope, receive, send)
         elif realm == "staff":
             await self.app(scope, receive, send)
         else:
             # Host thiếu/lạ/sai cú pháp: KHÔNG BAO GIỜ rơi về realm nhân viên.
             await _sai_host(scope, receive, send)
+
+
+_DANGKY_DUONG = {"/", "/tai-khoan/dang-ky", "/tai-khoan/cho-duyet"}
+_DANGNHAP_DUONG = {"/", "/tai-khoan", "/tai-khoan/", "/tai-khoan/dang-nhap", "/tai-khoan/dang-xuat",
+                   "/tai-khoan/ho-so", "/tai-khoan/doi-mat-khau", "/tai-khoan/quen-mat-khau",
+                   "/tai-khoan/dat-lai", "/tai-khoan/vao-cong", "/tai-khoan/cho-duyet"}
+
+
+def duoc_phuc_vu(vai: str | None, path: str) -> bool:
+    """§15: dangky chỉ đăng ký + chờ duyệt; dangnhap đăng nhập/tài khoản + API nội bộ; chế độ một
+    host cũ ('tat_ca') phục vụ mọi route khách."""
+    if vai == "tat_ca":
+        return True
+    if path.startswith("/tai-khoan/static/"):
+        return vai in ("dangky", "dangnhap")
+    if vai == "dangky":
+        return path in _DANGKY_DUONG
+    if vai == "dangnhap":
+        return path in _DANGNHAP_DUONG or path.startswith("/api/internal/khach/")
+    return False
+
+
+def _qua_proxy_cong_khai(hdr: Headers) -> bool:
+    """Request đi qua reverse proxy công khai (Caddy luôn thêm các header này). CRM gọi API nội
+    bộ trực tiếp qua mạng docker ⇒ không có các header này."""
+    return any(hdr.get(k) for k in ("x-forwarded-for", "x-real-ip", "forwarded", "via"))
 
 
 def _dang_bao_tri() -> bool:
@@ -162,7 +197,8 @@ def _render(request: Request, ten: str, status: int = 200, **ctx) -> Response:
             ps = ps_moi = security.token_moi(24)
         csrf = khach.tao_csrf(ps)
     ctx.update({"request": request, "csrf": csrf, "page_title": ctx.get("page_title", ""),
-                "BRAND": "CÔNG TY TNHH VIP GROUP"})
+                "BRAND": "CÔNG TY TNHH VIP GROUP", "URL_DANGKY": khach.url_dangky(),
+                "URL_DANGNHAP": khach.url_dangnhap()})
     resp = web.templates.TemplateResponse(request=request, name=f"khach/{ten}",
                                           status_code=status, context=ctx)
     if ps_moi:
@@ -341,12 +377,23 @@ def _ua(request: Request) -> str:
     return request.headers.get("user-agent") or ""
 
 
-def _sang_crm(conn, request: Request, acc: dict, session_id: str) -> RedirectResponse:
+def _sang_crm(conn, request: Request, acc: dict, session_id: str,
+              tiep: str | None = None) -> RedirectResponse:
     token = khach.phat_launch_token(conn, acc, request, session_id=session_id)
-    return RedirectResponse(khach.url_launch(token), status_code=303)
+    return RedirectResponse(khach.url_launch(token, khach.kiem_tiep(tiep)), status_code=303)
 
 
 # ------------------------------------------------------------------ trang
+@khach_app.get("/")
+def trang_goc(request: Request):
+    vai = khach.vai_tro_host(request.headers.get("host"))
+    if vai == "dangky":
+        return RedirectResponse("/tai-khoan/dang-ky", status_code=303)
+    if vai == "dangnhap":
+        return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
+    raise StarletteHTTPException(status_code=404)
+
+
 @khach_app.get("/tai-khoan")
 @khach_app.get("/tai-khoan/")
 def goc():
@@ -418,23 +465,26 @@ def cho_duyet(request: Request):
 
 
 @khach_app.get("/tai-khoan/dang-nhap")
-def dang_nhap_form(request: Request):
+def dang_nhap_form(request: Request, tiep: str = ""):
+    tiep = tiep if khach.kiem_tiep(tiep) else ""  # không hợp lệ ⇒ bỏ, về vao-cong mặc định
     conn = db.connect()
     try:
         ctx = _ctx_phien(request, conn)
     finally:
         conn.close()
     if ctx:
-        return _render(request, "dang_nhap.html", page_title="Đăng nhập",
+        return _render(request, "dang_nhap.html", page_title="Đăng nhập", tiep=tiep,
                        da_dang_nhap=ctx["account"], csrf=ctx["session"]["csrf_token"])
-    return _render(request, "dang_nhap.html", page_title="Đăng nhập")
+    return _render(request, "dang_nhap.html", page_title="Đăng nhập", tiep=tiep)
 
 
 @khach_app.post("/tai-khoan/dang-nhap")
 async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(""),
                     csrf_form: str = Form("", alias="_csrf"),
-                    cf_token: str = Form("", alias="cf-turnstile-response")):
+                    cf_token: str = Form("", alias="cf-turnstile-response"),
+                    tiep: str = Form("")):
     dinh_danh = dinh_danh[:40]
+    tiep = tiep[:2000] if khach.kiem_tiep(tiep[:2000]) else ""
     thiet_bi = request.cookies.get(khach.COOKIE_THIET_BI)
     ip = _ip_khoa(request)
     ts_ok = False
@@ -444,7 +494,7 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
     if ket == "csrf":
         return _loi_csrf(request)
     if ket == "loi":
-        return _loi_dang_nhap(request, e, dinh_danh)
+        return _loi_dang_nhap(request, e, dinh_danh, tiep)
     thu_thach = e if ket == "thu_thach" else None
     if thu_thach is not None:
         # CHỈ gọi siteverify sau khi CSRF/cùng nguồn đạt VÀ chính lớp chặn đòi thử thách.
@@ -452,12 +502,12 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
         if kq == "qua_tan_suat":
             return _loi_dang_nhap(request, khach.ThuThach(
                 "Bạn đã thử quá nhiều lần. Vui lòng đợi 1 phút rồi thử lại.", 429, "THU_THACH"),
-                dinh_danh)
+                dinh_danh, tiep)
         if kq != "ok":
-            return _loi_dang_nhap(request, thu_thach, dinh_danh)
+            return _loi_dang_nhap(request, thu_thach, dinh_danh, tiep)
         ts_ok = True
     return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi,
-                           ts_ok)
+                           ts_ok, tiep)
 
 
 def _doc_phien(request: Request) -> dict | None:
@@ -488,12 +538,13 @@ def _kiem_truoc_dang_nhap(request: Request, dinh_danh: str, ip: str, thiet_bi: s
         conn.close()
 
 
-def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
+def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str,
+                   tiep: str = "") -> Response:
     if isinstance(e, khach.KhachPilot):
         return _trang_pilot(request)
     thu_thach = isinstance(e, khach.ThuThach)
     resp = _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
-                   dinh_danh=dinh_danh,
+                   dinh_danh=dinh_danh, tiep=tiep,
                    thu_thach=thu_thach, turnstile_site_key=config.KHACH_TURNSTILE_SITE_KEY,
                    turnstile_action=khach.TURNSTILE_ACTION)
     if thu_thach:
@@ -502,7 +553,7 @@ def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Res
 
 
 def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | None,
-               ts_ok: bool = False) -> Response:
+               ts_ok: bool = False, tiep: str = "") -> Response:
     conn = db.connect()
     try:
         try:
@@ -511,9 +562,9 @@ def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | 
         except khach.ChoDuyet:
             return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)
         except khach.KhachLoi as e:
-            return _loi_dang_nhap(request, e, dinh_danh)
+            return _loi_dang_nhap(request, e, dinh_danh, tiep)
         sess, token = khach.tao_phien(conn, acc, web.ip_cua(request), _ua(request))
-        resp = _sang_crm(conn, request, acc, sess["id"])
+        resp = _sang_crm(conn, request, acc, sess["id"], tiep)
     finally:
         conn.close()
     resp.set_cookie(khach.COOKIE_PHIEN, token, max_age=config.KHACH_SESSION_HOURS * 3600,
@@ -594,7 +645,7 @@ def _doi_mat_khau(request: Request, ctx: dict, cu: str, moi: str, moi2: str) -> 
 
 
 @khach_app.get("/tai-khoan/vao-cong")
-def vao_cong(request: Request):
+def vao_cong(request: Request, tiep: str = ""):
     conn = db.connect()
     try:
         ctx_goc = khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
@@ -604,7 +655,7 @@ def vao_cong(request: Request):
         if not ctx:
             return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
         try:  # phiên được kiểm lại TRONG giao dịch phát token (đua với đăng xuất)
-            return _sang_crm(conn, request, ctx["account"], ctx["session"]["id"])
+            return _sang_crm(conn, request, ctx["account"], ctx["session"]["id"], tiep[:2000])
         except khach.KhachLoi:
             return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
     finally:

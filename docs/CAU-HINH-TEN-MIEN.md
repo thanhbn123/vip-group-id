@@ -315,3 +315,26 @@ chối launch (mốc `revoked_at_ms` ở tương lai).
 - **Công tắc khẩn** `COWORK_KHACH_MAINTENANCE_FILE` (mặc định `data/khach_bao_tri.flag`):
   `touch <tệp>` ⇒ mọi request host khách 503 bảo trì ngay; `rm <tệp>` ⇒ mở lại. Không ảnh hưởng
   realm nhân viên. Lỗi kiểm tệp ⇒ coi như đang bảo trì (an toàn).
+
+### §15 — hai tên miền realm khách (dangky / dangnhap)
+| Biến | Ví dụ production |
+|---|---|
+| `COWORK_KHACH_HOST_DANGKY` | `dangky.vipgroup.com.vn` — chỉ `/tai-khoan/dang-ky`, `/tai-khoan/cho-duyet`, static; `/` → đăng ký |
+| `COWORK_KHACH_HOST_DANGNHAP` | `dangnhap.vipgroup.com.vn` — đăng nhập, đăng xuất, hồ sơ, đổi/quên/đặt lại mật khẩu, `vao-cong`, chờ duyệt, static, **API nội bộ**; `/` → đăng nhập |
+| `COWORK_KHACH_DANGKY_URL` / `COWORK_KHACH_DANGNHAP_URL` | URL tuyệt đối cho liên kết chéo (mặc định `https://<host>` ở production) |
+| `COWORK_KHACH_TIEP_CHO_PHEP` | `https://khachhang.vipgroup.com.vn/portal` (mặc định `CRM_PORTAL_PUBLIC_URL/portal`) |
+
+- Mỗi host chỉ phục vụ route của nó (còn lại 404). Để trống cả hai ⇒ chế độ một host cũ
+  (`COWORK_KHACH_HOSTS`, dùng cho dev/test).
+- Cookie luôn host-only (không đặt `Domain`): `vg_khach` chỉ có ở dangnhap.
+- `/api/internal/khach/*` chỉ trên host dangnhap **và** chỉ khi gọi trực tiếp qua mạng nội bộ:
+  request mang `X-Forwarded-For` / `X-Real-IP` / `Forwarded` / `Via` (đi qua proxy công khai) ⇒ 404.
+  Caddy nên chặn thêm `/api/internal/*` trên mọi site công khai.
+- Turnstile: hostname trong phản hồi siteverify phải khớp đúng host đang phục vụ (dangky ≠ dangnhap).
+- Link đặt lại mật khẩu (CRM xin) luôn trỏ host dangnhap.
+- **`tiep` sau đăng nhập:** `GET /tai-khoan/dang-nhap?tiep=<URL tuyệt đối>` (và `vao-cong?tiep=`).
+  Chỉ nhận khi URL khớp một tiền tố trong `COWORK_KHACH_TIEP_CHO_PHEP`: https (http chỉ ngoài
+  production), đúng host (không userinfo, không cổng khác, không dấu chấm cuối), path bắt đầu bằng
+  path cho phép theo ranh giới `/`, không `\`, `//`, `.`/`..`, ký tự điều khiển hay mã hoá đánh lừa
+  (`%2F %5C %2E %00`…). Hợp lệ ⇒ launch `…/portal/auth/launch?token=…&tiep=<chỉ path>` (CRM tự quyết);
+  không hợp lệ ⇒ bỏ qua, như `vao-cong` mặc định.

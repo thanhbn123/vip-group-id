@@ -4,7 +4,7 @@
 <p class="kh-eyebrow">Đã đăng nhập</p>
 <h1>Xin chào, {{ da_dang_nhap.display_name }}</h1>
 {% if da_dang_nhap.portal_code %}<p class="kh-muted">Mã khách hàng: <b>{{ da_dang_nhap.portal_code }}</b></p>{% endif %}
-<p><a class="kh-btn" href="/tai-khoan/vao-cong">Vào cổng khách hàng</a></p>
+<p><a class="kh-btn" href="/tai-khoan/vao-cong{% if tiep %}?tiep={{ tiep|urlencode }}{% endif %}">Vào cổng khách hàng</a></p>
 <p><a class="kh-btn kh-btn-ghost" href="/tai-khoan/ho-so">Tài khoản của tôi</a></p>
 <form method="post" action="/tai-khoan/dang-xuat" class="kh-form-inline">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
@@ -18,6 +18,7 @@
 {% include "khach/_loi.html" %}
 <form method="post" action="/tai-khoan/dang-nhap" class="kh-form" autocomplete="on">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {% if tiep %}<input type="hidden" name="tiep" value="{{ tiep }}">{% endif %}
   <label class="kh-field"><span>Số điện thoại hoặc mã khách hàng</span>
     <input type="text" name="dinh_danh" required maxlength="40" autocomplete="username" autocapitalize="characters" spellcheck="false" value="{{ dinh_danh or '' }}"></label>
   <label class="kh-field"><span>Mật khẩu</span>
@@ -28,6 +29,6 @@
   <button class="kh-btn" type="submit">Đăng nhập</button>
 </form>
 {% if thu_thach %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
-<p class="kh-links"><a href="/tai-khoan/quen-mat-khau">Quên mật khẩu?</a> · <a href="/tai-khoan/dang-ky">Đăng ký tài khoản</a></p>
+<p class="kh-links"><a href="/tai-khoan/quen-mat-khau">Quên mật khẩu?</a> · <a href="{{ URL_DANGKY }}/tai-khoan/dang-ky">Đăng ký tài khoản</a></p>
 {% endif %}
 {% endblock %}

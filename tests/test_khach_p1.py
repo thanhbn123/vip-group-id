@@ -2288,8 +2288,7 @@ def test_r7_1_khoa_ghi_sqlite_khong_lam_treo_route_nhan_vien(kh, owner, monkeypa
                         enumerate(("/dang-nhap", "/tai-khoan/anh-thanh", "/dang-nhap"))]
             # Các request khách phải GHI SQLite (audit lấy mẫu chữ ký sai) khi khoá đang bị giữ.
             ghi = [asyncio.create_task(c.post("/api/internal/khach/tam-khoa", content=b"{}",
-                   headers={"X-Portal-Ts": "1", "X-Portal-Sig": "0" * 64,
-                            "x-real-ip": f"10.9.{i}.1"})) for i in range(5)]
+                   headers={"X-Portal-Ts": "1", "X-Portal-Sig": "0" * 64})) for i in range(5)]
             tre = await asyncio.gather(*nv_tasks)
             kq = await asyncio.gather(*ghi)
             return tre, [r.status_code for r in kq]
@@ -2665,3 +2664,196 @@ def test_cong_tac_bao_tri_khong_can_khoi_dong_lai(kh, client, owner, monkeypatch
     assert client.get("/tai-khoan").status_code == 200
     co.unlink()  # mở lại
     assert kh.get("/tai-khoan/dang-nhap").status_code == 200
+
+
+# ================================================================== §15: hai tên miền + tiep
+DK = "http://dangky.localhost:8898"
+DN = "http://dangnhap.localhost:8898"
+PORTAL = "https://khachhang.vipgroup.com.vn/portal"
+
+
+@pytest.fixture()
+def hai_host(client, bat, crm, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_HOSTS", [])
+    monkeypatch.setattr(config, "KHACH_HOST_DANGKY", "dangky.localhost:8898")
+    monkeypatch.setattr(config, "KHACH_HOST_DANGNHAP", "dangnhap.localhost:8898")
+    monkeypatch.setattr(config, "KHACH_DANGKY_URL", DK)
+    monkeypatch.setattr(config, "KHACH_DANGNHAP_URL", DN)
+    monkeypatch.setattr(config, "KHACH_TIEP_CHO_PHEP", [PORTAL])
+    return KC(DK), KC(DN)
+
+
+def _duyet_sdt(c, n):
+    acc = acc_theo_sdt(f"+8490000000{n}")
+    assert duyet(c, acc["subject"], n).status_code == 200
+    return acc
+
+
+def test_s15_moi_host_chi_phuc_vu_route_cua_no(hai_host):
+    dk, dn = hai_host
+    r = dk.get("/", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/dang-ky"
+    r = dn.get("/", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/dang-nhap"
+    for p in ("/tai-khoan/dang-ky", "/tai-khoan/cho-duyet", "/tai-khoan/static/khach.css"):
+        assert dk.get(p).status_code == 200, p
+    for p in ("/tai-khoan/dang-nhap", "/tai-khoan/quen-mat-khau", "/tai-khoan/dang-xuat",
+              "/tai-khoan/cho-duyet", "/tai-khoan/static/khach.css"):
+        assert dn.get(p).status_code == 200, p
+    for p in ("/tai-khoan/dang-nhap", "/tai-khoan/ho-so", "/tai-khoan/doi-mat-khau",
+              "/tai-khoan/quen-mat-khau", "/tai-khoan/dat-lai?t=x", "/tai-khoan/vao-cong",
+              "/tai-khoan/dang-xuat", "/tai-khoan", "/dang-nhap", "/api/me"):
+        assert dk.get(p, follow_redirects=False).status_code == 404, p
+    for p in ("/tai-khoan/dang-ky", "/dang-nhap", "/tai-khoan/anh-thanh", "/api/me"):
+        assert dn.get(p, follow_redirects=False).status_code == 404, p
+    tok = csrf_tu(dn.get("/tai-khoan/dang-nhap").text)
+    assert dn.post("/tai-khoan/dang-ky", data={"_csrf": tok}).status_code == 404
+    # API nội bộ: chỉ host dangnhap, và KHÔNG qua proxy công khai.
+    path = "/api/internal/khach/thu-hoi"
+    body = json.dumps({"subject": "cust:khong-co", "reason": "x"}).encode()
+    assert dn.post(path, content=body, headers=ky_vao(path, body)).status_code == 404  # subject lạ
+    r = dn.post(path, content=body, headers=ky_vao(path, body))
+    assert r.json()["loi"]["ma"] in ("KHONG_TIM_THAY", "PHAT_LAI")
+    assert dk.post(path, content=body, headers=ky_vao(path, body)).json()["loi"]["ma"] == "HTTP_404"
+    for h in ({"x-forwarded-for": "203.0.113.1"}, {"x-real-ip": "203.0.113.1"},
+              {"forwarded": "for=203.0.113.1"}, {"via": "1.1 caddy"}):
+        r = dn.post(path, content=body, headers={**ky_vao(path, body), **h})
+        assert r.status_code == 404 and r.json()["loi"]["ma"] == "HTTP_404", h
+
+
+def test_s15_luong_hai_host_lien_ket_cookie_host_only(hai_host):
+    dk, dn = hai_host
+    r = dk.get("/tai-khoan/dang-ky")
+    assert f'href="{DN}/tai-khoan/dang-nhap"' in r.text
+    assert dang_ky(dk, 1).headers["location"] == "/tai-khoan/cho-duyet"
+    assert f'href="{DN}/tai-khoan/dang-nhap"' in dk.get("/tai-khoan/cho-duyet").text
+    assert f'href="{DK}/tai-khoan/dang-ky"' in dn.get("/tai-khoan/dang-nhap").text
+    # POST chéo host (Origin dangky → dangnhap) bị chặn.
+    tok = csrf_tu(dn.get("/tai-khoan/dang-nhap").text)
+    r = dn.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000001", "mat_khau": MK,
+                "_csrf": tok}, headers={"origin": DK})
+    assert r.status_code == 403
+    acc = _duyet_sdt(dn, 1)
+    r = dang_nhap(dn, "0900000001")
+    token_launch(r)
+    cks = r.headers.get_list("set-cookie")
+    assert any(c.startswith("vg_khach=") for c in cks)
+    for c in cks + dk.get("/tai-khoan/dang-ky").headers.get_list("set-cookie"):
+        assert "domain=" not in c.lower(), c  # cookie host-only
+    assert "vg_khach" not in dk.cookies and dn.cookies.get("vg_khach")
+    # Link đặt lại do CRM xin luôn trỏ host dangnhap.
+    r = goi_noi_bo(dn, "/api/internal/khach/tao-link-dat-lai",
+                   {"subject": acc["subject"], "requested_by": "nv"})
+    assert r.json()["data"]["url"].startswith(DN + "/tai-khoan/dat-lai?t=")
+
+
+def test_s15_turnstile_kiem_hostname_theo_host(hai_host, monkeypatch):
+    from cowork import khach_web
+    dk, dn = hai_host
+    monkeypatch.setattr(config, "KHACH_TURNSTILE_SITE_KEY", TS_SITE)
+    monkeypatch.setenv("COWORK_KHACH_TURNSTILE_SECRET", TS_SECRET)
+
+    async def _gia(secret, token, remoteip):  # token = hostname Cloudflare báo
+        return {"success": True, "hostname": token, "action": "khach_dang_ky"}
+    monkeypatch.setattr(khach_web, "turnstile_siteverify", _gia)
+    tok = csrf_tu(dk.get("/tai-khoan/dang-ky").text)
+    base = {"ho_ten": "Khách", "sdt": "0900000002", "email": "", "mat_khau": MK, "mat_khau_2": MK,
+            "dong_y": "1", "_csrf": tok}
+    r = dk.post("/tai-khoan/dang-ky", data={**base, "cf-turnstile-response": "dangnhap.localhost"})
+    assert r.status_code == 400  # token giải trên host dangnhap không dùng cho dangky
+    r = dk.post("/tai-khoan/dang-ky", data={**base, "cf-turnstile-response": "dangky.localhost"},
+                follow_redirects=False)
+    assert r.status_code == 303
+
+
+def test_s15_pilot_ap_dung_ca_hai_host(hai_host, pilot):
+    dk, dn = hai_host
+    assert _la_trang_pilot(dang_ky(dk, 2))
+    assert _la_trang_pilot(dang_nhap(dn, "0900000002"))
+    assert dang_ky(dk, 1).status_code == 303
+
+
+@pytest.mark.parametrize("raw", [
+    "//evil.com", "//evil.com/portal", "https://evil.com/portal",
+    "https://khachhang.vipgroup.com.vn.evil.com/portal", "https://khachhang.vipgroup.com.vn./portal",
+    "https://user@khachhang.vipgroup.com.vn/portal", "https://khachhang.vipgroup.com.vn@evil.com/portal",
+    "https://user:pw@khachhang.vipgroup.com.vn/portal",
+    "https://khachhang.vipgroup.com.vn/portal%2F%2Fevil.com", "https://khachhang.vipgroup.com.vn/portal%2f..",
+    "https://khachhang.vipgroup.com.vn/portal/%2e%2e/admin", "https://khachhang.vipgroup.com.vn/portal/../admin",
+    "https://khachhang.vipgroup.com.vn/portal/./x", "https://khachhang.vipgroup.com.vn//evil.com/portal",
+    "https://khachhang.vipgroup.com.vn/portal//evil.com", "https://khachhang.vipgroup.com.vn/portalx",
+    "https://khachhang.vipgroup.com.vn/admin", "https://khachhang.vipgroup.com.vn/PORTAL",
+    "https://khachhang.vipgroup.com.vn", "javascript:alert(1)", "JavaScript://khachhang.vipgroup.com.vn/portal",
+    "data:text/html,<script>alert(1)</script>", "https://khachhang.vipgroup.com.vn\\@evil.com/portal",
+    "https://khachhang.vipgroup.com.vn/portal\\evil", "https:/khachhang.vipgroup.com.vn/portal",
+    "https:khachhang.vipgroup.com.vn/portal", "https://khachhang.vipgroup.com.vn:8443/portal",
+    "/portal", "portal", "https://khachhang.vipgroup.com.vn/portal/ x", "https://khachhang.vipgroup.com.vn/portal\n",
+    "https://khachhang.vipgroup.com.vn/portal\t", " https://khachhang.vipgroup.com.vn/portal",
+    "https://khachhang%2evipgroup.com.vn/portal", "https://khachhаng.vipgroup.com.vn/portal",
+    "https://khachhang.vipgroup.com.vn/portal%00", "https://khachhang.vipgroup.com.vn/portal%5cevil",
+    "ftp://khachhang.vipgroup.com.vn/portal", "", "x" * 3000,
+])
+def test_s15_tiep_chan_open_redirect(raw, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_TIEP_CHO_PHEP", [PORTAL])
+    assert khach.kiem_tiep(raw) is None
+
+
+@pytest.mark.parametrize("raw, mong", [
+    (PORTAL, "/portal"), (PORTAL + "/", "/portal/"), (PORTAL + "/kien/123?x=1#f", "/portal/kien/123"),
+    ("https://KhachHang.VIPGROUP.com.vn/portal/a", "/portal/a"),
+    ("HTTPS://khachhang.vipgroup.com.vn/portal/b", "/portal/b"),
+])
+def test_s15_tiep_hop_le(raw, mong, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_TIEP_CHO_PHEP", [PORTAL])
+    assert khach.kiem_tiep(raw) == mong
+
+
+def test_s15_tiep_http_chi_ngoai_production(monkeypatch):
+    monkeypatch.setattr(config, "KHACH_TIEP_CHO_PHEP", ["http://127.0.0.1:8897/portal"])
+    assert khach.kiem_tiep("http://127.0.0.1:8897/portal/x") == "/portal/x"
+    monkeypatch.setattr(config, "ENV", "production")
+    assert khach.kiem_tiep("http://127.0.0.1:8897/portal/x") is None
+
+
+def test_s15_dang_nhap_mang_tiep_sang_crm(hai_host):
+    dk, dn = hai_host
+    dang_ky(dk, 1)
+    _duyet_sdt(dn, 1)
+    # Hợp lệ: form có trường ẩn, sau đăng nhập launch mang tiep = đường dẫn.
+    r = dn.get("/tai-khoan/dang-nhap", params={"tiep": PORTAL + "/kien/42?a=1"})
+    assert 'name="tiep"' in r.text
+    tok = csrf_tu(r.text)
+    r = dn.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000001", "mat_khau": MK,
+                "_csrf": tok, "tiep": PORTAL + "/kien/42?a=1"}, follow_redirects=False)
+    loc = r.headers["location"]
+    q = parse_qs(urlsplit(loc).query)
+    assert loc.startswith("http://crm.localhost:8897/portal/auth/launch?token=")
+    assert q["tiep"] == ["/portal/kien/42"]
+    crm_xac_minh_launch(q["token"][0], khach.portal_secret())
+    # vao-cong với tiep hợp lệ / không hợp lệ.
+    q = parse_qs(urlsplit(dn.get("/tai-khoan/vao-cong", params={"tiep": PORTAL + "/x"},
+                                 follow_redirects=False).headers["location"]).query)
+    assert q["tiep"] == ["/portal/x"]
+    for xau in ("https://evil.com/portal", "//evil.com", "javascript:alert(1)"):
+        loc = dn.get("/tai-khoan/vao-cong", params={"tiep": xau},
+                     follow_redirects=False).headers["location"]
+        assert "tiep=" not in loc and loc.startswith("http://crm.localhost:8897/portal/auth/launch?")
+    # Không hợp lệ ở form đăng nhập ⇒ bỏ (không có trường ẩn, không có tiep).
+    c = KC(DN)
+    r = c.get("/tai-khoan/dang-nhap", params={"tiep": "https://khachhang.vipgroup.com.vn.evil.com/portal"})
+    assert 'name="tiep"' not in r.text
+    r = c.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000001", "mat_khau": MK,
+               "_csrf": csrf_tu(r.text), "tiep": "//evil.com"}, follow_redirects=False)
+    assert "tiep=" not in r.headers["location"]
+
+
+def test_s15_che_do_mot_host_cu_van_chay(kh):
+    """Không đặt dangky/dangnhap ⇒ một host phục vụ mọi route (dev cũ, test cũ)."""
+    assert khach.vai_tro_host("khach.localhost:8898") == "tat_ca"
+    assert kh.get("/tai-khoan/dang-ky").status_code == 200
+    assert kh.get("/tai-khoan/dang-nhap").status_code == 200
+    assert kh.get("/").status_code == 404
+
+
+def test_s15_kiem_cau_hinh_chap_nhan_chi_hai_host(hai_host):
+    khach.kiem_cau_hinh()  # KHACH_HOSTS rỗng nhưng có dangky/dangnhap ⇒ hợp lệ

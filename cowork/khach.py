@@ -194,8 +194,9 @@ def kiem_cau_hinh() -> None:
             and config.KHACH_MAIL_TRANSPORT not in KENH_EMAIL_THAT):
         loi.append("A8: production bật COWORK_KHACH_EMAIL_ENABLED=1 nhưng chưa có kênh gửi email "
                    f"thật (COWORK_KHACH_MAIL_TRANSPORT={config.KHACH_MAIL_TRANSPORT!r}).")
-    if not config.KHACH_HOSTS:
-        loi.append("COWORK_KHACH_HOSTS rỗng.")
+    if not host_khach():
+        loi.append("Chưa có host realm khách (COWORK_KHACH_HOSTS hoặc COWORK_KHACH_HOST_DANGKY/"
+                   "COWORK_KHACH_HOST_DANGNHAP).")
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
     if la_production():
@@ -237,7 +238,9 @@ def kiem_cau_hinh() -> None:
         loi.append("VIPID_PORTAL_SECRET phải KHÁC mọi bí mật khác (Brain, phiên, hạ tầng).")
     if la_production():
         for ten, url in (("CRM_PORTAL_PUBLIC_URL", config.CRM_PORTAL_PUBLIC_URL),
-                         ("COWORK_KHACH_PUBLIC_URL", config.KHACH_PUBLIC_URL)):
+                         ("COWORK_KHACH_PUBLIC_URL", config.KHACH_PUBLIC_URL),
+                         ("URL dangky", url_dangky()), ("URL dangnhap", url_dangnhap()),
+                         *(("COWORK_KHACH_TIEP_CHO_PHEP", u) for u in ds_tiep_cho_phep())):
             if not url.startswith("https://"):
                 loi.append(f"{ten} phải là https ở production.")
     if loi:
@@ -275,7 +278,83 @@ def _ten_host(h: str) -> str:
 
 
 def host_khach() -> list[str]:
-    return [x for x in (chuan_hoa_host(h) for h in config.KHACH_HOSTS) if x]
+    ds = list(config.KHACH_HOSTS) + [h for h in (config.KHACH_HOST_DANGKY,
+                                                 config.KHACH_HOST_DANGNHAP) if h]
+    return [x for x in (chuan_hoa_host(h) for h in ds) if x]
+
+
+def vai_tro_host(host: str | None) -> str | None:
+    """'dangky' | 'dangnhap' | 'tat_ca' (chế độ một host cũ) | None (không phải host khách)."""
+    h = chuan_hoa_host(host)
+    if not h:
+        return None
+    for vai, cau_hinh in (("dangky", config.KHACH_HOST_DANGKY),
+                          ("dangnhap", config.KHACH_HOST_DANGNHAP)):
+        x = chuan_hoa_host(cau_hinh) if cau_hinh else None
+        if x and _khop(h, [x]):
+            return vai
+    ds = [x for x in (chuan_hoa_host(e) for e in config.KHACH_HOSTS) if x]
+    return "tat_ca" if _khop(h, ds) else None
+
+
+def _url_host(url_cau_hinh: str, host: str) -> str:
+    if url_cau_hinh:
+        return url_cau_hinh
+    if host:
+        return f"{'https' if la_production() else 'http'}://{host}"
+    return config.KHACH_PUBLIC_URL
+
+
+def url_dangky() -> str:
+    return _url_host(config.KHACH_DANGKY_URL, config.KHACH_HOST_DANGKY)
+
+
+def url_dangnhap() -> str:
+    return _url_host(config.KHACH_DANGNHAP_URL, config.KHACH_HOST_DANGNHAP)
+
+
+def ds_tiep_cho_phep() -> list[str]:
+    return config.KHACH_TIEP_CHO_PHEP or [config.CRM_PORTAL_PUBLIC_URL + "/portal"]
+
+
+_TIEP_MA_HOA_CAM = re.compile(r"%(2f|5c|2e|00|09|0a|0d|20|40)", re.I)
+
+
+def kiem_tiep(raw: str | None) -> str | None:
+    """Kiểm `tiep` (URL tuyệt đối) theo danh sách cho phép; trả ĐƯỜNG DẪN (path) hoặc None.
+
+    Chặn open-redirect: chỉ https (http chỉ ngoài production), đúng host (không userinfo, không
+    cổng lạ, không dấu chấm cuối), path bắt đầu bằng path cho phép (theo ranh giới '/'), không
+    '\\', '//', '.'/'..', ký tự điều khiển hay mã hoá đánh lừa (%2F %5C %2E %00 …)."""
+    if not raw or len(raw) > 2000:
+        return None
+    if any(ord(c) < 0x21 or ord(c) == 0x7F or c == "\\" for c in raw):
+        return None
+    try:
+        u = urlsplit(raw)
+    except ValueError:
+        return None
+    if u.scheme not in ("https", "http") or (u.scheme == "http" and la_production()):
+        return None
+    if not raw.lower().startswith(u.scheme + "://"):
+        return None
+    if "@" in u.netloc or "%" in u.netloc or not u.netloc:
+        return None
+    path = u.path
+    if (not path.startswith("/") or "//" in path or _TIEP_MA_HOA_CAM.search(path)
+            or any(seg in (".", "..") for seg in path.split("/"))):
+        return None
+    for cho in ds_tiep_cho_phep():
+        try:
+            a = urlsplit(cho)
+        except ValueError:
+            continue
+        if u.scheme != a.scheme or u.netloc.lower() != a.netloc.lower():
+            continue
+        goc = a.path.rstrip("/")
+        if path == goc or path.startswith(goc + "/"):
+            return path
+    return None
 
 
 def host_nhan_vien() -> list[str]:
@@ -592,7 +671,8 @@ def gui_email(conn, account_id: str | None, to_email: str | None, kind: str, tie
 
 
 def _link(path: str) -> str:
-    return f"{config.KHACH_PUBLIC_URL}{path}"
+    """Liên kết trong email / link đặt lại: luôn về host đăng nhập."""
+    return f"{url_dangnhap()}{path}"
 
 
 _CHAN_THU = ("\n\n—\nCÔNG TY TNHH VIP GROUP\nEmail tự động, vui lòng không trả lời. "
@@ -1035,8 +1115,11 @@ def phat_launch_token(conn, acc: dict, request=None, session_id: str | None = No
     return phan + "." + _b64u(sig)
 
 
-def url_launch(token: str) -> str:
-    return f"{config.CRM_PORTAL_PUBLIC_URL}/portal/auth/launch?token={token}"
+def url_launch(token: str, tiep: str | None = None) -> str:
+    """`tiep` (đã qua kiem_tiep) chỉ là ĐƯỜNG DẪN; CRM tự quyết có dùng hay không."""
+    from urllib.parse import quote
+    url = f"{config.CRM_PORTAL_PUBLIC_URL}/portal/auth/launch?token={token}"
+    return url + ("&tiep=" + quote(tiep, safe="/") if tiep else "")
 
 
 # ------------------------------------------------------------------ HMAC VIP ID ⇄ CRM
