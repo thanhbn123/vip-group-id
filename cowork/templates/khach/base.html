@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{ page_title }} · Cổng khách hàng VIP GROUP</title>
+  <link rel="icon" href="/tai-khoan/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/tai-khoan/static/khach.css">
+</head>
+<body>
+<header class="kh-top">
+  <div class="kh-wrap kh-top-in">
+    <a class="kh-brand" href="{{ URL_DANGNHAP }}/tai-khoan/dang-nhap" aria-label="Cổng khách hàng VIP GROUP">
+      <span class="kh-mark" aria-hidden="true">V</span>
+      <span class="kh-brand-text"><b>VIP GROUP</b><small>Cổng khách hàng</small></span>
+    </a>
+  </div>
+</header>
+<main class="kh-wrap kh-main" id="noi-dung">
+  <section class="kh-card">
+    {% block content %}{% endblock %}
+  </section>
+</main>
+<footer class="kh-foot kh-wrap">
+  <p>© 2026 {{ BRAND }} · Dữ liệu được bảo vệ, mọi đăng nhập đều được ghi nhật ký.</p>
+</footer>
+</body>
+</html>

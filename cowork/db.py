@@ -13,6 +13,8 @@ from .schema import (BO_PHAN_MAC_DINH, DDL, MODULES, PERMISSIONS, ROLES,
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 _init_lock = threading.Lock()
 _initialized = False
+#: Lỗi nâng cấp bảng realm khách (None = ổn). Có lỗi ⇒ realm khách TẮT, realm nhân viên vẫn chạy.
+KHACH_LOI: str | None = None
 
 
 def now_iso() -> str:
@@ -60,8 +62,15 @@ def init_db() -> None:
         try:
             conn.executescript(DDL)
             _migrate(conn)
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                         (str(SCHEMA_VERSION),))
+            # Chỉ ghi phiên bản khi nâng cấp realm khách THÀNH CÔNG. Lỗi ⇒ giữ nguyên số cũ (không
+            # báo sai), realm khách tắt; lần khởi động sau tự thử lại (phát hiện theo định nghĩa
+            # bảng), thành công thì mới ghi.
+            if KHACH_LOI is None:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                             "VALUES('khach_schema_version', ?)", (str(SCHEMA_VERSION),))
+                conn.commit()
             _seed(conn)
             _initialized = True
         finally:
@@ -81,6 +90,92 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Nâng DB cũ lên schema hiện tại — CHỈ thêm cột/bảng, không xoá dữ liệu."""
     _them_cot(conn, "users", "mfa_enabled", "INTEGER NOT NULL DEFAULT 0")
     _them_cot(conn, "users", "mfa_secret", "TEXT")
+    # Realm khách (v4) — cột thêm sau bản đầu của bảng; DB dev cũ được bổ sung.
+    _them_cot(conn, "customer_accounts", "phone_conflict_count", "INTEGER NOT NULL DEFAULT 0")
+    _them_cot(conn, "crm_sync_pending", "claimed_until", "TEXT")
+    _them_cot(conn, "customer_accounts", "revoked_at_ms", "INTEGER")
+    _them_cot(conn, "customer_accounts", "launch_at_ms", "INTEGER")
+    global KHACH_LOI
+    KHACH_LOI = None
+    try:
+        _dung_lai_customer_accounts(conn)
+        _them_cot(conn, "customer_accounts", "phone_verified_method", "TEXT")
+        _chuyen_cho_xac_minh_email(conn)
+    except Exception as exc:  # noqa: BLE001 - lỗi realm khách không được làm sập realm nhân viên
+        KHACH_LOI = str(exc)[:500]
+        import logging
+        logging.getLogger("cowork.khach").error(
+            "Nâng cấp DB realm khách thất bại — realm khách TẮT, nhân viên vẫn chạy: %s", exc)
+        try:
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id, actor_id, action, target_type, detail, created_at) "
+                "VALUES('khach','system','khach.migration.loi','schema',?,?)",
+                (KHACH_LOI, now_iso()))
+        except sqlite3.Error:
+            pass
+    conn.commit()
+
+
+def _dung_lai_customer_accounts(conn: sqlite3.Connection) -> None:
+    """Dựng lại customer_accounts theo DDL hiện tại khi ràng buộc cũ không sửa tại chỗ được
+    (SQLite không ALTER CHECK/UNIQUE). CHÉP NGUYÊN mọi dòng, không đổi dữ liệu.
+      - v5: mã khách VG + 6 số ⇒ VG1001, VG1002… (owner). Dòng có mã kiểu cũ ⇒ dừng, báo lỗi rõ.
+      - v6: email_norm hết NOT NULL UNIQUE (owner 07/11: email tuỳ chọn, không xác minh)."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                       "AND name='customer_accounts'").fetchone()
+    sql_cu = (row["sql"] or "") if row else ""
+    if not row or ("VG[0-9][0-9][0-9][0-9][0-9][0-9]" not in sql_cu
+                   and "email_norm TEXT NOT NULL UNIQUE" not in sql_cu):
+        return
+    import re as _re
+    m = _re.search(r"CREATE TABLE IF NOT EXISTS customer_accounts\((.*?)\n\);", DDL, _re.S)
+    if not m:
+        raise RuntimeError("Không tìm thấy DDL customer_accounts để nâng cấp v5.")
+    cot_cu = {r["name"] for r in conn.execute("PRAGMA table_info(customer_accounts)").fetchall()}
+    cot_moi = [x.strip().split()[0] for x in m.group(1).split("\n")
+               if x.strip() and not x.strip().startswith(("CHECK", "AND", "portal_code GLOB"))]
+    ds = ", ".join(c for c in cot_moi if c in cot_cu)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(f"CREATE TABLE customer_accounts_v5({m.group(1)}\n)")
+        try:
+            conn.execute(f"INSERT INTO customer_accounts_v5({ds}) SELECT {ds} FROM customer_accounts")
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError("Nâng cấp v5 dừng: có portal_code kiểu cũ (VG + 6 số) không hợp lệ "
+                               "theo định dạng mới VG1001…; cần xử lý tay trước.") from exc
+        conn.execute("DROP TABLE customer_accounts")
+        conn.execute("ALTER TABLE customer_accounts_v5 RENAME TO customer_accounts")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_crm_id ON "
+                     "customer_accounts(crm_customer_id) WHERE crm_customer_id IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_customer_email ON customer_accounts(email_norm)")
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise RuntimeError(f"Nâng cấp v5: vi phạm khoá ngoại {len(bad)} dòng.")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _chuyen_cho_xac_minh_email(conn: sqlite3.Connection) -> None:
+    """Owner 07/11 bỏ xác minh email: tài khoản cũ còn 'cho_xac_minh_email' ⇒ 'cho_duyet' và xếp
+    hàng signup sang CRM (không gửi ngay)."""
+    rows = q(conn, "SELECT * FROM customer_accounts WHERE status='cho_xac_minh_email'")
+    if not rows:
+        return
+    from . import khach
+    for acc in rows:
+        conn.execute("UPDATE customer_accounts SET status='cho_duyet', updated_at=? WHERE id=? "
+                     "AND status='cho_xac_minh_email'", (now_iso(), acc["id"]))
+        conn.commit()
+        acc["status"] = "cho_duyet"
+        khach._gui_signup(conn, acc)
+        conn.execute("INSERT INTO audit_log(tenant_id, actor_id, action, target_type, target_id, "
+                     "created_at) VALUES('khach','system','khach.migration.cho_duyet','customer',?,?)",
+                     (acc["subject"], now_iso()))
     conn.commit()
 
 

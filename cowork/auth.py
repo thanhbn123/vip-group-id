@@ -12,8 +12,10 @@ TEN_COOKIE = config.COOKIE_NAME
 
 
 def la_https(request) -> bool:
-    return (request.url.scheme == "https"
-            or request.headers.get("x-forwarded-proto", "").lower() == "https")
+    """X-Forwarded-Proto chỉ được tin khi chạy sau proxy đã ghi đè header (COWORK_TIN_PROXY=1)."""
+    if request.url.scheme == "https":
+        return True
+    return config.TIN_PROXY and request.headers.get("x-forwarded-proto", "").lower() == "https"
 
 
 def cookie_kwargs(request, max_age: int | None = None) -> dict:

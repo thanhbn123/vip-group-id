@@ -208,3 +208,142 @@ Không dùng `docker cp` vào `/etc/caddy` vì mount read-only.
 - Validate OK; public health 200; TLS giữ nguyên.
 - Hash trước `eea7ed56…d86f`; sau `c0ae5314…74ad`.
 - Backup trước cutover: `~/Caddyfile.bak-before-cutover-20261019-202511.txt` và `/data/Caddyfile.bak-before-cutover-20261019-202511`.
+
+## Realm khách (cổng khách hàng) — danh sách host
+
+Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
+
+| Biến | Ý nghĩa |
+|---|---|
+| `COWORK_KHACH_HOSTS` | Host realm khách, ví dụ `khachhang.vipgroup.com.vn` |
+| `COWORK_STAFF_HOSTS` | **Danh sách trắng** host nhân viên, ví dụ `cowork.vipgroup.com.vn,127.0.0.1:8899` |
+
+- Host không thuộc danh sách nào (kể cả thiếu Host) ⇒ **421**, không bao giờ rơi về realm nhân viên.
+- Tên host khách và nhân viên phải **khác nhau** (khác cổng là chưa đủ — cookie không tách theo cổng).
+- `COWORK_STAFF_HOSTS` **chưa đặt**: dev/staging ghi cảnh báo lớn khi khởi động và suy ra từ
+  `COWORK_PUBLIC_URL`/`COWORK_INTERNAL_URL`; **production từ chối khởi động**.
+- CRM gọi `/api/internal/khach/*` phải gửi `Host` là host khách.
+- Staging: xem `deploy/vps/README.md` — đặt `COWORK_STAFF_HOSTS` **tường minh**.
+- Trang thử thách Turnstile cần Caddy KHÔNG ghi đè CSP của VIP ID (CSP mở
+  `challenges.cloudflare.com` chỉ trên trang đó).
+
+### Giới hạn đã biết (realm khách)
+- **Vượt ngưỡng trong một loạt đồng thời (P2-c):** bộ giới hạn chung (`vuot_tan_suat`: đăng ký,
+  siteverify theo IP, quên mật khẩu, trần đăng ký…) đếm + ghi trong một giao dịch `BEGIN IMMEDIATE`
+  nên **không** vượt ngưỡng. Riêng bộ đếm đăng nhập sai (khoá cặp/IP) vẫn kiểm rồi mới ghi: một loạt
+  đồng thời có thể vượt ngưỡng một ít, bị chặn trên bởi hàng đợi băm (2 luồng, trần 16).
+- Production bật realm khách bắt buộc `COWORK_TIN_PROXY=1` và `COWORK_COOKIE_SECURE=1`
+  (thiếu ⇒ từ chối khởi động).
+
+### Đăng ký & khôi phục (quyết định owner 07/11/2026)
+- **Không xác minh email, không gọi xác minh SĐT.** Đăng ký tạo ngay tài khoản `cho_duyet` và gửi
+  signup HMAC sang CRM (lỗi mạng ⇒ hàng đợi `crm_sync_pending`, chạy `cowork.cli khach-dong-bo`).
+  Nhân viên duyệt là cổng duy nhất; đăng nhập chỉ khi `hoat_dong`.
+- Email là thông tin liên hệ **tuỳ chọn** (kiểm định dạng nếu nhập, không unique). SĐT vẫn unique.
+- Đăng ký trùng SĐT: phản hồi y hệt, không tạo tài khoản, đánh dấu `phone_conflict` gửi CRM.
+- **Quên mật khẩu do nhân viên hỗ trợ:** trang `/tai-khoan/quen-mat-khau` chỉ hướng dẫn gọi
+  hotline/Zalo (`COWORK_KHACH_HOTLINE`, mặc định `0961 102 655`). CRM cấp link qua
+  `POST /api/internal/khach/tao-link-dat-lai` `{subject, requested_by}` ⇒ `{url, expires_at}`.
+- `COWORK_KHACH_EMAIL_ENABLED=0` (mặc định): không ghi outbox email, không có tự khôi phục qua
+  email; production **không** đòi kênh email thật. Bật `=1` thì phải có kênh gửi thật (A8).
+- Lỗi BUG-VIPID-01 (đã sửa): không dùng `<meta name="referrer" content="no-referrer">` trong trang
+  khách — Chrome gửi `Origin: null` khi POST ⇒ mọi form 403. Header `Referrer-Policy: same-origin`
+  đã đủ.
+
+### Gửi CRM, chống đăng ký ồ ạt, nâng cấp DB
+- **Request không bao giờ gọi CRM.** Mọi signup/thu hồi chỉ xếp hàng `crm_sync_pending`; vòng nền
+  trong tiến trình gửi mỗi `COWORK_KHACH_SYNC_GIAY` giây (mặc định 5). `cowork.cli khach-dong-bo`
+  (cron) vẫn dùng được song song. Thời gian phản hồi đăng ký không phụ thuộc SĐT đã có hay chưa.
+- **Turnstile bắt buộc cho đăng ký** khi đã cấu hình (action `khach_dang_ky`); production đã bắt
+  buộc có khoá thật.
+- **Trần đăng ký toàn hệ thống** `COWORK_KHACH_SIGNUP_GLOBAL_PER_HOUR` (mặc định 200/giờ): vượt ⇒
+  trang "Hệ thống đang nhận quá nhiều đăng ký" (503) + audit `khach.canh_bao.dang_ky_tang_dot_bien`
+  (tối đa 1 dòng/giờ) để cảnh báo.
+- Cập nhật cờ `phone_conflict` sang CRM gộp tối đa 1 lần/subject/giờ (số đếm vẫn tăng tại chỗ).
+- **Nâng cấp DB realm khách lỗi** (ví dụ còn `portal_code` kiểu cũ VG + 6 số): giao dịch dựng lại
+  bảng được hoàn tác, ghi log ERROR + audit `khach.migration.loi`, **realm khách tự tắt**, realm
+  nhân viên vẫn khởi động bình thường. Sửa dữ liệu rồi khởi động lại để thử nâng cấp lại.
+- **Giới hạn rollback:** sau schema v6 (email tuỳ chọn, mã VG1001…), bản code cũ (v4/v5) **không**
+  dùng được DB này nữa (ràng buộc khác). Rollback code ⇒ phải khôi phục bản backup DB chụp TRƯỚC
+  khi nâng cấp (`scripts/backup.sh`). Tắt cờ `COWORK_KHACH_ENABLED=0` là cách rollback an toàn mà
+  không đổi code.
+
+
+### Hợp đồng thu hồi VIP ID → CRM
+`POST {CRM_PORTAL_INTERNAL_URL}/api/internal/portal/thu-hoi` (HMAC `vipid->crm`), body:
+`{subject, reason, revoked_at, revoked_at_ms}` — `reason` ∈ `dang_xuat` | `dat_lai_mat_khau` |
+`doi_mat_khau` | `rut_pilot` (tài khoản bị rút khỏi danh sách pilot); `revoked_at_ms` = **mili-giây unix (số nguyên) lúc thu hồi xảy ra tại VIP ID**,
+ghi khi xếp hàng (gửi là bất đồng bộ); `revoked_at` = `revoked_at_ms // 1000` (giây, tương thích).
+
+Launch token có thêm claim `iat_ms` (mili-giây unix lúc phát; `iat = iat_ms // 1000`).
+**CRM so theo mili-giây:** từ chối khi `iat_ms < revoked_at_ms` (INTEROP-05: đăng xuất cùng giây với
+launch). VIP ID bảo đảm bất biến theo từng tài khoản (lưu `revoked_at_ms`, `launch_at_ms`):
+- mọi launch đã phát TRƯỚC một lần thu hồi có `iat_ms < revoked_at_ms` (kể cả cùng mili-giây);
+- mọi launch phát SAU (đổi mật khẩu, đặt lại, đăng nhập lại) có `iat_ms > revoked_at_ms` —
+  mốc thu hồi được lấy TRƯỚC khi tạo phiên mới.
+
+#### Nguyên tử và kẹp đồng hồ (R8)
+- Phát launch: **một giao dịch ghi** — kiểm phiên VIP ID còn sống + một
+  `UPDATE … SET launch_at_ms = MIN(MAX(launch_at_ms, revoked_at_ms + 1, now), now + 5 phút) RETURNING`.
+- Thu hồi (đăng xuất, đặt lại, đổi mật khẩu): **một giao dịch ghi** — một
+  `UPDATE … SET revoked_at_ms = MIN(MAX(revoked_at_ms + 1, launch_at_ms + 1, now), now + 5 phút) RETURNING`
+  + thu hồi phiên VIP ID tương ứng. Không có khe đọc-rồi-ghi giữa launch và thu hồi.
+- Mốc lưu không vượt `now + 5 phút`; khi phải kẹp ⇒ audit `khach.canh_bao.dong_ho` + log WARNING.
+
+#### Runbook: đặt lại mốc thời gian của một khách (sau sự cố đồng hồ)
+Dấu hiệu: audit `khach.canh_bao.dong_ho`, hoặc khách đăng nhập được VIP ID nhưng CRM liên tục từ
+chối launch (mốc `revoked_at_ms` ở tương lai).
+1. Sửa đồng hồ máy chủ (NTP) trước.
+2. `COWORK_DATA_DIR=… COWORK_DB_PATH=… .venv/bin/python -m cowork.cli khach-dat-lai-moc <SĐT|VG…|cust:…>`
+   — đưa `revoked_at_ms`/`launch_at_ms` về hiện tại, thu hồi mọi phiên VIP ID của khách, ghi audit
+   `khach.ops.dat_lai_moc`, in mốc mới.
+3. Yêu cầu phiên CRM đặt lại `revoked_at_ms` của subject đó (phía CRM) về **cùng mốc** đã in.
+4. Khách đăng nhập lại.
+
+### Pilot (chạy thử có kiểm soát) và công tắc bảo trì
+- `COWORK_KHACH_PILOT=1`: chỉ SĐT trong danh sách trắng (`COWORK_KHACH_PILOT_PHONES` ∪ tệp
+  `COWORK_KHACH_PILOT_FILE`, đọc lại khi tệp đổi) được **đăng ký, đăng nhập, vào cổng, khôi phục**.
+  Ngoài danh sách ⇒ trang "Cổng khách hàng VIP GROUP đang chạy thử nội bộ, sẽ mở sớm. Liên hệ
+  hotline/Zalo …" (403): không tạo tài khoản, không gửi CRM, không kiểm mật khẩu, không đếm lượt.
+  Quyết định chỉ dựa trên danh sách (SĐT của định danh, hoặc của tài khoản mang mã VG…) nên không lộ
+  SĐT đã có tài khoản hay chưa. Phiên đang có của tài khoản bị rút khỏi danh sách hết dùng được;
+  CRM xin link đặt lại cho tài khoản ngoài danh sách ⇒ 403 `PILOT`.
+- CLI `cowork.cli khach-pilot add|remove|list` (sửa tệp nguyên tử, 0600, audit). SĐT trong env chỉ
+  sửa được bằng env.
+- Production bật realm khách **bắt buộc** đặt `COWORK_KHACH_PILOT=0` hoặc `1` (thiếu ⇒ từ chối khởi
+  động) — buộc quyết định tường minh.
+- **Công tắc khẩn** `COWORK_KHACH_MAINTENANCE_FILE` (mặc định `data/khach_bao_tri.flag`):
+  `touch <tệp>` ⇒ mọi request host khách 503 bảo trì ngay; `rm <tệp>` ⇒ mở lại. Không ảnh hưởng
+  realm nhân viên. Kiểm bằng `os.stat`: mọi lỗi khác "không có tệp" ⇒ coi như đang bảo trì.
+  **Không đóng phiên portal CRM đang mở** — CRM có `portal.off` riêng; vận hành phải touch cả hai.
+- Rút SĐT khỏi pilot (CLI hoặc sửa tay tệp — phát hiện khi tệp đổi) ⇒ thu hồi mọi phiên VIP ID + xếp
+  hàng thu hồi portal CRM (`rut_pilot`, có `revoked_at_ms`). Đăng xuất vẫn dùng được với tài khoản
+  ngoài pilot. Tệp pilot không đọc được ⇒ fail-closed (chỉ SĐT env), audit `khach.pilot.loi_tep`.
+  Giới hạn: thay đổi xảy ra khi tiến trình đang tắt (hoặc sửa env) không được phát hiện như "rút" —
+  phiên VIP ID của tài khoản ngoài danh sách vẫn bị chặn ở mỗi request, nhưng phiên portal CRM tồn
+  tại tới khi hết hạn; khi đó chạy `khach-pilot remove` (hoặc `khach-dat-lai-moc`) để báo CRM.
+
+### §15 — hai tên miền realm khách (dangky / dangnhap)
+| Biến | Ví dụ production |
+|---|---|
+| `COWORK_KHACH_HOST_DANGKY` | `dangky.vipgroup.com.vn` — chỉ `/tai-khoan/dang-ky`, `/tai-khoan/cho-duyet`, static; `/` → đăng ký |
+| `COWORK_KHACH_HOST_DANGNHAP` | `dangnhap.vipgroup.com.vn` — đăng nhập, đăng xuất, hồ sơ, đổi/quên/đặt lại mật khẩu, `vao-cong`, chờ duyệt, static, **API nội bộ**; `/` → đăng nhập |
+| `COWORK_KHACH_DANGKY_URL` / `COWORK_KHACH_DANGNHAP_URL` | URL tuyệt đối cho liên kết chéo (mặc định `https://<host>` ở production) |
+| `COWORK_KHACH_TIEP_CHO_PHEP` | `https://khachhang.vipgroup.com.vn/portal` (mặc định `CRM_PORTAL_PUBLIC_URL/portal`) |
+
+- Mỗi host chỉ phục vụ route của nó (còn lại 404). Để trống cả hai ⇒ chế độ một host cũ
+  (`COWORK_KHACH_HOSTS`, dùng cho dev/test). Chế độ hai host **bỏ** giá trị mặc định của
+  `COWORK_KHACH_HOSTS`; production đặt cả hai kiểu ⇒ từ chối khởi động trừ khi
+  `COWORK_KHACH_HOSTS_CA_HAI=1`.
+- Cookie luôn host-only (không đặt `Domain`): `vg_khach` chỉ có ở dangnhap.
+- `/api/internal/khach/*` chỉ trên host dangnhap **và** chỉ khi gọi trực tiếp qua mạng nội bộ:
+  request mang `X-Forwarded-For` / `X-Real-IP` / `Forwarded` / `Via` (đi qua proxy công khai) ⇒ 404.
+  Caddy nên chặn thêm `/api/internal/*` trên mọi site công khai.
+- Turnstile: hostname trong phản hồi siteverify phải khớp đúng host đang phục vụ (dangky ≠ dangnhap).
+- Link đặt lại mật khẩu (CRM xin) luôn trỏ host dangnhap.
+- **`tiep` sau đăng nhập:** `GET /tai-khoan/dang-nhap?tiep=<URL tuyệt đối>` (và `vao-cong?tiep=`).
+  Chỉ nhận khi URL khớp một tiền tố trong `COWORK_KHACH_TIEP_CHO_PHEP`: https (http chỉ ngoài
+  production), đúng host (không userinfo, không cổng khác, không dấu chấm cuối), path bắt đầu bằng
+  path cho phép theo ranh giới `/`, không `\`, `//`, `.`/`..`, ký tự điều khiển hay mã hoá đánh lừa
+  (`%2F %5C %2E %00`…). Hợp lệ ⇒ launch `…/portal/auth/launch?token=…&tiep=<chỉ path>` (CRM tự quyết);
+  không hợp lệ ⇒ bỏ qua, như `vao-cong` mặc định.

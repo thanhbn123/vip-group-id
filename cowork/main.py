@@ -1,6 +1,7 @@
 """VIP GROUP COWORK — ứng dụng FastAPI."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import config, db, web
+from . import config, db, khach, khach_web, web
 from .errors import AuthRequired, CoworkError, Forbidden, NotFound, ValidationError
 from .routers import (accounts, audit_routes, auth_routes, brain_routes, dashboard, hatang,
                       departments, internal, modules, roles, settings_routes)
@@ -22,9 +23,22 @@ log = logging.getLogger("cowork")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Realm khách bật mà cấu hình không an toàn (A8, bí mật, host) ⇒ từ chối khởi động.
+    khach.kiem_cau_hinh()
     db.init_db()
     log.info("COWORK khởi động — DB=%s · public=%s", config.DB_PATH, config.PUBLIC_URL)
-    yield
+    if config.KHACH_ENABLED and db.KHACH_LOI:
+        log.error("Realm khách TẮT do lỗi nâng cấp DB: %s", db.KHACH_LOI)
+    tac_vu = asyncio.create_task(khach_web.vong_dong_bo_crm()) if khach.realm_bat() else None
+    try:
+        yield
+    finally:
+        if tac_vu:
+            tac_vu.cancel()
+            try:
+                await tac_vu
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 app = FastAPI(title=config.APP_NAME, version=config.APP_VERSION, docs_url=None,
@@ -32,6 +46,8 @@ app = FastAPI(title=config.APP_NAME, version=config.APP_VERSION, docs_url=None,
 
 app.add_middleware(web.FlashMiddleware)
 app.add_middleware(web.SecurityHeadersMiddleware)
+# Ngoài cùng: Host khách ⇒ app realm khách (route nhân viên không tồn tại ở đó).
+app.add_middleware(khach_web.KhachHostDispatch)
 
 app.include_router(auth_routes.router, tags=["auth"])
 app.include_router(dashboard.router, tags=["dashboard"])

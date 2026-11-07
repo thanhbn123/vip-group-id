@@ -86,3 +86,53 @@ cd /srv/vip-staging/cowork
 ./deploy/vps/backup.sh          # backup ngay
 crontab -l | grep cowork        # lịch 03:20
 ```
+
+## Realm khách trên staging (chỉ khi owner cho phép)
+
+Realm khách mặc định TẮT. Nếu bật trên staging, đặt tường minh trong `.env.staging`
+(không để VIP ID tự suy ra host nhân viên):
+
+```
+COWORK_KHACH_ENABLED=1
+COWORK_KHACH_HOSTS=khachhang-staging.vipgroup.com.vn
+COWORK_STAFF_HOSTS=cowork-staging.vipgroup.com.vn,127.0.0.1:8899
+COWORK_TIN_PROXY=1            # Caddy ghi đè X-Real-IP / X-Forwarded-Proto
+```
+
+- Thiếu `COWORK_STAFF_HOSTS` ⇒ staging chỉ cảnh báo khi khởi động, **production từ chối chạy**.
+- Host không thuộc hai danh sách ⇒ 421. Tên host khách và nhân viên phải khác nhau.
+- Turnstile (thử thách đăng nhập khi tài khoản bị dò): `COWORK_KHACH_TURNSTILE_SITE_KEY` + secret
+  qua env `COWORK_KHACH_TURNSTILE_SECRET` hoặc tệp 0600 `COWORK_KHACH_TURNSTILE_SECRET_FILE`.
+  Staging có thể dùng khoá thử nghiệm của Cloudflare; production bắt buộc khoá thật.
+
+## Pilot production có kiểm soát (owner duyệt) + công tắc khẩn
+
+Chỉ owner và các tài khoản được chỉ định. Trong `.env` production:
+
+```
+COWORK_KHACH_ENABLED=1
+COWORK_KHACH_PILOT=1                       # BẮT BUỘC đặt tường minh 0 hoặc 1 ở production
+COWORK_KHACH_PILOT_PHONES=0961102655       # (tuỳ chọn) SĐT cố định, phân tách bằng dấu phẩy
+COWORK_KHACH_PILOT_FILE=/srv/…/data/khach_pilot.txt
+COWORK_KHACH_MAINTENANCE_FILE=/srv/…/data/khach_bao_tri.flag
+```
+
+Quản lý danh sách pilot (có audit `khach.pilot.them|bot`, hiệu lực ngay, không cần khởi động lại):
+
+```
+.venv/bin/python -m cowork.cli khach-pilot list
+.venv/bin/python -m cowork.cli khach-pilot add 0901234567
+.venv/bin/python -m cowork.cli khach-pilot remove 0901234567
+```
+
+**Đóng cổng khách NGAY (không khởi động lại):** `touch /srv/…/data/khach_bao_tri.flag` — mọi request
+host khách trả 503 trang bảo trì (kèm hotline), API nội bộ CRM → VIP ID trả 503 `BAO_TRI` (CRM tự
+thử lại). Realm nhân viên không bị ảnh hưởng. **Mở lại:** `rm /srv/…/data/khach_bao_tri.flag`.
+Kiểm tệp **fail-closed**: lỗi khác "không có tệp" (quyền, IO) ⇒ coi như đang bảo trì.
+
+> **Lưu ý:** bảo trì VIP ID **không** đóng các phiên portal đang mở ở CRM (khachhang). CRM có công tắc
+> riêng (`portal.off`). Muốn đóng hẳn cổng khách: **touch cả hai** (VIP ID + CRM).
+
+Rút một SĐT khỏi pilot (`khach-pilot remove`, hoặc sửa tay tệp) ⇒ thu hồi ngay mọi phiên VIP ID của
+tài khoản đó và xếp hàng thu hồi phiên portal ở CRM (`reason: "rut_pilot"`). Tệp pilot không đọc
+được ⇒ fail-closed (chỉ còn SĐT trong env) + audit `khach.pilot.loi_tep`.

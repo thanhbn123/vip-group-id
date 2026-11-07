@@ -1,0 +1,20 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>Quên mật khẩu</h1>
+{% if not email_bat %}
+<p>Vui lòng liên hệ <b>hotline/Zalo {{ hotline }}</b> để được cấp link đặt lại mật khẩu.</p>
+<p class="kh-muted">Nhân viên VIP GROUP sẽ xác nhận thông tin của bạn qua điện thoại rồi gửi link đặt lại mật khẩu qua Zalo. Link chỉ dùng được một lần trong 30 phút.</p>
+{% elif da_gui %}
+<div class="kh-alert kh-alert-ok" role="status">Nếu thông tin khớp với một tài khoản, chúng tôi đã gửi liên kết đặt lại mật khẩu tới email đã đăng ký. Liên kết có hiệu lực 30 phút.</div>
+{% else %}
+<p class="kh-muted">Nhập email, số điện thoại hoặc mã khách hàng. Liên kết đặt lại sẽ được gửi tới email đã đăng ký.</p>
+<form method="post" action="/tai-khoan/quen-mat-khau" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label class="kh-field"><span>Email, số điện thoại hoặc mã khách hàng</span>
+    <input type="text" name="dinh_danh" required maxlength="254" autocomplete="username" spellcheck="false"></label>
+  <button class="kh-btn" type="submit">Gửi liên kết</button>
+</form>
+<p class="kh-muted">Hoặc liên hệ hotline/Zalo {{ hotline }}.</p>
+{% endif %}
+<p class="kh-links"><a href="{{ URL_DANGNHAP }}/tai-khoan/dang-nhap">Về trang đăng nhập</a></p>
+{% endblock %}

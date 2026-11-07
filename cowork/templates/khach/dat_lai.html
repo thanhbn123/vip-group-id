@@ -1,0 +1,19 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>Đặt lại mật khẩu</h1>
+{% include "khach/_loi.html" %}
+{% if hop_le %}
+<form method="post" action="/tai-khoan/dat-lai" class="kh-form">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="t" value="{{ token }}">
+  <label class="kh-field"><span>Mật khẩu mới (ít nhất 12 ký tự)</span>
+    <input type="password" name="mat_khau" required minlength="12" maxlength="200" autocomplete="new-password"></label>
+  <label class="kh-field"><span>Nhập lại mật khẩu mới</span>
+    <input type="password" name="mat_khau_2" required minlength="12" maxlength="200" autocomplete="new-password"></label>
+  <button class="kh-btn" type="submit">Đặt mật khẩu mới</button>
+</form>
+{% else %}
+{% if not loi %}<div class="kh-alert kh-alert-err" role="alert">Liên kết đặt lại mật khẩu không hợp lệ, đã dùng hoặc đã hết hạn.</div>{% endif %}
+<p><a href="/tai-khoan/quen-mat-khau">Cách nhận liên kết mới</a></p>
+{% endif %}
+{% endblock %}

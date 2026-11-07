@@ -198,7 +198,7 @@ def test_tai_khoan_bi_khoa_giua_phien(client, owner):
 
 
 # ---------------------------------------------------------- 4. thuộc tính cookie
-def test_cookie_httponly_samesite_lax_secure_khi_https(client, owner):
+def test_cookie_httponly_samesite_lax_secure_khi_https(client, owner, monkeypatch):
     r = dang_nhap(client, "anh-thanh", "Owner!Passw0rd")
     header = r.headers.get("set-cookie", "")
     assert COOKIE in header
@@ -216,13 +216,19 @@ def test_cookie_httponly_samesite_lax_secure_khi_https(client, owner):
     assert "SameSite=lax" in header_https
     assert c_https.get("/api/me").status_code == 200
 
-    # Sau reverse proxy: X-Forwarded-Proto=https cũng phải bật Secure.
-    c_proxy = _client()
-    token_csrf = csrf_tu(c_proxy.get("/dang-nhap").text)
-    r_proxy = c_proxy.post("/dang-nhap", data={
-        "userId": "anh-thanh", "matKhau": "Owner!Passw0rd", "_csrf": token_csrf,
-        "next": "/"}, headers={"X-Forwarded-Proto": "https"}, follow_redirects=False)
+    # X-Forwarded-Proto chỉ được tin khi COWORK_TIN_PROXY=1 (sau Caddy đã ghi đè header).
+    def _qua_proxy():
+        c_proxy = _client()
+        token_csrf = csrf_tu(c_proxy.get("/dang-nhap").text)
+        return c_proxy.post("/dang-nhap", data={
+            "userId": "anh-thanh", "matKhau": "Owner!Passw0rd", "_csrf": token_csrf,
+            "next": "/"}, headers={"X-Forwarded-Proto": "https"}, follow_redirects=False)
+    assert "Secure" not in _qua_proxy().headers.get("set-cookie", "")
+    assert "strict-transport-security" not in _qua_proxy().headers
+    monkeypatch.setattr(config, "TIN_PROXY", True)
+    r_proxy = _qua_proxy()
     assert "Secure" in r_proxy.headers.get("set-cookie", "")
+    assert "strict-transport-security" in r_proxy.headers
 
 
 # ------------------------------------------------------------------ 5. CSRF

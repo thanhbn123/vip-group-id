@@ -1,0 +1,6 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<h1>{{ tieu_de }}</h1>
+<p>{{ noi_dung }}</p>
+{% if link_dang_nhap %}<p class="kh-links"><a href="{{ URL_DANGNHAP }}/tai-khoan/dang-nhap">Về trang đăng nhập</a></p>{% endif %}
+{% endblock %}

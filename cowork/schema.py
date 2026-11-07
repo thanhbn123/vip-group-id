@@ -1,7 +1,7 @@
 """Schema + dữ liệu nền COWORK. Idempotent: chạy nhiều lần không nhân đôi dữ liệu."""
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -233,6 +233,127 @@ CREATE TABLE IF NOT EXISTS hatang_bao_cao(
     nhan_luc TEXT NOT NULL,
     du_lieu TEXT NOT NULL
 );
+
+-- ===================== REALM KHÁCH (v4, chỉ THÊM bảng) =====================
+-- Bảng RIÊNG, không dùng `users` của nhân viên: không có đường leo thang sang vai trò
+-- nhân viên. subject = 'cust:' || id nên không thể trùng ID nhân viên.
+CREATE TABLE IF NOT EXISTS customer_accounts(
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL UNIQUE CHECK(subject = 'cust:' || id),
+    phone_e164 TEXT NOT NULL UNIQUE,
+    email_norm TEXT,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    password_algo TEXT NOT NULL DEFAULT 'scrypt',
+    status TEXT NOT NULL DEFAULT 'cho_duyet'
+        CHECK(status IN ('cho_xac_minh_email','cho_duyet','hoat_dong','tu_choi','tam_khoa')),
+    consent_at TEXT NOT NULL,
+    email_verified_at TEXT,
+    phone_verified_at TEXT,
+    phone_verified_by TEXT,
+    phone_verified_method TEXT,
+    crm_customer_id TEXT,
+    customer_code TEXT,
+    portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR (
+        portal_code GLOB 'VG[1-9][0-9][0-9][0-9]*' AND length(portal_code) BETWEEN 6 AND 11
+        AND substr(portal_code, 3) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(portal_code, 3) AS INTEGER) >= 1001)),
+    token_version INTEGER NOT NULL DEFAULT 1,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    phone_conflict_count INTEGER NOT NULL DEFAULT 0,
+    revoked_at_ms INTEGER,
+    launch_at_ms INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_login_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_crm_id ON customer_accounts(crm_customer_id)
+    WHERE crm_customer_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_email ON customer_accounts(email_norm);
+
+CREATE TABLE IF NOT EXISTS customer_sessions(
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    csrf_token TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    token_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+    revoked_at TEXT,
+    revoke_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_customer_sessions_acc ON customer_sessions(account_id, status);
+
+CREATE TABLE IF NOT EXISTS customer_tokens(
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    account_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL CHECK(purpose IN ('kich_hoat_email','khoi_phuc')),
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS customer_login_attempts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_key TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_customer_login_key ON customer_login_attempts(account_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_customer_login_ip ON customer_login_attempts(ip, created_at);
+
+-- Dev/staging: KHÔNG gửi thật. Production bị chặn khởi động khi chưa có kênh thật (A8).
+CREATE TABLE IF NOT EXISTS customer_outbox(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT,
+    kind TEXT NOT NULL,
+    to_email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+);
+
+-- Hàng đợi gửi sang CRM (signup, thu hồi), idempotent theo idem_key.
+CREATE TABLE IF NOT EXISTS crm_sync_pending(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idem_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    path TEXT NOT NULL,
+    body TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    done_at TEXT,
+    claimed_until TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_crm_sync_due ON crm_sync_pending(done_at, next_at);
+
+-- Chống phát lại chữ ký HMAC chiều CRM → VIP ID.
+CREATE TABLE IF NOT EXISTS customer_hmac_seen(
+    sig TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Bộ đếm tần suất chung (đăng ký, quên mật khẩu, thông báo trùng...).
+CREATE TABLE IF NOT EXISTS customer_rate_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_customer_rate ON customer_rate_events(bucket, key, created_at);
 """
 
 #: Module registry mặc định. `route` là đường dẫn COWORK; module cần Brain sẽ mở qua ticket.

@@ -7,7 +7,16 @@ from fastapi.responses import RedirectResponse
 from .. import audit, auth, config, db, rbac, security, services, web
 from ..errors import Conflict, Forbidden, NotFound, ValidationError
 
-router = APIRouter()
+
+
+async def _chan_ten_danh_rieng(request: Request) -> None:
+    """Chạy TRƯỚC kiểm đăng nhập: /tai-khoan/<tên realm khách> luôn 404 trên host nhân viên.
+    async: không chiếm threadpool (route đồng bộ bị nghẽn không kéo theo trang nhân viên)."""
+    if request.path_params.get("user_id") in security.TEN_DANH_RIENG_KHACH:
+        raise NotFound("Không tìm thấy tài khoản trong tenant.")
+
+
+router = APIRouter(dependencies=[Depends(_chan_ten_danh_rieng)])
 
 
 # ------------------------------------------------------------------ tiện ích

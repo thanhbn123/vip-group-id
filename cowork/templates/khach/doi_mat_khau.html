@@ -1,0 +1,18 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<p class="kh-eyebrow">Bảo mật</p>
+<h1>Đổi mật khẩu</h1>
+<p class="kh-muted">Sau khi đổi, các thiết bị khác sẽ bị đăng xuất.</p>
+{% include "khach/_loi.html" %}
+<form method="post" action="/tai-khoan/doi-mat-khau" class="kh-form" autocomplete="off">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label class="kh-field"><span>Mật khẩu hiện tại</span>
+    <input type="password" name="mat_khau_cu" required maxlength="200" autocomplete="current-password"></label>
+  <label class="kh-field"><span>Mật khẩu mới (ít nhất 12 ký tự)</span>
+    <input type="password" name="mat_khau" required minlength="12" maxlength="200" autocomplete="new-password"></label>
+  <label class="kh-field"><span>Nhập lại mật khẩu mới</span>
+    <input type="password" name="mat_khau_2" required minlength="12" maxlength="200" autocomplete="new-password"></label>
+  <button class="kh-btn" type="submit">Đổi mật khẩu</button>
+</form>
+<p class="kh-links"><a href="/tai-khoan/ho-so">Quay lại tài khoản</a></p>
+{% endblock %}

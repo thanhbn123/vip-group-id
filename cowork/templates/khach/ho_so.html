@@ -1,0 +1,17 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<p class="kh-eyebrow">Tài khoản của tôi</p>
+<h1>{{ acc.display_name }}</h1>
+{% if da_doi %}<div class="kh-alert kh-alert-ok" role="status">Đã đổi mật khẩu. Các thiết bị khác đã được đăng xuất.</div>{% endif %}
+<dl class="kh-info">
+  <dt>Mã khách hàng</dt><dd><b>{{ acc.portal_code or "—" }}</b></dd>
+  <dt>Số điện thoại</dt><dd>{{ sdt_che }}</dd>
+  <dt>Email</dt><dd class="kh-break">{{ acc.email_norm or "—" }}</dd>
+</dl>
+<p><a class="kh-btn" href="/tai-khoan/vao-cong">Vào cổng khách hàng</a></p>
+<p><a class="kh-btn kh-btn-ghost" href="/tai-khoan/doi-mat-khau">Đổi mật khẩu</a></p>
+<form method="post" action="/tai-khoan/dang-xuat" class="kh-form-inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button class="kh-btn kh-btn-ghost" type="submit">Đăng xuất</button>
+</form>
+{% endblock %}
