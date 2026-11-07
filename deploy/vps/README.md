@@ -86,3 +86,21 @@ cd /srv/vip-staging/cowork
 ./deploy/vps/backup.sh          # backup ngay
 crontab -l | grep cowork        # lịch 03:20
 ```
+
+## Realm khách trên staging (chỉ khi owner cho phép)
+
+Realm khách mặc định TẮT. Nếu bật trên staging, đặt tường minh trong `.env.staging`
+(không để VIP ID tự suy ra host nhân viên):
+
+```
+COWORK_KHACH_ENABLED=1
+COWORK_KHACH_HOSTS=khachhang-staging.vipgroup.com.vn
+COWORK_STAFF_HOSTS=cowork-staging.vipgroup.com.vn,127.0.0.1:8899
+COWORK_TIN_PROXY=1            # Caddy ghi đè X-Real-IP / X-Forwarded-Proto
+```
+
+- Thiếu `COWORK_STAFF_HOSTS` ⇒ staging chỉ cảnh báo khi khởi động, **production từ chối chạy**.
+- Host không thuộc hai danh sách ⇒ 421. Tên host khách và nhân viên phải khác nhau.
+- Turnstile (thử thách đăng nhập khi tài khoản bị dò): `COWORK_KHACH_TURNSTILE_SITE_KEY` + secret
+  qua env `COWORK_KHACH_TURNSTILE_SECRET` hoặc tệp 0600 `COWORK_KHACH_TURNSTILE_SECRET_FILE`.
+  Staging có thể dùng khoá thử nghiệm của Cloudflare; production bắt buộc khoá thật.

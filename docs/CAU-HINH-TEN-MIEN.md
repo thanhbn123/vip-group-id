@@ -223,3 +223,6 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
 - `COWORK_STAFF_HOSTS` **chưa đặt**: dev/staging ghi cảnh báo lớn khi khởi động và suy ra từ
   `COWORK_PUBLIC_URL`/`COWORK_INTERNAL_URL`; **production từ chối khởi động**.
 - CRM gọi `/api/internal/khach/*` phải gửi `Host` là host khách.
+- Staging: xem `deploy/vps/README.md` — đặt `COWORK_STAFF_HOSTS` **tường minh**.
+- Trang thử thách Turnstile cần Caddy KHÔNG ghi đè CSP của VIP ID (CSP mở
+  `challenges.cloudflare.com` chỉ trên trang đó).
