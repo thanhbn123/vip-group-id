@@ -252,6 +252,19 @@ TURNSTILE_IP_MOI_PHUT = 10
 _ts_dang_goi = 0
 
 
+def _turnstile_qua_tan_suat(request: Request) -> bool:
+    conn = db.connect()
+    try:
+        if khach.vuot_tan_suat(conn, "turnstile_ip", _ip_khoa(request), TURNSTILE_IP_MOI_PHUT, 60):
+            khach._ghi_audit(conn, "khach:anon", "khach.turnstile.qua_tan_suat",
+                             detail={"ip": _ip_khoa(request)}, request=request,
+                             lay_mau=_ip_khoa(request))
+            return True
+        return False
+    finally:
+        conn.close()
+
+
 async def _vuot_turnstile(request: Request, token: str,
                           action: str = khach.TURNSTILE_ACTION) -> str:
     """'ok' | 'sai' | 'qua_tan_suat'.
@@ -263,15 +276,8 @@ async def _vuot_turnstile(request: Request, token: str,
     global _ts_dang_goi
     if not khach.turnstile_bat() or not token or len(token) > 2048:
         return "sai"
-    conn = db.connect()
-    try:
-        if khach.vuot_tan_suat(conn, "turnstile_ip", _ip_khoa(request), TURNSTILE_IP_MOI_PHUT, 60):
-            khach._ghi_audit(conn, "khach:anon", "khach.turnstile.qua_tan_suat",
-                             detail={"ip": _ip_khoa(request)}, request=request,
-                             lay_mau=_ip_khoa(request))
-            return "qua_tan_suat"
-    finally:
-        conn.close()
+    if await asyncio.to_thread(_turnstile_qua_tan_suat, request):
+        return "qua_tan_suat"
     han = time.monotonic() + TURNSTILE_CHO_SLOT_GIAY
     while _ts_dang_goi >= TURNSTILE_DONG_THOI_TOI_DA:
         if time.monotonic() >= han:
@@ -386,22 +392,14 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
     thiet_bi = request.cookies.get(khach.COOKIE_THIET_BI)
     ip = _ip_khoa(request)
     ts_ok = False
-    conn = db.connect()
-    try:
-        if not _kiem_csrf(request, csrf_form):
-            ctx = _ctx_phien(request, conn)  # đang đăng nhập: chấp nhận token CSRF của phiên
-            if not ctx or not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
-                return _loi_csrf(request)
-        # Lớp chặn rẻ chạy ngay (không băm, không vào hàng đợi băm).
-        try:
-            khach.kiem_chan(conn, dinh_danh, ip, thiet_bi, request)
-            thu_thach = None
-        except khach.ThuThach as e:
-            thu_thach = e
-        except khach.KhachLoi as e:
-            return _loi_dang_nhap(request, e, dinh_danh)
-    finally:
-        conn.close()
+    # CSRF + lớp chặn rẻ (không băm) chạy trong luồng: ghi giới hạn/audit SQLite không chặn loop.
+    ket, e = await asyncio.to_thread(_kiem_truoc_dang_nhap, request, dinh_danh, ip, thiet_bi,
+                                     csrf_form)
+    if ket == "csrf":
+        return _loi_csrf(request)
+    if ket == "loi":
+        return _loi_dang_nhap(request, e, dinh_danh)
+    thu_thach = e if ket == "thu_thach" else None
     if thu_thach is not None:
         # CHỈ gọi siteverify sau khi CSRF/cùng nguồn đạt VÀ chính lớp chặn đòi thử thách.
         kq = await _vuot_turnstile(request, cf_token) if cf_token else "sai"
@@ -414,6 +412,34 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
         ts_ok = True
     return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi,
                            ts_ok)
+
+
+def _doc_phien(request: Request) -> dict | None:
+    conn = db.connect()
+    try:
+        return _ctx_phien(request, conn)
+    finally:
+        conn.close()
+
+
+def _kiem_truoc_dang_nhap(request: Request, dinh_danh: str, ip: str, thiet_bi: str | None,
+                          csrf_form: str):
+    """('ok'|'csrf'|'loi'|'thu_thach', lỗi). Chạy trong luồng (có đọc/ghi SQLite)."""
+    conn = db.connect()
+    try:
+        if not _kiem_csrf(request, csrf_form):
+            ctx = _ctx_phien(request, conn)  # đang đăng nhập: chấp nhận token CSRF của phiên
+            if not ctx or not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
+                return "csrf", None
+        try:
+            khach.kiem_chan(conn, dinh_danh, ip, thiet_bi, request)
+            return "ok", None
+        except khach.ThuThach as e:
+            return "thu_thach", e
+        except khach.KhachLoi as e:
+            return "loi", e
+    finally:
+        conn.close()
 
 
 def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
@@ -494,15 +520,11 @@ def doi_mat_khau_form(request: Request):
 @khach_app.post("/tai-khoan/doi-mat-khau")
 async def doi_mat_khau(request: Request, mat_khau_cu: str = Form(""), mat_khau: str = Form(""),
                        mat_khau_2: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
-    conn = db.connect()
-    try:
-        ctx = _ctx_phien(request, conn)
-        if not ctx:
-            return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
-        if not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
-            return _loi_csrf(request)
-    finally:
-        conn.close()
+    ctx = await asyncio.to_thread(_doc_phien, request)  # SQLite ngoài event loop
+    if not ctx:
+        return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
+    if not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
+        return _loi_csrf(request)
     return await _chay_kdf(request, _doi_mat_khau, request, ctx, mat_khau_cu[:200],
                            mat_khau[:200], mat_khau_2[:200])
 
@@ -651,30 +673,39 @@ async def _doc_body(request: Request) -> bytes | None:
     return bytes(buf)
 
 
-async def _noi_bo(request: Request, xu_ly) -> JSONResponse:
-    raw = await _doc_body(request)
-    if raw is None:
-        return _jloi(413, "QUA_LON", "Thiếu Content-Length hoặc yêu cầu quá lớn (tối đa 10 KB).")
+def _noi_bo_dong_bo(request: Request, xu_ly, raw: bytes):
     conn = db.connect()
     try:
         kq_ky = khach.xac_thuc_vao(conn, request.method, request.url.path,
                                    request.headers.get("x-portal-ts"),
                                    request.headers.get("x-portal-sig"), raw)
         if kq_ky == "phat_lai":
-            return _jloi(409, "PHAT_LAI", "Chữ ký này đã được dùng; ký lại với X-Portal-Ts mới.")
+            return _jloi(409, "PHAT_LAI", "Chữ ký này đã được dùng; ký lại với X-Portal-Ts mới."), 0, None
         if kq_ky != "ok":
             khach._ghi_audit(conn, "crm", "khach.hmac.sai", detail={"path": request.url.path},
                              request=request, lay_mau=_ip_khoa(request))
-            return _jloi(401, "CHU_KY_SAI", "Chữ ký nội bộ không hợp lệ hoặc đã hết hạn.")
+            return _jloi(401, "CHU_KY_SAI", "Chữ ký nội bộ không hợp lệ hoặc đã hết hạn."), 0, None
         try:
             data = json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError
         except (ValueError, UnicodeDecodeError):
-            return _jloi(400, "JSON_SAI", "Body phải là JSON object.")
+            return _jloi(400, "JSON_SAI", "Body phải là JSON object."), 0, None
         status, kq = xu_ly(conn, data, request)
+        return None, status, kq
     finally:
         conn.close()
+
+
+async def _noi_bo(request: Request, xu_ly) -> JSONResponse:
+    raw = await _doc_body(request)
+    if raw is None:
+        return _jloi(413, "QUA_LON", "Thiếu Content-Length hoặc yêu cầu quá lớn (tối đa 10 KB).")
+    # Mọi thao tác SQLite (kiểm/ghi chữ ký đã dùng, audit, xử lý) chạy NGOÀI event loop: một
+    # khoá ghi đang bị giữ không làm treo các route async khác (kể cả route nhân viên).
+    kq_loi, status, kq = await asyncio.to_thread(_noi_bo_dong_bo, request, xu_ly, raw)
+    if kq_loi is not None:
+        return kq_loi
     if status >= 400:
         return _jloi(status, kq.get("ma", "LOI"), kq.get("thongBao", ""))
     return JSONResponse({"ok": True, "data": kq})

@@ -2245,3 +2245,79 @@ def test_mock_crm_chan_launch_truoc_thu_hoi(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="thu hồi"):
         mock.kiem_launch(tok(now - 1))
     assert mock.kiem_launch(tok(now))["iat"] == now  # cùng giây: được phép
+
+
+# ================================================================== rà soát vòng 7
+def test_r7_1_khoa_ghi_sqlite_khong_lam_treo_route_nhan_vien(kh, owner, monkeypatch):
+    import asyncio
+    import threading
+    import httpx
+    _ip(monkeypatch)
+    giu = threading.Event()
+    tha = threading.Event()
+
+    def giu_khoa():
+        conn = db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # giữ khoá ghi
+            giu.set()
+            tha.wait(1.5)
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+    t = threading.Thread(target=giu_khoa)
+    t.start()
+    giu.wait(2)
+
+    async def chay():
+        tr = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=tr, base_url="http://testserver", timeout=30) as nv, \
+                httpx.AsyncClient(transport=tr, base_url=HOST_KHACH, timeout=30) as c:
+            goc = time.perf_counter()
+
+            async def nhan_vien(path, tre_giay):
+                # Hẹn giờ cố định từ mốc chung: nếu loop bị chặn, độ trễ thực tế sẽ lộ ra.
+                await asyncio.sleep(tre_giay)
+                hen = goc + tre_giay
+                r = await nv.get(path, follow_redirects=False)
+                return path, r.status_code, time.perf_counter() - hen
+            nv_tasks = [asyncio.create_task(nhan_vien(p, 0.2 + 0.1 * i)) for i, p in
+                        enumerate(("/dang-nhap", "/tai-khoan/anh-thanh", "/dang-nhap"))]
+            # Các request khách phải GHI SQLite (audit lấy mẫu chữ ký sai) khi khoá đang bị giữ.
+            ghi = [asyncio.create_task(c.post("/api/internal/khach/tam-khoa", content=b"{}",
+                   headers={"X-Portal-Ts": "1", "X-Portal-Sig": "0" * 64,
+                            "x-real-ip": f"10.9.{i}.1"})) for i in range(5)]
+            tre = await asyncio.gather(*nv_tasks)
+            kq = await asyncio.gather(*ghi)
+            return tre, [r.status_code for r in kq]
+    try:
+        tre, codes = asyncio.run(chay())
+    finally:
+        tha.set()
+        t.join()
+    for path, status, giay in tre:
+        assert status in (200, 303) and giay < 0.5, (path, status, giay)
+    assert set(codes) == {401}
+
+
+def test_r7_2_lease_va_han_chot_gui(kh, crm, monkeypatch):
+    monkeypatch.setattr(config, "CRM_PORTAL_TIMEOUT", 3.0)
+    assert khach.crm_lease_giay() == 60
+    monkeypatch.setattr(config, "CRM_PORTAL_TIMEOUT", 40.0)
+    assert khach.crm_lease_giay() == 90 and khach.crm_han_chot_giay() < khach.crm_lease_giay()
+    monkeypatch.setattr(config, "CRM_PORTAL_TIMEOUT", 0.2)
+    assert khach.crm_han_chot_giay() < khach.crm_lease_giay()
+    dang_ky(kh, 1)
+    crm.cham = 5.0  # CRM treo lâu hơn hạn chót
+    conn = db.connect()
+    try:
+        t0 = time.perf_counter()
+        kq = khach.dong_bo_crm(conn, tat_ca=True)
+        tg = time.perf_counter() - t0
+        row = db.one(conn, "SELECT * FROM crm_sync_pending")
+    finally:
+        conn.close()
+    assert kq == {"thu": 1, "thanh_cong": 0, "con_lai": 1}
+    assert tg < khach.crm_han_chot_giay() + 1.0, tg
+    assert row["attempts"] == 1 and "hạn chót" in row["last_error"]
+    assert row["claimed_until"] is None and row["done_at"] is None

@@ -950,7 +950,9 @@ def xac_thuc_vao(conn, method: str, path: str, ts: str | None, sig: str | None,
 def _http_post(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, str]:
     """Điểm gửi HTTP duy nhất (test thay thế). Trả (status, mô tả)."""
     import httpx
-    r = httpx.post(url, content=body, headers=headers, timeout=config.CRM_PORTAL_TIMEOUT)
+    t = config.CRM_PORTAL_TIMEOUT
+    r = httpx.post(url, content=body, headers=headers,
+                   timeout=httpx.Timeout(connect=t, read=t, write=t, pool=t))
     return r.status_code, r.text[:200]
 
 
@@ -971,7 +973,32 @@ def xep_hang_crm(conn, kind: str, idem_key: str, subject: str, path: str, payloa
     return row_id
 
 
-CRM_LEASE_GIAY = 60  # > thời gian chờ CRM tối đa; lượt chết giữa chừng ⇒ hết hạn rồi lượt khác nhận
+def crm_lease_giay() -> float:
+    """Thời hạn nhận dòng: max(60, 2×timeout + 10) — luôn dài hơn hạn chót mỗi lần gửi."""
+    return max(60.0, 2 * config.CRM_PORTAL_TIMEOUT + 10)
+
+
+def crm_han_chot_giay() -> float:
+    """Hạn chót CỨNG cho một lần gửi (mọi pha: kết nối, ghi, đọc, chờ pool), ngắn hơn lease."""
+    return 2 * config.CRM_PORTAL_TIMEOUT + 2
+
+
+_crm_pool = None
+
+
+def _gui_co_han(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, str]:
+    """Gọi `_http_post` với hạn chót tổng; quá hạn ⇒ TimeoutError (dòng được thử lại sau;
+    CRM idempotent theo Idempotency-Key nên lỡ đã tới nơi cũng không sao)."""
+    global _crm_pool
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+    if _crm_pool is None:
+        _crm_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khach-crm")
+    fut = _crm_pool.submit(_http_post, url, body, headers)
+    try:
+        return fut.result(timeout=crm_han_chot_giay())
+    except _FutTimeout:
+        fut.cancel()
+        raise TimeoutError(f"CRM quá hạn chót {crm_han_chot_giay():.1f}s") from None
 
 
 def _nhan_dong(conn, row_id: int) -> bool:
@@ -981,7 +1008,7 @@ def _nhan_dong(conn, row_id: int) -> bool:
     cur = conn.execute(
         "UPDATE crm_sync_pending SET claimed_until=? WHERE id=? AND done_at IS NULL "
         "AND (claimed_until IS NULL OR claimed_until<?)",
-        (_iso(now + timedelta(seconds=CRM_LEASE_GIAY)), row_id, _iso(now)))
+        (_iso(now + timedelta(seconds=crm_lease_giay())), row_id, _iso(now)))
     conn.commit()
     return cur.rowcount == 1
 
@@ -1000,7 +1027,7 @@ def _gui_da_nhan(conn, row_id: int) -> bool:
     headers = {"Content-Type": "application/json", "Idempotency-Key": row["idem_key"],
                **ky_portal(HUONG_RA, "POST", row["path"], body)}
     try:
-        status, mo_ta = _http_post(config.CRM_PORTAL_INTERNAL_URL + row["path"], body, headers)
+        status, mo_ta = _gui_co_han(config.CRM_PORTAL_INTERNAL_URL + row["path"], body, headers)
         ok = 200 <= status < 300 or status == 409  # 409 = CRM đã có (idempotent)
         loi = None if ok else f"HTTP {status}: {mo_ta}"
     except Exception as exc:  # noqa: BLE001 - CRM lỗi mạng ⇒ để lại hàng đợi
