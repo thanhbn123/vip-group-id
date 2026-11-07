@@ -173,3 +173,7 @@ KHACH_TURNSTILE_TIMEOUT = 5.0
 KHACH_EMAIL_ENABLED = os.environ.get("COWORK_KHACH_EMAIL_ENABLED", "0").strip() == "1"
 #: Hotline/Zalo hiển thị trên trang quên mật khẩu (khôi phục do nhân viên hỗ trợ).
 KHACH_HOTLINE = os.environ.get("COWORK_KHACH_HOTLINE", "0961 102 655").strip() or "0961 102 655"
+#: Trần đăng ký toàn hệ thống mỗi giờ (chống đăng ký ồ ạt / giữ chỗ SĐT hàng loạt).
+KHACH_SIGNUP_GLOBAL_PER_HOUR = int(os.environ.get("COWORK_KHACH_SIGNUP_GLOBAL_PER_HOUR", "200"))
+#: Chu kỳ (giây) của vòng nền gửi hàng đợi sang CRM. Request KHÔNG BAO GIỜ gọi CRM trực tiếp.
+KHACH_SYNC_GIAY = float(os.environ.get("COWORK_KHACH_SYNC_GIAY", "5"))

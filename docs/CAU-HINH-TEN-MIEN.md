@@ -250,3 +250,22 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
 - Lỗi BUG-VIPID-01 (đã sửa): không dùng `<meta name="referrer" content="no-referrer">` trong trang
   khách — Chrome gửi `Origin: null` khi POST ⇒ mọi form 403. Header `Referrer-Policy: same-origin`
   đã đủ.
+
+### Gửi CRM, chống đăng ký ồ ạt, nâng cấp DB
+- **Request không bao giờ gọi CRM.** Mọi signup/thu hồi chỉ xếp hàng `crm_sync_pending`; vòng nền
+  trong tiến trình gửi mỗi `COWORK_KHACH_SYNC_GIAY` giây (mặc định 5). `cowork.cli khach-dong-bo`
+  (cron) vẫn dùng được song song. Thời gian phản hồi đăng ký không phụ thuộc SĐT đã có hay chưa.
+- **Turnstile bắt buộc cho đăng ký** khi đã cấu hình (action `khach_dang_ky`); production đã bắt
+  buộc có khoá thật.
+- **Trần đăng ký toàn hệ thống** `COWORK_KHACH_SIGNUP_GLOBAL_PER_HOUR` (mặc định 200/giờ): vượt ⇒
+  trang "Hệ thống đang nhận quá nhiều đăng ký" (503) + audit `khach.canh_bao.dang_ky_tang_dot_bien`
+  (tối đa 1 dòng/giờ) để cảnh báo.
+- Cập nhật cờ `phone_conflict` sang CRM gộp tối đa 1 lần/subject/giờ (số đếm vẫn tăng tại chỗ).
+- **Nâng cấp DB realm khách lỗi** (ví dụ còn `portal_code` kiểu cũ VG + 6 số): giao dịch dựng lại
+  bảng được hoàn tác, ghi log ERROR + audit `khach.migration.loi`, **realm khách tự tắt**, realm
+  nhân viên vẫn khởi động bình thường. Sửa dữ liệu rồi khởi động lại để thử nâng cấp lại.
+- **Giới hạn rollback:** sau schema v6 (email tuỳ chọn, mã VG1001…), bản code cũ (v4/v5) **không**
+  dùng được DB này nữa (ràng buộc khác). Rollback code ⇒ phải khôi phục bản backup DB chụp TRƯỚC
+  khi nâng cấp (`scripts/backup.sh`). Tắt cờ `COWORK_KHACH_ENABLED=0` là cách rollback an toàn mà
+  không đổi code.
+

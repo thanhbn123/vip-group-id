@@ -1,6 +1,7 @@
 """VIP GROUP COWORK — ứng dụng FastAPI."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from contextlib import asynccontextmanager
@@ -26,7 +27,18 @@ async def lifespan(app: FastAPI):
     khach.kiem_cau_hinh()
     db.init_db()
     log.info("COWORK khởi động — DB=%s · public=%s", config.DB_PATH, config.PUBLIC_URL)
-    yield
+    if config.KHACH_ENABLED and db.KHACH_LOI:
+        log.error("Realm khách TẮT do lỗi nâng cấp DB: %s", db.KHACH_LOI)
+    tac_vu = asyncio.create_task(khach_web.vong_dong_bo_crm()) if khach.realm_bat() else None
+    try:
+        yield
+    finally:
+        if tac_vu:
+            tac_vu.cancel()
+            try:
+                await tac_vu
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 app = FastAPI(title=config.APP_NAME, version=config.APP_VERSION, docs_url=None,

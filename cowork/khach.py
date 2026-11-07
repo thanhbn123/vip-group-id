@@ -90,6 +90,11 @@ def _host_cua_url(url: str) -> str:
 ENV_HOP_LE = {"local", "dev", "development", "test", "staging", "prod", "production"}
 
 
+def realm_bat() -> bool:
+    """Realm khách thực sự phục vụ: cờ bật VÀ DB realm khách sẵn sàng (nâng cấp không lỗi)."""
+    return config.KHACH_ENABLED and not db.KHACH_LOI
+
+
 def la_production() -> bool:
     return config.ENV.strip().lower() in ("prod", "production")
 
@@ -251,11 +256,15 @@ TURNSTILE_KHOA_THU = ("1x00000000000000000000AA", "1x000000000000000000000000000
 TURNSTILE_ACTION = "khach_login"
 
 
-def ket_qua_turnstile_hop_le(kq: dict | None, host: str | None) -> bool:
+TURNSTILE_ACTION_DANG_KY = "khach_dang_ky"
+
+
+def ket_qua_turnstile_hop_le(kq: dict | None, host: str | None,
+                             action: str = TURNSTILE_ACTION) -> bool:
     """Kiểm phản hồi siteverify: success, action đúng, hostname khớp host khách đang phục vụ."""
     if not isinstance(kq, dict) or kq.get("success") is not True:
         return False
-    if kq.get("action") != TURNSTILE_ACTION:
+    if kq.get("action") != action:
         return False
     h = chuan_hoa_host(host)
     ten = _ten_host(h) if h else None
@@ -580,6 +589,15 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
         raise KhachLoi("Bạn đã gửi quá nhiều yêu cầu đăng ký. Vui lòng thử lại sau.", 429,
                        "QUA_TAN_SUAT")
 
+    if vuot_tan_suat(conn, "dang_ky_toan_cuc", "*", config.KHACH_SIGNUP_GLOBAL_PER_HOUR, 3600):
+        if not vuot_tan_suat(conn, "canh_bao_dang_ky", "*", 1, 3600):
+            _ghi_audit(conn, "system", "khach.canh_bao.dang_ky_tang_dot_bien",
+                       detail={"tran_gio": config.KHACH_SIGNUP_GLOBAL_PER_HOUR}, request=request)
+            log.warning("CANH_BAO khach: đăng ký vượt %s/giờ — tạm ngừng nhận",
+                        config.KHACH_SIGNUP_GLOBAL_PER_HOUR)
+        raise KhachLoi("Hệ thống đang nhận quá nhiều đăng ký. Vui lòng thử lại sau ít phút hoặc "
+                       f"liên hệ hotline/Zalo {config.KHACH_HOTLINE}.", 503, "QUA_TAI")
+
     trung = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=?", (phone,))
     if trung:
         _xu_ly_trung(conn, trung, em, mat_khau, ip, request)
@@ -626,8 +644,12 @@ def _xu_ly_trung(conn, acc: dict, email_moi: str | None, mat_khau: str, ip: str,
     moi = tai_khoan(conn, acc["id"])
     _ghi_audit(conn, "khach:anon", "khach.dang_ky.xung_dot_sdt", target_id=acc["subject"],
                detail={"lan": moi["phone_conflict_count"],
-                       "emailKhac": che_email(email_moi) if email_moi else None}, request=request)
-    _gui_signup(conn, moi)
+                       "emailKhac": che_email(email_moi) if email_moi else None}, request=request,
+               lay_mau=f"{ip}:{acc['id']}")
+    # Gộp: tối đa 1 bản cập nhật xung đột / subject / giờ (số đếm vẫn tăng tại chỗ; lần gửi sau
+    # mang số mới nhất).
+    if not vuot_tan_suat(conn, "xung_dot_crm", acc["id"], 1, 3600):
+        _gui_signup(conn, moi)
 
 
 def _gui_signup(conn, acc: dict) -> None:
@@ -932,7 +954,9 @@ def _http_post(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, str
 
 
 def xep_hang_crm(conn, kind: str, idem_key: str, subject: str, path: str, payload: dict,
-                 gui_ngay: bool = True) -> int:
+                 gui_ngay: bool = False) -> int:
+    """CHỈ xếp hàng. Gửi do vòng nền (`khach_web.vong_dong_bo_crm`) hoặc CLI `khach-dong-bo`:
+    request không bao giờ chờ CRM (không lộ nhánh qua thời gian phản hồi, không treo khi CRM chậm)."""
     now = db.now_iso()
     conn.execute(
         "INSERT OR IGNORE INTO crm_sync_pending(idem_key, kind, subject, path, body, attempts, "
@@ -1199,7 +1223,8 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
 
 
 # ------------------------------------------------------------------ đổi mật khẩu (đã đăng nhập)
-DOI_MK_SAI_TOI_DA = 5
+DOI_MK_SAI_TOI_DA = 5          # theo (tài khoản, IP)
+DOI_MK_SAI_TK_TOI_DA = 10      # theo tài khoản, mọi IP
 
 
 def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: str, ip: str,
@@ -1216,6 +1241,15 @@ def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: s
     da_sai = int(conn.execute(
         "SELECT COUNT(*) FROM customer_rate_events WHERE bucket='doi_mk_sai' AND key=? "
         "AND created_at>=?", (khoa, _truoc(seconds=w))).fetchone()[0])
+    sai_tk = int(conn.execute(
+        "SELECT COUNT(*) FROM customer_rate_events WHERE bucket='doi_mk_sai_tk' AND key=? "
+        "AND created_at>=?", (acc["id"], _truoc(seconds=w))).fetchone()[0])
+    if sai_tk >= DOI_MK_SAI_TK_TOI_DA:
+        _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau.tam_khoa_tai_khoan",
+                   target_id=acc["subject"], detail={"ip": ip, "lan": sai_tk}, request=request,
+                   lay_mau=acc["id"])
+        raise KhachLoi(f"Mật khẩu hiện tại đã bị nhập sai nhiều lần. Vui lòng thử lại sau "
+                       f"{config.KHACH_LOGIN_WINDOW_MIN} phút.", 429, "TAM_KHOA")
     if da_sai >= DOI_MK_SAI_TOI_DA:
         _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau.tam_khoa", target_id=acc["subject"],
                    detail={"ip": ip}, request=request, lay_mau=khoa)
@@ -1225,6 +1259,8 @@ def doi_mat_khau(conn, ctx: dict, mat_khau_cu: str, mat_khau: str, mat_khau_2: s
     if not kiem_mk(mat_khau_cu, acc):
         conn.execute("INSERT INTO customer_rate_events(bucket, key, created_at) VALUES(?,?,?)",
                      ("doi_mk_sai", khoa, _iso(_bay_gio())))
+        conn.execute("INSERT INTO customer_rate_events(bucket, key, created_at) VALUES(?,?,?)",
+                     ("doi_mk_sai_tk", acc["id"], _iso(_bay_gio())))
         conn.commit()
         _ghi_audit(conn, acc["subject"], "khach.doi_mat_khau.sai", target_id=acc["subject"],
                    detail={"ip": ip}, request=request, lay_mau=khoa)

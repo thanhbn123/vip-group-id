@@ -13,6 +13,8 @@ from .schema import (BO_PHAN_MAC_DINH, DDL, MODULES, PERMISSIONS, ROLES,
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 _init_lock = threading.Lock()
 _initialized = False
+#: Lỗi nâng cấp bảng realm khách (None = ổn). Có lỗi ⇒ realm khách TẮT, realm nhân viên vẫn chạy.
+KHACH_LOI: str | None = None
 
 
 def now_iso() -> str:
@@ -83,8 +85,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _them_cot(conn, "users", "mfa_secret", "TEXT")
     # Realm khách (v4) — cột thêm sau bản đầu của bảng; DB dev cũ được bổ sung.
     _them_cot(conn, "customer_accounts", "phone_conflict_count", "INTEGER NOT NULL DEFAULT 0")
-    _dung_lai_customer_accounts(conn)
-    _them_cot(conn, "customer_accounts", "phone_verified_method", "TEXT")
+    global KHACH_LOI
+    KHACH_LOI = None
+    try:
+        _dung_lai_customer_accounts(conn)
+        _them_cot(conn, "customer_accounts", "phone_verified_method", "TEXT")
+        _chuyen_cho_xac_minh_email(conn)
+    except Exception as exc:  # noqa: BLE001 - lỗi realm khách không được làm sập realm nhân viên
+        KHACH_LOI = str(exc)[:500]
+        import logging
+        logging.getLogger("cowork.khach").error(
+            "Nâng cấp DB realm khách thất bại — realm khách TẮT, nhân viên vẫn chạy: %s", exc)
+        try:
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id, actor_id, action, target_type, detail, created_at) "
+                "VALUES('khach','system','khach.migration.loi','schema',?,?)",
+                (KHACH_LOI, now_iso()))
+        except sqlite3.Error:
+            pass
     conn.commit()
 
 
@@ -130,6 +148,25 @@ def _dung_lai_customer_accounts(conn: sqlite3.Connection) -> None:
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _chuyen_cho_xac_minh_email(conn: sqlite3.Connection) -> None:
+    """Owner 07/11 bỏ xác minh email: tài khoản cũ còn 'cho_xac_minh_email' ⇒ 'cho_duyet' và xếp
+    hàng signup sang CRM (không gửi ngay)."""
+    rows = q(conn, "SELECT * FROM customer_accounts WHERE status='cho_xac_minh_email'")
+    if not rows:
+        return
+    from . import khach
+    for acc in rows:
+        conn.execute("UPDATE customer_accounts SET status='cho_duyet', updated_at=? WHERE id=? "
+                     "AND status='cho_xac_minh_email'", (now_iso(), acc["id"]))
+        conn.commit()
+        acc["status"] = "cho_duyet"
+        khach._gui_signup(conn, acc)
+        conn.execute("INSERT INTO audit_log(tenant_id, actor_id, action, target_type, target_id, "
+                     "created_at) VALUES('khach','system','khach.migration.cho_duyet','customer',?,?)",
+                     (acc["subject"], now_iso()))
+    conn.commit()
 
 
 def _seed(conn: sqlite3.Connection) -> None:

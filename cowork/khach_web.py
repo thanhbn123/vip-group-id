@@ -40,7 +40,7 @@ class KhachHostDispatch:
             await self.app(scope, receive, send)  # hành vi cũ: không kiểm Host
             return
         realm = khach.chon_realm(Headers(scope=scope).get("host"))
-        if realm == "khach" and config.KHACH_ENABLED:
+        if realm == "khach" and khach.realm_bat():
             await khach_app(scope, receive, send)
         elif realm == "staff":
             await self.app(scope, receive, send)
@@ -168,6 +168,28 @@ def _loi_csrf(request: Request) -> Response:
                    noi_dung="Vui lòng tải lại trang và thử lại.")
 
 
+# ------------------------------------------------------------------ vòng nền gửi CRM
+def dong_bo_mot_luot() -> dict:
+    conn = db.connect()
+    try:
+        return khach.dong_bo_crm(conn)
+    finally:
+        conn.close()
+
+
+async def vong_dong_bo_crm() -> None:
+    """Chạy nền suốt vòng đời app: gửi hàng đợi crm_sync_pending mỗi KHACH_SYNC_GIAY giây
+    (trong luồng riêng — không chặn event loop). CLI `khach-dong-bo` vẫn dùng được song song."""
+    while True:
+        await asyncio.sleep(config.KHACH_SYNC_GIAY)
+        try:
+            await asyncio.to_thread(dong_bo_mot_luot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - vòng nền không được chết
+            log.exception("Vòng gửi CRM lỗi")
+
+
 # Băm mật khẩu (scrypt 128 MiB) chạy trong executor RIÊNG: lượt đăng nhập ồ ạt không chiếm
 # threadpool mặc định (route đồng bộ của realm khác vẫn có luồng). Hàng đợi có trần ⇒ 503.
 _kdf_pool = ThreadPoolExecutor(max_workers=max(1, config.KHACH_SCRYPT_DONG_THOI),
@@ -227,7 +249,8 @@ TURNSTILE_DONG_THOI_TOI_DA = 4
 _ts_dang_goi = 0
 
 
-async def _vuot_turnstile(request: Request, token: str) -> bool:
+async def _vuot_turnstile(request: Request, token: str,
+                          action: str = khach.TURNSTILE_ACTION) -> bool:
     """Gọi siteverify với trần đồng thời (không chờ): quá trần ⇒ coi như chưa vượt thử thách."""
     global _ts_dang_goi
     if not khach.turnstile_bat() or not token or len(token) > 2048:
@@ -240,7 +263,7 @@ async def _vuot_turnstile(request: Request, token: str) -> bool:
         kq = await turnstile_siteverify(khach.turnstile_secret(), token, web.ip_cua(request))
     finally:
         _ts_dang_goi -= 1
-    return khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"))
+    return khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"), action)
 
 
 def _ua(request: Request) -> str:
@@ -259,17 +282,35 @@ def goc():
     return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
 
 
+def _form_dang_ky(request: Request, status: int = 200, **ctx) -> Response:
+    """Trang đăng ký; Turnstile bật ⇒ luôn có thử thách (action khach_dang_ky) + CSP mở Cloudflare."""
+    tt = khach.turnstile_bat()
+    resp = _render(request, "dang_ky.html", status, page_title="Đăng ký tài khoản",
+                   thu_thach=tt, turnstile_site_key=config.KHACH_TURNSTILE_SITE_KEY,
+                   turnstile_action=khach.TURNSTILE_ACTION_DANG_KY, **ctx)
+    if tt:
+        resp.headers["x-khach-turnstile"] = "1"
+    return resp
+
+
 @khach_app.get("/tai-khoan/dang-ky")
 def dang_ky_form(request: Request):
-    return _render(request, "dang_ky.html", page_title="Đăng ký tài khoản", form={})
+    return _form_dang_ky(request, form={})
 
 
 @khach_app.post("/tai-khoan/dang-ky")
 async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
                   email: str = Form(""), mat_khau: str = Form(""), mat_khau_2: str = Form(""),
-                  dong_y: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
+                  dong_y: str = Form(""), csrf_form: str = Form("", alias="_csrf"),
+                  cf_token: str = Form("", alias="cf-turnstile-response")):
     if not _kiem_csrf(request, csrf_form):
         return _loi_csrf(request)
+    # Turnstile cấu hình ⇒ BẮT BUỘC cho mọi lượt đăng ký (chống đăng ký/giữ chỗ hàng loạt);
+    # chỉ gọi siteverify sau khi CSRF/cùng nguồn đạt.
+    if khach.turnstile_bat() and not (
+            cf_token and await _vuot_turnstile(request, cf_token, khach.TURNSTILE_ACTION_DANG_KY)):
+        return _form_dang_ky(request, 400, loi="Vui lòng xác nhận bạn không phải máy rồi gửi lại.",
+                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
     return await _chay_kdf(request, _dang_ky, request, ho_ten, sdt, email, mat_khau,
                            mat_khau_2, dong_y)
 
@@ -282,8 +323,7 @@ def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Respo
                       mat_khau_2=mat_khau_2[:200], dong_y=dong_y == "1",
                       ip=_ip_khoa(request), request=request)
     except khach.KhachLoi as e:
-        return _render(request, "dang_ky.html", e.status, page_title="Đăng ký tài khoản",
-                       loi=e.message, form=form)
+        return _form_dang_ky(request, e.status, loi=e.message, form=form)
     finally:
         conn.close()
     return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)

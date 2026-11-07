@@ -34,19 +34,34 @@ def KC(base: str = HOST_KHACH) -> TestClient:
 # ------------------------------------------------------------------ fixture
 @pytest.fixture()
 def crm(monkeypatch):
-    """CRM giả: ghi lại mọi lần gọi; `crm.song=False` mô phỏng CRM không truy cập được."""
+    """CRM giả: ghi lại mọi lần gọi; `crm.song=False` mô phỏng CRM không truy cập được.
+
+    Request KHÔNG gọi CRM (chỉ xếp hàng). Đọc `crm.goi` = chạy một lượt vòng nền gửi hàng đợi
+    rồi trả danh sách; `crm.goi_that` = các lần gọi thực sự đã xảy ra (không tự gửi)."""
     class _CRM:
         song = True
-        goi: list[dict] = []
+        cham = 0.0
+        goi_that: list[dict] = []
+
+        @property
+        def goi(self):
+            conn = db.connect()
+            try:
+                khach.dong_bo_crm(conn, tat_ca=True)
+            finally:
+                conn.close()
+            return self.goi_that
 
     c = _CRM()
-    c.goi = []
+    c.goi_that = []
 
     def _post(url, body, headers):
+        if c.cham:
+            time.sleep(c.cham)
         if not c.song:
             raise ConnectionError("CRM không truy cập được")
-        c.goi.append({"url": url, "body": json.loads(body), "headers": dict(headers),
-                      "raw": body})
+        c.goi_that.append({"url": url, "body": json.loads(body), "headers": dict(headers),
+                           "raw": body})
         return 200, "ok"
 
     monkeypatch.setattr(khach, "_http_post", _post)
@@ -84,7 +99,8 @@ def dang_ky(c: TestClient, n: int = 1, *, email: str | None = None, sdt: str | N
             mk: str = MK, mk2: str | None = None, dong_y: bool = True, headers=None):
     data = {"ho_ten": f"Khách Thử {n}", "sdt": sdt or f"090000000{n}",
             "email": f"khach{n}@example.test" if email is None else email, "mat_khau": mk,
-            "mat_khau_2": mk if mk2 is None else mk2, "_csrf": _csrf(c, "/tai-khoan/dang-ky")}
+            "mat_khau_2": mk if mk2 is None else mk2, "_csrf": _csrf(c, "/tai-khoan/dang-ky"),
+            "cf-turnstile-response": "tot-dk"}
     if dong_y:
         data["dong_y"] = "1"
     return c.post("/tai-khoan/dang-ky", data=data, follow_redirects=False, headers=headers or {})
@@ -332,6 +348,9 @@ def test_crm_loi_thi_xep_hang_va_thu_lai(kh, crm):
     assert dang_ky(kh, 1).status_code == 303  # CRM lỗi vẫn nhận đăng ký
     conn = db.connect()
     try:
+        row = db.one(conn, "SELECT * FROM crm_sync_pending")
+        assert row["done_at"] is None and row["attempts"] == 0  # request không gọi CRM
+        khach.dong_bo_crm(conn, tat_ca=True)  # vòng nền: CRM lỗi ⇒ giữ lại hàng đợi
         row = db.one(conn, "SELECT * FROM crm_sync_pending")
         assert row["done_at"] is None and row["attempts"] == 1 and row["last_error"]
         crm.song = True
@@ -1279,9 +1298,16 @@ def turnstile(monkeypatch):
     from cowork import khach_web
     monkeypatch.setattr(config, "KHACH_TURNSTILE_SITE_KEY", TS_SITE)
     monkeypatch.setenv("COWORK_KHACH_TURNSTILE_SECRET", TS_SECRET)
-    goi: list[tuple] = []
+    class _Goi(list):
+        dang_ky: list = []
+    goi = _Goi()
+    goi.dang_ky = []  # các lượt siteverify cho đăng ký (tách khỏi đăng nhập)
 
     async def _gia(secret, token, remoteip):
+        if token in ("tot-dk", "dk-sai-action"):
+            goi.dang_ky.append((secret, token, remoteip))
+            return {"success": True, "hostname": "khach.localhost",
+                    "action": "khach_dang_ky" if token == "tot-dk" else "khach_login"}
         goi.append((secret, token, remoteip))
         if token == "tot":
             return {"success": True, "hostname": "khach.localhost", "action": "khach_login"}
@@ -1610,11 +1636,12 @@ def test_migration_v5_dung_khi_co_ma_kieu_cu(client):
     finally:
         conn.close()
     db._initialized = False
-    with pytest.raises(RuntimeError, match="VG1001"):
-        db.init_db()
+    db.init_db()  # KHÔNG làm sập khởi động: realm khách tắt, nhân viên vẫn chạy
+    assert db.KHACH_LOI and "VG1001" in db.KHACH_LOI
     conn = db.connect()
-    try:  # không mất dữ liệu: bảng cũ còn nguyên
+    try:  # không mất dữ liệu: bảng cũ còn nguyên; có audit lỗi
         assert db.scalar(conn, "SELECT portal_code FROM customer_accounts WHERE id='kh_x'") == "VG000001"
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.migration.loi'") == 1
     finally:
         conn.close()
     db._initialized = False
@@ -1876,3 +1903,162 @@ def test_migration_v6_email_tuy_chon(client):
         conn.commit()
     finally:
         conn.close()
+
+
+# ================================================================== rà soát vòng 5
+def test_n5_1_request_khong_goi_crm_thoi_gian_khong_lo_nhanh(kh, crm, monkeypatch):
+    crm.cham = 1.0  # CRM chậm 1 giây
+    tao_khach_hoat_dong(kh, 1)               # SĐT 1: đang hoạt động
+    dang_ky(kh, 2)                           # SĐT 2: đang chờ duyệt
+    crm.goi_that.clear()
+    t = {}
+    for ten, n, email in (("moi", 3, None), ("cho_duyet", 2, "khac2@example.test"),
+                          ("hoat_dong", 1, "khac1@example.test")):
+        t0 = time.perf_counter()
+        r = dang_ky(KC(), n, email=email)
+        t[ten] = time.perf_counter() - t0
+        assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
+    assert crm.goi_that == []  # không có lời gọi CRM nào trong request
+    assert max(t.values()) < 0.9, t  # không chờ CRM chậm
+    assert max(t.values()) - min(t.values()) < 0.3, t
+    # Vòng nền gửi sau đó.
+    from cowork import khach_web
+    crm.cham = 0
+    kq = khach_web.dong_bo_mot_luot()
+    assert kq["thanh_cong"] >= 2 and crm.goi_that
+
+
+def test_n5_1_vong_nen_gui_hang_doi(kh, crm, monkeypatch):
+    import asyncio
+    from cowork import khach_web
+    dang_ky(kh, 1)
+    assert crm.goi_that == []
+    monkeypatch.setattr(config, "KHACH_SYNC_GIAY", 0.01)
+
+    async def chay():
+        task = asyncio.create_task(khach_web.vong_dong_bo_crm())
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if crm.goi_that:
+                break
+        task.cancel()
+    asyncio.run(chay())
+    assert crm.goi_that and crm.goi_that[0]["url"].endswith("/api/internal/portal/signups")
+
+
+def test_n5_2_dang_ky_bat_buoc_turnstile(kh, monkeypatch, turnstile):
+    r = kh.get("/tai-khoan/dang-ky")
+    assert 'class="cf-turnstile"' in r.text and 'data-action="khach_dang_ky"' in r.text
+    assert "script-src https://challenges.cloudflare.com;" in r.headers["content-security-policy"]
+    tok = csrf_tu(r.text)
+    base = {"ho_ten": "Khách Máy", "sdt": "0900000004", "email": "", "mat_khau": MK,
+            "mat_khau_2": MK, "dong_y": "1", "_csrf": tok}
+    # Thiếu token / token của action đăng nhập ⇒ không tạo tài khoản.
+    for extra in ({}, {"cf-turnstile-response": "tot"}, {"cf-turnstile-response": "dk-sai-action"}):
+        r = kh.post("/tai-khoan/dang-ky", data={**base, **extra}, follow_redirects=False)
+        assert r.status_code == 400 and "cf-turnstile" in r.text, extra
+    assert acc_theo_sdt("+84900000004") is None
+    # Khác nguồn ⇒ 403 và KHÔNG gọi siteverify.
+    n0 = len(turnstile.dang_ky)
+    r = kh.post("/tai-khoan/dang-ky", data={**base, "cf-turnstile-response": "tot-dk"},
+                headers={"origin": "https://evil.example"})
+    assert r.status_code == 403 and len(turnstile.dang_ky) == n0
+    r = kh.post("/tai-khoan/dang-ky", data={**base, "cf-turnstile-response": "tot-dk"},
+                follow_redirects=False)
+    assert r.status_code == 303 and acc_theo_sdt("+84900000004")["status"] == "cho_duyet"
+
+
+def test_n5_2_tran_dang_ky_toan_he_thong(kh, monkeypatch):
+    _ip(monkeypatch)
+    monkeypatch.setattr(config, "KHACH_SIGNUP_GLOBAL_PER_HOUR", 2)
+    for n in (1, 2):
+        assert dang_ky(KC(), n, headers={"x-real-ip": f"10.5.0.{n}"}).status_code == 303
+    for n in (3, 4):
+        r = dang_ky(KC(), n, headers={"x-real-ip": f"10.5.0.{n}"})
+        assert r.status_code == 503 and "quá nhiều đăng ký" in r.text
+        assert acc_theo_sdt(f"+8490000000{n}") is None
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE "
+                         "action='khach.canh_bao.dang_ky_tang_dot_bien'") == 1
+    finally:
+        conn.close()
+
+
+def test_n5_2_gop_cap_nhat_xung_dot(kh, crm, monkeypatch):
+    _ip(monkeypatch)
+    dang_ky(kh, 1)
+    crm.goi  # gửi signup đầu
+    crm.goi_that.clear()
+    for i in range(5):
+        dang_ky(KC(), 1, email=f"ke{i}@example.test", headers={"x-real-ip": f"10.6.0.{i}"})
+    goi = [g for g in crm.goi if g["body"].get("phone_conflict")]
+    assert len(goi) == 1 and goi[0]["body"]["phone_conflict_count"] == 1
+    assert acc_theo_sdt("+84900000001")["phone_conflict_count"] == 5
+    # Sau một giờ, lần xung đột tiếp theo gửi số mới nhất.
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_rate_events SET created_at='2020-01-01T00:00:00+07:00' "
+                     "WHERE bucket='xung_dot_crm'")
+        conn.commit()
+    finally:
+        conn.close()
+    dang_ky(KC(), 1, email="ke9@example.test", headers={"x-real-ip": "10.6.0.9"})
+    goi = [g for g in crm.goi if g["body"].get("phone_conflict")]
+    assert len(goi) == 2 and goi[-1]["body"]["phone_conflict_count"] == 6
+
+
+def test_n5_3_doi_mat_khau_dem_theo_tai_khoan_moi_ip(kh, monkeypatch):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001", headers={"x-real-ip": "198.51.100.30"}))
+    for i in range(khach.DOI_MK_SAI_TK_TOI_DA):  # mỗi IP chỉ 2 lần ⇒ không chạm khoá theo cặp
+        r = _doi_mk(kh, "Sai!Passw0rd-xx", MK_MOI, **{"x-real-ip": f"10.7.{i // 2}.1"})
+        assert r.status_code == 400
+    r = _doi_mk(kh, MK, MK_MOI, **{"x-real-ip": "198.51.100.31"})
+    assert r.status_code == 429
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE "
+                         "action='khach.doi_mat_khau.tam_khoa_tai_khoan'") == 1
+    finally:
+        conn.close()
+
+
+def test_n5_4_chuyen_cho_xac_minh_email_sang_cho_duyet(kh, crm):
+    dang_ky(kh, 1)
+    acc = acc_theo_sdt("+84900000001")
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_accounts SET status='cho_xac_minh_email' WHERE id=?", (acc["id"],))
+        conn.execute("DELETE FROM crm_sync_pending")
+        conn.commit()
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()
+    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending WHERE subject=? AND done_at IS NULL",
+                         (acc["subject"],)) == 1
+    finally:
+        conn.close()
+    assert crm.goi[-1]["body"]["subject"] == acc["subject"]
+
+
+def test_n5_5_loi_nang_cap_khong_sap_realm_nhan_vien(client, bat, crm, owner):
+    conn = db.connect()
+    try:
+        _dung_bang_v4(conn, "VG000001")
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()
+    assert db.KHACH_LOI and not khach.realm_bat()
+    # Nhân viên vẫn đăng nhập/dùng được.
+    assert dang_nhap_nv(client, "anh-thanh", "Owner!Passw0rd").status_code == 303
+    assert client.get("/tai-khoan").status_code == 200
+    # Host khách không được phục vụ (realm coi như tắt; Host không thuộc danh sách nhân viên ⇒ 421).
+    r = KC().get("/tai-khoan/dang-nhap")
+    assert r.status_code == 421

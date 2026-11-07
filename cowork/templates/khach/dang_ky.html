@@ -18,7 +18,11 @@
     <input type="password" name="mat_khau_2" required minlength="12" maxlength="200" autocomplete="new-password"></label>
   <label class="kh-check"><input type="checkbox" name="dong_y" value="1" required>
     <span>Tôi đồng ý để VIP GROUP xử lý thông tin cá nhân (họ tên, số điện thoại, email nếu có) nhằm cung cấp dịch vụ, theo chính sách bảo mật và điều khoản sử dụng.</span></label>
+  {% if thu_thach %}
+  <div class="cf-turnstile" data-sitekey="{{ turnstile_site_key }}" data-action="{{ turnstile_action }}"></div>
+  {% endif %}
   <button class="kh-btn" type="submit">Đăng ký</button>
 </form>
+{% if thu_thach %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
 <p class="kh-links">Đã có tài khoản? <a href="/tai-khoan/dang-nhap">Đăng nhập</a></p>
 {% endblock %}
