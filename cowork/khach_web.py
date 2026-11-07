@@ -8,8 +8,11 @@
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, Request
@@ -96,48 +99,97 @@ def _secure(request: Request) -> bool:
     return config.COOKIE_SECURE or khach.la_production() or auth.la_https(request)
 
 
-def _csrf_moi(request: Request) -> str:
-    tk = request.cookies.get(khach.COOKIE_CSRF)
-    return tk if khach.csrf_hop_le(tk) else khach.tao_csrf()
+def _ten_ps(request: Request) -> str:
+    # __Host- (bắt buộc Secure, Path=/, không Domain): subdomain không cài đè được cookie này.
+    return "__Host-vg_khach_ps" if _secure(request) else "vg_khach_ps"
+
+
+def _ps(request: Request) -> str | None:
+    v = request.cookies.get(_ten_ps(request))
+    return v if v and khach.PS_RE.match(v) else None
 
 
 def _render(request: Request, ten: str, status: int = 200, **ctx) -> Response:
     csrf_phien = ctx.pop("csrf", None)
-    csrf = csrf_phien or _csrf_moi(request)
+    ps_moi = None
+    if csrf_phien:
+        csrf = csrf_phien
+    else:
+        ps = _ps(request)
+        if not ps:
+            ps = ps_moi = security.token_moi(24)
+        csrf = khach.tao_csrf(ps)
     ctx.update({"request": request, "csrf": csrf, "page_title": ctx.get("page_title", ""),
                 "BRAND": "CÔNG TY TNHH VIP GROUP"})
     resp = web.templates.TemplateResponse(request=request, name=f"khach/{ten}",
                                           status_code=status, context=ctx)
-    if not csrf_phien:  # token phiên nằm trong DB, không đưa vào cookie double-submit
-        resp.set_cookie(khach.COOKIE_CSRF, csrf, max_age=7200, path=khach.COOKIE_PATH,
-                        httponly=True, samesite="strict", secure=_secure(request))
+    if ps_moi:
+        ten_ck = _ten_ps(request)
+        resp.set_cookie(ten_ck, ps_moi, max_age=86400, httponly=True, samesite="lax",
+                        path="/" if ten_ck.startswith("__Host-") else khach.COOKIE_PATH,
+                        secure=_secure(request))
     return resp
 
 
-def _kiem_csrf(request: Request, gui: str | None, mong: str | None = None) -> bool:
-    """Token phiên (DB) hoặc double-submit có CHỮ KÝ máy chủ; Origin (nếu có) phải cùng host."""
-    if mong is None:
-        mong = request.cookies.get(khach.COOKIE_CSRF)
-        if not khach.csrf_hop_le(mong):
-            return False
-    if not mong or not gui or not security.hmac.compare_digest(str(mong), str(gui)):
-        return False
+def _cung_nguon(request: Request) -> bool:
+    """POST của trình duyệt phải chứng minh cùng nguồn: Origin khớp host khách, hoặc (khi không
+    có Origin) Sec-Fetch-Site: same-origin. Thiếu cả hai ⇒ từ chối."""
     origin = request.headers.get("origin")
-    if origin == "null":
-        return False
-    if origin:
+    host = khach.chuan_hoa_host(request.headers.get("host"))
+    if origin is not None:
+        if origin == "null":
+            return False
         try:
-            if urlsplit(origin).netloc.lower() != (request.headers.get("host") or "").lower():
-                return False
+            nl = khach.chuan_hoa_host(urlsplit(origin).netloc)
         except ValueError:
             return False
-    return True
+        return bool(host) and nl == host and khach.la_host_khach(nl)
+    return request.headers.get("sec-fetch-site") == "same-origin"
+
+
+def _kiem_csrf(request: Request, gui: str | None, mong: str | None = None) -> bool:
+    """Cùng nguồn + (token phiên trong DB, hoặc token ẩn danh ký HMAC gắn id tiền-phiên)."""
+    if not _cung_nguon(request):
+        return False
+    if mong is None:
+        return khach.csrf_hop_le(gui, _ps(request))
+    return bool(gui) and security.hmac.compare_digest(str(mong), str(gui))
 
 
 def _loi_csrf(request: Request) -> Response:
     return _render(request, "thong_bao.html", 403, page_title="Phiên không hợp lệ",
                    tieu_de="Phiên biểu mẫu đã hết hạn",
                    noi_dung="Vui lòng tải lại trang và thử lại.")
+
+
+# Băm mật khẩu (scrypt 128 MiB) chạy trong executor RIÊNG: lượt đăng nhập ồ ạt không chiếm
+# threadpool mặc định (route đồng bộ của realm khác vẫn có luồng). Hàng đợi có trần ⇒ 503.
+_kdf_pool = ThreadPoolExecutor(max_workers=max(1, config.KHACH_SCRYPT_DONG_THOI),
+                               thread_name_prefix="khach-kdf")
+KDF_HANG_DOI_TOI_DA = 16
+KDF_TIMEOUT_GIAY = 10.0
+_kdf_dang_cho = 0
+
+
+def _ban(request: Request) -> Response:
+    return _render(request, "thong_bao.html", 503, page_title="Hệ thống bận",
+                   tieu_de="Hệ thống đang bận",
+                   noi_dung="Vui lòng thử lại sau ít giây.", link_dang_nhap=True)
+
+
+async def _chay_kdf(request: Request, fn, *args) -> Response:
+    global _kdf_dang_cho
+    if _kdf_dang_cho >= KDF_HANG_DOI_TOI_DA:
+        return _ban(request)
+    _kdf_dang_cho += 1
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(_kdf_pool, functools.partial(fn, *args)), KDF_TIMEOUT_GIAY)
+    except (asyncio.TimeoutError, khach.HeThongBan):
+        return _ban(request)
+    finally:
+        _kdf_dang_cho -= 1
 
 
 def _ctx_phien(request: Request, conn) -> dict | None:
@@ -166,11 +218,16 @@ def dang_ky_form(request: Request):
 
 
 @khach_app.post("/tai-khoan/dang-ky")
-def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""), email: str = Form(""),
-            mat_khau: str = Form(""), mat_khau_2: str = Form(""), dong_y: str = Form(""),
-            csrf_form: str = Form("", alias="_csrf")):
+async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
+                  email: str = Form(""), mat_khau: str = Form(""), mat_khau_2: str = Form(""),
+                  dong_y: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
     if not _kiem_csrf(request, csrf_form):
         return _loi_csrf(request)
+    return await _chay_kdf(request, _dang_ky, request, ho_ten, sdt, email, mat_khau,
+                           mat_khau_2, dong_y)
+
+
+def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Response:
     form = {"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]}
     conn = db.connect()
     try:
@@ -255,23 +312,41 @@ def dang_nhap_form(request: Request):
 
 
 @khach_app.post("/tai-khoan/dang-nhap")
-def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(""),
-              csrf_form: str = Form("", alias="_csrf")):
+async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(""),
+                    csrf_form: str = Form("", alias="_csrf")):
+    dinh_danh = dinh_danh[:40]
+    thiet_bi = request.cookies.get(khach.COOKIE_THIET_BI)
     conn = db.connect()
     try:
         if not _kiem_csrf(request, csrf_form):
             ctx = _ctx_phien(request, conn)  # đang đăng nhập: chấp nhận token CSRF của phiên
             if not ctx or not _kiem_csrf(request, csrf_form, ctx["session"]["csrf_token"]):
                 return _loi_csrf(request)
+        # Lớp chặn rẻ chạy ngay (không băm, không vào hàng đợi băm).
         try:
-            acc = khach.dang_nhap(conn, dinh_danh[:40], mat_khau[:200], web.ip_cua(request),
-                                  request, thiet_bi=request.cookies.get(khach.COOKIE_THIET_BI))
+            khach.kiem_chan(conn, dinh_danh, web.ip_cua(request), thiet_bi, request)
+        except khach.KhachLoi as e:
+            return _loi_dang_nhap(request, e, dinh_danh)
+    finally:
+        conn.close()
+    return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi)
+
+
+def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
+    return _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
+                   dinh_danh=dinh_danh, chua_xac_minh=e.ma == "CHUA_XAC_MINH_EMAIL")
+
+
+def _dang_nhap(request: Request, dinh_danh: str, mat_khau: str, thiet_bi: str | None) -> Response:
+    conn = db.connect()
+    try:
+        try:
+            acc = khach.dang_nhap(conn, dinh_danh, mat_khau, web.ip_cua(request), request,
+                                  thiet_bi=thiet_bi)
         except khach.ChoDuyet:
             return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)
         except khach.KhachLoi as e:
-            return _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập",
-                           loi=e.message, dinh_danh=dinh_danh[:40],
-                           chua_xac_minh=e.ma == "CHUA_XAC_MINH_EMAIL")
+            return _loi_dang_nhap(request, e, dinh_danh)
         sess, token = khach.tao_phien(conn, acc, web.ip_cua(request), _ua(request))
         resp = _sang_crm(conn, request, acc)
     finally:
@@ -279,9 +354,9 @@ def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(
     resp.set_cookie(khach.COOKIE_PHIEN, token, max_age=config.KHACH_SESSION_HOURS * 3600,
                     path=khach.COOKIE_PATH, httponly=True, samesite="lax",
                     secure=_secure(request))
-    resp.delete_cookie(khach.COOKIE_CSRF, path=khach.COOKIE_PATH)
-    # Thiết bị tin cậy: miễn giới hạn theo IP cho đúng tài khoản này (vẫn chịu khoá theo cặp).
-    resp.set_cookie(khach.COOKIE_THIET_BI, khach.tao_thiet_bi(acc["id"]),
+    # Thiết bị tin cậy (gắn token_version): miễn giới hạn theo IP và giới hạn toàn cục của
+    # đúng tài khoản này; vẫn chịu khoá theo cặp (tài khoản, IP).
+    resp.set_cookie(khach.COOKIE_THIET_BI, khach.tao_thiet_bi(acc),
                     max_age=config.KHACH_THIET_BI_NGAY * 86400, path=khach.COOKIE_PATH,
                     httponly=True, samesite="lax", secure=_secure(request))
     return resp
@@ -360,10 +435,14 @@ def dat_lai_form(request: Request, t: str = ""):
 
 
 @khach_app.post("/tai-khoan/dat-lai")
-def dat_lai(request: Request, t: str = Form(""), mat_khau: str = Form(""),
-            mat_khau_2: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
+async def dat_lai(request: Request, t: str = Form(""), mat_khau: str = Form(""),
+                  mat_khau_2: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
     if not _kiem_csrf(request, csrf_form):
         return _loi_csrf(request)
+    return await _chay_kdf(request, _dat_lai, request, t, mat_khau, mat_khau_2)
+
+
+def _dat_lai(request: Request, t: str, mat_khau: str, mat_khau_2: str) -> Response:
     conn = db.connect()
     try:
         khach.dat_lai_mat_khau(conn, t, mat_khau[:200], mat_khau_2[:200], request)

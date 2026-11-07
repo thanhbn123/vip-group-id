@@ -37,7 +37,6 @@ HUONG_VAO = "crm->vipid"
 PATH_SIGNUP = "/api/internal/portal/signups"
 PATH_THU_HOI = "/api/internal/portal/thu-hoi"
 COOKIE_PHIEN = "vg_khach"
-COOKIE_CSRF = "vg_khach_csrf"
 COOKIE_THIET_BI = "vg_khach_tb"
 COOKIE_PATH = "/tai-khoan"
 PORTAL_CODE_RE = re.compile(r"^VG\d{6}$")
@@ -47,7 +46,6 @@ EMAIL_RE = re.compile(r"^[^@\s<>\"'(),;:\\]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z
 KENH_EMAIL_THAT: set[str] = set()
 #: Sau ngần này lần sai (mọi IP cộng lại) trong cửa sổ thì bắt đầu làm chậm.
 LAM_CHAM_SAU = 10
-LAM_CHAM_TOI_DA_GIAY = 30
 
 THONG_BAO_SAI = "Thông tin đăng nhập không đúng hoặc tài khoản chưa thể đăng nhập."
 THONG_BAO_TAM_KHOA = ("Bạn đã thử đăng nhập sai nhiều lần từ thiết bị này. "
@@ -109,6 +107,15 @@ def kiem_cau_hinh() -> None:
         loi.append("COWORK_KHACH_HOSTS rỗng.")
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
+    if not config.STAFF_HOSTS:
+        if la_production():
+            loi.append("COWORK_STAFF_HOSTS chưa đặt — production bắt buộc khai báo danh sách "
+                       "trắng host nhân viên khi bật realm khách.")
+        else:
+            log.warning("CANH_BAO CAU HINH: realm khách BẬT nhưng COWORK_STAFF_HOSTS chưa đặt — "
+                        "đang suy ra host nhân viên từ COWORK_PUBLIC_URL/INTERNAL_URL: %s. "
+                        "Hãy đặt COWORK_STAFF_HOSTS tường minh (production sẽ từ chối khởi động).",
+                        ", ".join(host_nhan_vien()) or "(rỗng)")
     # So TÊN host (bỏ cổng): cookie không tách theo cổng.
     ten_kh = {_ten_host(h) for h in host_khach()}
     ten_nv = {_ten_host(h) for h in host_nhan_vien()}
@@ -193,6 +200,11 @@ def la_host_khach(host: str | None) -> bool:
 
 # ------------------------------------------------------------------ scrypt realm khách
 _scrypt_sem = threading.BoundedSemaphore(max(1, config.KHACH_SCRYPT_DONG_THOI))
+SCRYPT_CHO_TOI_DA_GIAY = 2.0
+
+
+class HeThongBan(Exception):
+    """Quá tải băm mật khẩu ⇒ 503 (không xếp hàng vô hạn, không chiếm luồng của realm khác)."""
 _SALT_GIA_KHACH = b"vipid-khach-gia1"
 
 
@@ -208,9 +220,13 @@ def _tham_so(algo: str | None) -> tuple[int, int, int]:
 
 
 def _scrypt(mat_khau: str, salt: bytes, n: int, r: int, p: int) -> bytes:
-    with _scrypt_sem:
+    if not _scrypt_sem.acquire(timeout=SCRYPT_CHO_TOI_DA_GIAY):
+        raise HeThongBan()
+    try:
         return hashlib.scrypt(mat_khau.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32,
                               maxmem=256 * 1024 * 1024)
+    finally:
+        _scrypt_sem.release()
 
 
 def bam_mk(mat_khau: str) -> tuple[str, str, str]:
@@ -244,35 +260,42 @@ def _ky(muc_dich: str, du_lieu: str) -> str:
                     hashlib.sha256).hexdigest()[:40]
 
 
-def tao_csrf() -> str:
+PS_RE = re.compile(r"^[A-Za-z0-9_-]{24,64}$")
+
+
+def tao_csrf(ps_id: str) -> str:
+    """Token CSRF ẩn danh gắn với id tiền-phiên (cookie riêng của trình duyệt này)."""
     ng = security.token_moi(18)
-    return f"{ng}.{_ky('khach-csrf', ng)}"
+    return f"{ng}.{_ky('khach-csrf', ps_id + '.' + ng)}"
 
 
-def csrf_hop_le(tok: str | None) -> bool:
-    if not tok or len(tok) > 120 or tok.count(".") != 1:
+def csrf_hop_le(tok: str | None, ps_id: str | None) -> bool:
+    if not tok or not ps_id or not PS_RE.match(ps_id) or len(tok) > 120 or tok.count(".") != 1:
         return False
     ng, sig = tok.split(".")
-    return bool(ng) and hmac.compare_digest(_ky("khach-csrf", ng), sig)
+    return bool(ng) and hmac.compare_digest(_ky("khach-csrf", ps_id + "." + ng), sig)
 
 
-def tao_thiet_bi(account_id: str) -> str:
-    du = f"{account_id}.{int(time.time())}.{security.token_moi(9)}"
+def tao_thiet_bi(acc: dict) -> str:
+    """Cookie thiết bị tin cậy: ký (id tài khoản, token_version, thời điểm, ngẫu nhiên).
+    Đặt lại mật khẩu / khoá tài khoản tăng token_version ⇒ mọi cookie cũ mất hiệu lực."""
+    du = f"{acc['id']}.{int(acc['token_version'])}.{int(time.time())}.{security.token_moi(9)}"
     return f"{du}.{_ky('khach-thiet-bi', du)}"
 
 
-def thiet_bi_hop_le(raw: str | None, account_id: str) -> bool:
-    if not raw or len(raw) > 200:
+def thiet_bi_hop_le(raw: str | None, acc: dict | None) -> bool:
+    if not raw or not acc or len(raw) > 200:
         return False
     phan = raw.split(".")
-    if len(phan) != 4:
+    if len(phan) != 5:
         return False
-    du, sig = ".".join(phan[:3]), phan[3]
-    if not hmac.compare_digest(_ky("khach-thiet-bi", du), sig) or phan[0] != account_id:
+    du, sig = ".".join(phan[:4]), phan[4]
+    if not hmac.compare_digest(_ky("khach-thiet-bi", du), sig) or phan[0] != acc["id"]:
         return False
     try:
-        return time.time() - int(phan[1]) <= config.KHACH_THIET_BI_NGAY * 86400
-    except ValueError:
+        return (int(phan[1]) == int(acc["token_version"])
+                and time.time() - int(phan[2]) <= config.KHACH_THIET_BI_NGAY * 86400)
+    except (ValueError, TypeError):
         return False
 
 
@@ -651,50 +674,55 @@ def _ghi_lan(conn, key: str, ip: str, ok: bool) -> None:
     conn.commit()
 
 
-def thoi_gian_cho_lam_cham(conn, key: str) -> int:
-    """Số giây còn phải chờ do làm chậm toàn cục theo tài khoản (mọi IP). 0 = không chờ."""
-    w = config.KHACH_LOGIN_WINDOW_MIN
-    n = _dem_sai(conn, "account_key=?", (key,), w)
-    if n < LAM_CHAM_SAU:
-        return 0
-    cho = min(LAM_CHAM_TOI_DA_GIAY, 2 ** min(10, n - LAM_CHAM_SAU + 1))
-    cuoi = db.scalar(conn, "SELECT MAX(created_at) FROM customer_login_attempts "
-                     "WHERE account_key=? AND success=0", (key,))
-    try:
-        da_qua = (_bay_gio() - datetime.fromisoformat(cuoi)).total_seconds()
-    except (TypeError, ValueError):
-        return 0
-    return max(0, int(cho - da_qua))
+def dang_gioi_han_toan_cuc(conn, key: str) -> bool:
+    """Tài khoản bị dò từ nhiều nơi: >= LAM_CHAM_SAU lượt sai (mọi IP) trong cửa sổ."""
+    return _dem_sai(conn, "account_key=?", (key,), config.KHACH_LOGIN_WINDOW_MIN) >= LAM_CHAM_SAU
 
 
-def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
-              thiet_bi: str | None = None) -> dict:
-    """Trả account khi được phép đăng nhập. Ném KhachLoi/ChoDuyet nếu không.
+THONG_BAO_GIOI_HAN = ("Tài khoản này đang tạm giới hạn đăng nhập vì có nhiều lần thử sai. "
+                      "Vui lòng thử lại sau {phut} phút trên thiết bị đã dùng trước đây, hoặc "
+                      "đặt lại mật khẩu qua email để đăng nhập ngay.")
 
-    Thứ tự (chống khoá ác ý, §11.6):
-      1. Khoá tạm theo cặp (tài khoản, IP) — trước khi kiểm mật khẩu.
-      2. Giới hạn theo IP — trước khi kiểm mật khẩu; MIỄN cho thiết bị tin cậy của đúng
-         tài khoản (cookie ký `vg_khach_tb`), để kẻ lạ chung NAT không chặn được chủ.
-      3. Kiểm mật khẩu.
-      4. Trên mọi IP cộng lại: CHỈ áp lên lượt SAI (429 + cảnh báo), không bao giờ chặn một
-         lượt đúng mật khẩu — kẻ lạ xoay IP không thể làm chủ tài khoản đăng nhập thất bại.
+
+def kiem_chan(conn, dinh_danh: str, ip: str, thiet_bi: str | None = None,
+              request=None) -> tuple[dict | None, str, bool]:
+    """Các lớp chặn TRƯỚC khi kiểm mật khẩu — rẻ, KHÔNG băm (chống làm nghẽn bằng lượt bị chặn).
+
+    Phản hồi chặn không phụ thuộc mật khẩu hay việc tài khoản có tồn tại (khoá đếm theo định
+    danh đã chuẩn hoá), nên không lộ gì. Trả (acc, key, tin_cay) khi được đi tiếp.
+      1. Khoá tạm theo cặp (tài khoản, IP) — áp cho mọi client, kể cả thiết bị tin cậy.
+      2. Giới hạn theo IP — miễn cho thiết bị tin cậy của đúng tài khoản (chung NAT).
+      3. Giới hạn toàn cục theo tài khoản (mọi IP) — client KHÔNG có cookie thiết bị tin cậy
+         nhận 429 giống hệt dù mật khẩu đúng hay sai (không đăng nhập, không lộ đúng/sai).
+         Thiết bị tin cậy đi qua. Chủ ở thiết bị mới: đặt lại mật khẩu qua email (xoá bộ đếm).
     """
     w = config.KHACH_LOGIN_WINDOW_MIN
-    mat_khau = mat_khau or ""
     acc, key = _tim_theo_dinh_danh(conn, dinh_danh)
     actor = acc["subject"] if acc else "khach:anon"
-    tin_cay = bool(acc) and thiet_bi_hop_le(thiet_bi, acc["id"])
+    tin_cay = thiet_bi_hop_le(thiet_bi, acc)
     if _dem_sai(conn, "account_key=? AND ip=?", (key, ip), w) >= config.KHACH_LOGIN_MAX_FAIL:
-        bam_gia(mat_khau)
         _ghi_audit(conn, actor, "khach.dang_nhap.khoa_cap_ip", detail={"ip": ip}, request=request,
                    lay_mau=f"{ip}:{key}")
         raise KhachLoi(THONG_BAO_TAM_KHOA.format(phut=config.KHACH_LOCK_MIN), 429, "TAM_KHOA")
     if not tin_cay and _dem_sai(conn, "ip=?", (ip,), w) >= config.KHACH_LOGIN_IP_MAX_FAIL:
-        bam_gia(mat_khau)
         _ghi_audit(conn, actor, "khach.dang_nhap.chan_ip", detail={"ip": ip}, request=request,
                    lay_mau=ip)
         raise KhachLoi("Quá nhiều lần đăng nhập sai từ mạng của bạn. Vui lòng thử lại sau "
                        f"{w} phút.", 429, "QUA_TAN_SUAT")
+    if not tin_cay and dang_gioi_han_toan_cuc(conn, key):
+        _ghi_audit(conn, actor, "khach.dang_nhap.gioi_han_toan_cuc", detail={"ip": ip},
+                   request=request, lay_mau=f"{ip}:{key}")
+        raise KhachLoi(THONG_BAO_GIOI_HAN.format(phut=w), 429, "GIOI_HAN")
+    return acc, key, tin_cay
+
+
+def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
+              thiet_bi: str | None = None) -> dict:
+    """Trả account khi được phép đăng nhập. Ném KhachLoi/ChoDuyet nếu không (xem kiem_chan)."""
+    w = config.KHACH_LOGIN_WINDOW_MIN
+    mat_khau = mat_khau or ""
+    acc, key, _tin_cay = kiem_chan(conn, dinh_danh, ip, thiet_bi, request)
+    actor = acc["subject"] if acc else "khach:anon"
 
     hop_le = kiem_mk(mat_khau, acc)
     if not hop_le:
@@ -712,10 +740,6 @@ def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
                        request=request)
             log.warning("CANH_BAO khach: tài khoản %s bị dò mật khẩu (%s lần/%s phút)",
                         actor, n_tk, w)
-        cho = thoi_gian_cho_lam_cham(conn, key)
-        if cho > 0:
-            raise KhachLoi(f"Thông tin đăng nhập không đúng. Vui lòng đợi {cho} giây rồi thử lại.",
-                           429, "LAM_CHAM")
         raise KhachLoi(THONG_BAO_SAI, 401, "SAI_THONG_TIN")
 
     # Mật khẩu đúng ⇒ có thể nói trạng thái cho chính chủ.
