@@ -68,10 +68,52 @@ def test_nonce_moi_lan_khac_nhau():
     assert crm_launch.tao_token(u)[1]["nonce"] != crm_launch.tao_token(u)[1]["nonce"]
 
 
-def test_ttl_khong_vuot_60(monkeypatch):
-    monkeypatch.setattr(config, "CRM_LAUNCH_TTL", 3600)
+@pytest.mark.parametrize("ttl", [0, -5, 61, 3600])
+def test_ttl_ngoai_1_60_bi_tu_choi(monkeypatch, ttl):
+    monkeypatch.setattr(config, "CRM_LAUNCH_TTL", ttl)
+    assert any("COWORK_CRM_LAUNCH_TTL" in x for x in crm_launch.loi_cau_hinh())
+    with pytest.raises(RuntimeError):
+        crm_launch.tao_token({"id": "x", "tenant_id": "vip-group"})
+
+
+def test_ttl_hop_le_duoc_dung(monkeypatch):
+    monkeypatch.setattr(config, "CRM_LAUNCH_TTL", 30)
     _, p = crm_launch.tao_token({"id": "x", "tenant_id": "vip-group"})
-    assert p["exp"] - p["iat"] == 60
+    assert p["exp"] - p["iat"] == 30
+
+
+@pytest.mark.parametrize("env", ["prod", "production", "PROD"])
+def test_http_bi_chan_o_moi_ten_production(monkeypatch, env):
+    monkeypatch.setattr(config, "ENV", env)
+    monkeypatch.setattr(config, "CRM_PUBLIC_URL", "http://crm.vipgroup.com.vn")
+    assert any("https://" in x for x in crm_launch.loi_cau_hinh())
+
+
+def test_http_cho_phep_o_local(monkeypatch):
+    monkeypatch.setattr(config, "ENV", "local")
+    monkeypatch.setattr(config, "CRM_PUBLIC_URL", "http://127.0.0.1:8080")
+    assert not crm_launch.loi_cau_hinh()
+
+
+def test_trung_bi_mat_portal_nap_tu_tep(monkeypatch, tmp_path):
+    f = tmp_path / "portal.key"
+    f.write_text(BI_MAT + "\n")
+    monkeypatch.delenv("VIPID_PORTAL_SECRET", raising=False)
+    monkeypatch.setattr(config, "PORTAL_SECRET_FILE", f)
+    assert any("KHÁC" in x for x in crm_launch.loi_cau_hinh())
+
+
+def test_kiem_portal_khong_sinh_tep(monkeypatch, tmp_path):
+    f = tmp_path / "portal-chua-co.key"
+    monkeypatch.delenv("VIPID_PORTAL_SECRET", raising=False)
+    monkeypatch.setattr(config, "PORTAL_SECRET_FILE", f)
+    assert not crm_launch.loi_cau_hinh() and not f.exists()
+
+
+def test_chieu_nguoc_trung_voi_launch_crm():
+    assert crm_launch.trung_voi_launch_crm(BI_MAT)
+    assert not crm_launch.trung_voi_launch_crm("khac-" + BI_MAT)
+    assert not crm_launch.trung_voi_launch_crm("")
 
 
 @pytest.mark.parametrize("gia_tri, mau", [

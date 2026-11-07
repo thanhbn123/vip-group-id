@@ -69,13 +69,46 @@ def loi_cau_hinh() -> list[str]:
             loi.append("COWORK_CRM_LAUNCH_SECRET phải dài ít nhất 32 ký tự.")
         if "change-me" in s:
             loi.append("COWORK_CRM_LAUNCH_SECRET đang là giá trị mẫu.")
-        khac = [config.SECRET_KEY, config.BRAIN_SHARED_SECRET, config.HATANG_SHARED_SECRET,
-                os.environ.get("VIPID_PORTAL_SECRET", ""), os.environ.get("VIPID_SHARED_SECRET", "")]
-        if any(k and hmac.compare_digest(k, s) for k in khac):
+        if trung_bi_mat_khac(s):
             loi.append("COWORK_CRM_LAUNCH_SECRET phải KHÁC mọi bí mật khác (phiên, Brain, hạ tầng, portal).")
-    if not config.CRM_PUBLIC_URL.startswith("https://") and config.ENV == "production":
+    if not 1 <= config.CRM_LAUNCH_TTL <= TTL_TOI_DA:
+        loi.append(f"COWORK_CRM_LAUNCH_TTL phải trong khoảng 1..{TTL_TOI_DA} giây.")
+    if not config.CRM_PUBLIC_URL.startswith("https://") and _la_production():
         loi.append("COWORK_CRM_PUBLIC_URL phải là https:// ở production.")
     return loi
+
+
+def _la_production() -> bool:
+    # Cùng định nghĩa với khach.la_production() ('prod' hoặc 'production').
+    from . import khach
+    return khach.la_production()
+
+
+def _doc_khong_sinh(env_name: str, path) -> str:
+    """Đọc bí mật từ env → tệp nếu ĐÃ có. Không bao giờ sinh tệp mới (khác config._secret)."""
+    v = os.environ.get(env_name, "").strip()
+    if v:
+        return v
+    try:
+        if path and path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def trung_bi_mat_khac(s: str) -> bool:
+    """`s` (bí mật launch CRM) có trùng bí mật nào khác của VIP ID không — gồm portal từ env HOẶC tệp."""
+    khac = [config.SECRET_KEY, config.BRAIN_SHARED_SECRET, config.HATANG_SHARED_SECRET,
+            _doc_khong_sinh("VIPID_PORTAL_SECRET", config.PORTAL_SECRET_FILE),
+            os.environ.get("VIPID_SHARED_SECRET", "").strip()]
+    return any(k and hmac.compare_digest(k.encode(), s.encode()) for k in khac)
+
+
+def trung_voi_launch_crm(gia_tri: str) -> bool:
+    """Chiều ngược (cho khach.kiem_cau_hinh): `gia_tri` có trùng bí mật launch CRM không."""
+    s = bi_mat()
+    return bool(s and gia_tri) and hmac.compare_digest(s.encode(), gia_tri.encode())
 
 
 def tenant_crm(cowork_tenant_id: str) -> str | None:
@@ -105,7 +138,7 @@ def tao_token(user: dict, *, now: float | None = None) -> tuple[str, dict]:
     iat = int(now if now is not None else time.time())
     payload = {
         "ver": 1, "aud": AUDIENCE, "sub": subject(user), "tenant_code": tenant,
-        "iat": iat, "exp": iat + min(config.CRM_LAUNCH_TTL, TTL_TOI_DA), "nonce": str(uuid.uuid4()),
+        "iat": iat, "exp": iat + config.CRM_LAUNCH_TTL, "nonce": str(uuid.uuid4()),
     }
     return ky(bi_mat(), payload), payload
 
