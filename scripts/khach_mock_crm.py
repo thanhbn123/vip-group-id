@@ -65,8 +65,9 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         raw = self.rfile.read(int(self.headers.get("content-length") or 0))
         ts, sig = self.headers.get("x-portal-ts", ""), self.headers.get("x-portal-sig", "")
-        mong = hmac.new(_secret().encode(), f"vipid->crm.{ts}.".encode() + raw,
-                        hashlib.sha256).hexdigest()
+        # Chuỗi ký: "<direction>.<METHOD>.<path>.<ts>." + body
+        mong = hmac.new(_secret().encode(), f"vipid->crm.POST.{urlsplit(self.path).path}.{ts}.".encode()
+                        + raw, hashlib.sha256).hexdigest()
         if not ts.isdigit() or abs(time.time() - int(ts)) > 300 or not hmac.compare_digest(mong, sig):
             return self._tra(401, '{"ok":false}')
         print(f"[mock-crm] {self.path} {raw.decode()}", file=sys.stderr)

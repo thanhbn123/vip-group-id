@@ -26,7 +26,9 @@ export COWORK_INTERNAL_URL=http://127.0.0.1:8899
 export COWORK_BRAIN_ENABLED=0
 export COWORK_COOKIE_SECURE=0
 export COWORK_KHACH_ENABLED=1
-export COWORK_KHACH_HOSTS="${COWORK_KHACH_HOSTS:-khach.localhost:8898,127.0.0.1:8898}"
+# Tên host khách phải KHÁC tên host nhân viên (127.0.0.1) — cookie không tách theo cổng.
+export COWORK_KHACH_HOSTS="${COWORK_KHACH_HOSTS:-khach.localhost:8898}"
+export COWORK_STAFF_HOSTS="${COWORK_STAFF_HOSTS:-127.0.0.1:8899}"
 export COWORK_KHACH_PUBLIC_URL="${COWORK_KHACH_PUBLIC_URL:-http://khach.localhost:8898}"
 export CRM_PORTAL_INTERNAL_URL="${CRM_PORTAL_INTERNAL_URL:-http://127.0.0.1:8897}"
 export CRM_PORTAL_PUBLIC_URL="${CRM_PORTAL_PUBLIC_URL:-http://127.0.0.1:8897}"
