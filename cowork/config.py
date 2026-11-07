@@ -105,3 +105,40 @@ HATANG_TRE_PHUT = int(os.environ.get("COWORK_HATANG_TRE_PHUT", "25"))
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+# ---- REALM KHÁCH (cổng khách hàng P1 — docs KIEN_TRUC_P1 mục 3, 4) ----
+# Mặc định TẮT: khi tắt, không route nào của realm khách tồn tại (404).
+KHACH_ENABLED = os.environ.get("COWORK_KHACH_ENABLED", "0").strip() == "1"
+#: Host (có thể kèm cổng) phục vụ realm khách. Request tới host này CHỈ thấy /tai-khoan/*
+#: của khách và /api/internal/khach/*; mọi route nhân viên trả 404. Host khác thì ngược lại.
+KHACH_HOSTS = [h.strip().lower() for h in os.environ.get(
+    "COWORK_KHACH_HOSTS", "khach.localhost:8898,127.0.0.1:8898").split(",") if h.strip()]
+#: URL công khai của realm khách — dùng để dựng link trong email.
+KHACH_PUBLIC_URL = os.environ.get("COWORK_KHACH_PUBLIC_URL",
+                                  "http://khach.localhost:8898").rstrip("/")
+CRM_PORTAL_INTERNAL_URL = os.environ.get("CRM_PORTAL_INTERNAL_URL",
+                                         "http://127.0.0.1:8897").rstrip("/")
+CRM_PORTAL_PUBLIC_URL = os.environ.get("CRM_PORTAL_PUBLIC_URL",
+                                       "http://127.0.0.1:8897").rstrip("/")
+CRM_PORTAL_TIMEOUT = float(os.environ.get("CRM_PORTAL_TIMEOUT", "3"))
+#: Bí mật HMAC/launch token VIP ID ⇄ CRM portal. Nạp LƯỜI (chỉ khi realm bật) qua
+#: `khach.portal_secret()`: env VIPID_PORTAL_SECRET → tệp 0600 → sinh mới (chỉ dev).
+PORTAL_SECRET_FILE = _path("VIPID_PORTAL_SECRET_FILE", DATA_DIR / "portal_secret.key")
+#: Kênh gửi email. CHỈ có 'outbox' (ghi bảng customer_outbox, không gửi thật).
+#: Production + realm bật + chưa có kênh thật ⇒ ứng dụng TỪ CHỐI khởi động (chặn A8).
+KHACH_MAIL_TRANSPORT = os.environ.get("COWORK_KHACH_MAIL_TRANSPORT", "outbox").strip() or "outbox"
+KHACH_PASSWORD_MIN = 12
+KHACH_TOKEN_TTL_MIN = int(os.environ.get("COWORK_KHACH_TOKEN_TTL_MIN", "30"))
+KHACH_LAUNCH_TTL = min(60, int(os.environ.get("COWORK_KHACH_LAUNCH_TTL", "60")))
+KHACH_SESSION_HOURS = int(os.environ.get("COWORK_KHACH_SESSION_HOURS", "12"))
+KHACH_IDLE_MINUTES = int(os.environ.get("COWORK_KHACH_IDLE_MINUTES", "120"))
+KHACH_LOGIN_MAX_FAIL = int(os.environ.get("COWORK_KHACH_LOGIN_MAX_FAIL", "5"))
+KHACH_LOGIN_IP_MAX_FAIL = int(os.environ.get("COWORK_KHACH_LOGIN_IP_MAX_FAIL", "20"))
+KHACH_LOGIN_WINDOW_MIN = int(os.environ.get("COWORK_KHACH_LOGIN_WINDOW_MIN", "15"))
+KHACH_LOCK_MIN = int(os.environ.get("COWORK_KHACH_LOCK_MIN", "15"))
+KHACH_SIGNUP_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_SIGNUP_IP_PER_HOUR", "5"))
+KHACH_FORGOT_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_FORGOT_IP_PER_HOUR", "10"))
+#: Đăng ký chưa xác minh email quá hạn này thì bị giải phóng khi có người đăng ký trùng
+#: (chống "giữ chỗ" SĐT/email của người khác bằng tài khoản không bao giờ xác minh).
+KHACH_UNVERIFIED_TTL_HOURS = int(os.environ.get("COWORK_KHACH_UNVERIFIED_TTL_HOURS", "48"))
