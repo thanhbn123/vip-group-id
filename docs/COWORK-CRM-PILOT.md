@@ -13,6 +13,7 @@ Mọi thao tác hạ tầng và production dưới đây chỉ chạy khi owner 
 | `https://cowork.vipgroup.com.vn/api/health` | ✅ 200, db ok |
 | `https://crm.vipgroup.com.vn` | ❌ Lỗi TLS (`tlsv1 alert internal error`): Caddy chưa có khối site. Kế hoạch CRM: NO-GO PUBLIC, chờ owner và người giữ root |
 | `https://dangnhap…`, `https://khachhang…` | ❌ Lỗi TLS, cùng nguyên nhân (chờ P-09) |
+| E2E thật | ✅ COWORK (uvicorn) → CRM local test: 9/9 PASS (`evidence/cowork-crm-e2e-20261107.json`) |
 | Code | ✅ `cowork-crm` 329 test PASS. Liên thông với `verifyCoworkToken` thật của CRM (đã siết, c02474b) PASS. Verifier vòng 9: GO |
 
 **Điều kiện chặn:** CRM nội bộ phải có HTTPS công khai tại `crm.vipgroup.com.vn` (kế hoạch `VIP_CRM_V6_HTTPS_GO_PUBLIC_PLAN.md` của CRM). Chưa có thì nút "Mở CRM" sẽ dẫn tới trang lỗi TLS.
@@ -23,7 +24,7 @@ Mọi thao tác hạ tầng và production dưới đây chỉ chạy khi owner 
 |---|---|---|---|
 | P-01 / P-03 | Push, PR và deploy VIP ID **gồm cả** `feature/cowork-crm` (sau `khach-p1`). Không phát sinh thêm downtime | Website Controller | (dùng chung câu duyệt P-01 / P-03) |
 | P-09b | Khối Caddy `crm.vipgroup.com.vn` → CRM prod (theo kế hoạch HTTPS của CRM) | Owner hoặc người giữ root | Người root thực hiện, báo "xong P-09b" |
-| P-12 | Sinh **một** bí mật launch mới trên VPS: `openssl rand -hex 32`. Ghi vào VIP ID `/data/crm_launch_secret.key` (0600) và `COWORK_SHARED_SECRET` trong `secrets/app.env` của CRM prod (0600). Không đi qua chat hay log. Khởi động lại app CRM (< 1 phút) | VIP ID + CRM Controller qua SSH | `DUYỆT P-12 SECRET CRM` |
+| P-12 | Sinh **một** bí mật launch mới trên VPS: `openssl rand -hex 32`. Ghi thành hai tệp 0600: VIP ID `/data/crm_launch_secret.key` và CRM `COWORK_SHARED_SECRET_FILE` (hỗ trợ từ CRM 52fcdeb, khai báo compose secret ở RC kế tiếp; prod hiện **chưa có** `COWORK_SHARED_SECRET`). Không đi qua chat hay log. Khởi động lại app CRM (< 1 phút) | VIP ID + CRM Controller qua SSH | `DUYỆT P-12 SECRET CRM` |
 | P-13 | Cấp quyền `crm.view` và `crm.use` trong COWORK: màn **Vai trò** (theo vai trò) hoặc **Phân quyền module** (từng người). Có audit | **Owner** (giao diện COWORK) | Owner tự làm |
 | P-14 | Liên kết nhân sự trong CRM: vip_admin đặt `vip_subject = cowork:<ID đăng nhập COWORK>` (màn Nhân sự). Mỗi nhân viên xem mã của mình ở `cowork…/crm` | vip_admin CRM | Owner chỉ định danh sách |
 
