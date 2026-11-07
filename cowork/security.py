@@ -23,6 +23,12 @@ _SALT_GIA = b"cowork-gia-000001"  # 16 byte, cố định cho lượt băm giả
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,39}$")
 ID_CAM = {"admin", "root", "system", "cowork", "brain", "superadmin", "super-admin", "api"}
+#: Tên đường dẫn của realm khách dưới /tai-khoan/* — KHÔNG được làm ID nhân viên, và route
+#: nhân viên /tai-khoan/{user_id} trả 404 cho các tên này (tránh nhập nhằng với cổng khách).
+TEN_DANH_RIENG_KHACH = {
+    "dang-ky", "dang-nhap", "dang-xuat", "quen-mat-khau", "dat-lai", "xac-minh-email",
+    "vao-cong", "static", "da-gui-email", "gui-lai-xac-minh", "cho-duyet",
+}
 MAT_KHAU_CAM = {
     "1234567890", "123456789", "password", "matkhau123", "vipgroup123",
     "admin12345", "cowork123", "qwerty12345", "1111111111",
@@ -95,7 +101,7 @@ def chuan_hoa_id(user_id: str) -> str:
 def kiem_tra_id(user_id: str) -> str | None:
     if not ID_RE.match(user_id or ""):
         return "ID phải dài 3–40 ký tự, bắt đầu bằng chữ/số, chỉ gồm a-z, 0-9, dấu chấm, gạch ngang, gạch dưới."
-    if user_id in ID_CAM:
+    if user_id in ID_CAM or user_id in TEN_DANH_RIENG_KHACH:
         return "ID này được dành riêng cho hệ thống."
     return None
 

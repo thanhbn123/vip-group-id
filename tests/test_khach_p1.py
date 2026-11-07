@@ -105,6 +105,13 @@ def token_tu(body: str, path: str) -> str:
     return m.group(1)
 
 
+def xac_minh(c: TestClient, t: str):
+    """GET hiện trang xác nhận (không tiêu token) rồi POST để tiêu."""
+    r = c.get(f"/tai-khoan/xac-minh-email?t={t}")
+    assert r.status_code == 200, r.text[:300]
+    return c.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf_tu(r.text)})
+
+
 def acc_theo_sdt(phone: str) -> dict | None:
     conn = db.connect()
     try:
@@ -141,7 +148,7 @@ def tao_khach_hoat_dong(c: TestClient, n: int = 1) -> dict:
     assert dang_ky(c, n).status_code == 303
     mail = outbox("kich_hoat_email", f"khach{n}@example.test")[-1]
     t = token_tu(mail["body_text"], "/tai-khoan/xac-minh-email")
-    assert c.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 200
+    assert xac_minh(c, t).status_code == 200
     acc = acc_theo_sdt(f"+8490000000{n}")
     assert acc["status"] == "cho_duyet"
     r = duyet(c, acc["subject"], n)
@@ -318,7 +325,7 @@ def test_token_email_mot_lan_va_het_han(kh, crm):
         assert t not in json.dumps(db.q(conn, "SELECT * FROM customer_tokens"))
     finally:
         conn.close()
-    assert kh.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 200
+    assert xac_minh(kh, t).status_code == 200
     acc = acc_theo_sdt("+84900000001")
     assert acc["status"] == "cho_duyet" and acc["email_verified_at"]
     # Signup đã gửi sang CRM, ký HMAC đúng chiều.
@@ -331,8 +338,10 @@ def test_token_email_mot_lan_va_het_han(kh, crm):
     assert security.xac_thuc_hmac("vipid->crm", goi["headers"]["X-Portal-Ts"],
                                   goi["headers"]["X-Portal-Sig"], goi["raw"],
                                   secret=khach.portal_secret())
-    # Dùng lại ⇒ không hợp lệ.
+    # Dùng lại ⇒ không hợp lệ (cả GET lẫn POST).
     assert kh.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 400
+    csrf = _csrf(kh, "/tai-khoan/dang-nhap")
+    assert kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf}).status_code == 400
     # Token hết hạn.
     dang_ky(kh, 2)
     t2 = token_tu(outbox("kich_hoat_email", "khach2@example.test")[-1]["body_text"],
@@ -353,7 +362,7 @@ def test_crm_loi_thi_xep_hang_va_thu_lai(kh, crm):
     crm.song = False
     dang_ky(kh, 1)
     t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    assert kh.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 200
+    assert xac_minh(kh, t).status_code == 200
     conn = db.connect()
     try:
         row = db.one(conn, "SELECT * FROM crm_sync_pending")
@@ -376,7 +385,7 @@ def test_khong_dang_nhap_truoc_xac_minh_va_truoc_duyet(kh):
     r = dang_nhap(kh, "0900000001")
     assert r.status_code == 403 and "chưa xác minh email" in r.text
     t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    kh.get(f"/tai-khoan/xac-minh-email?t={t}")
+    assert xac_minh(kh, t).status_code == 200
     r = dang_nhap(kh, "0900000001")
     assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
     # Sai mật khẩu ở trạng thái chờ ⇒ thông báo chung, không lộ trạng thái.
@@ -401,7 +410,7 @@ def test_khong_dang_nhap_khi_sdt_chua_xac_minh(kh):
 def test_tu_choi_va_tam_khoa_khong_dang_nhap(kh):
     dang_ky(kh, 1)
     t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    kh.get(f"/tai-khoan/xac-minh-email?t={t}")
+    assert xac_minh(kh, t).status_code == 200
     acc = acc_theo_sdt("+84900000001")
     r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet",
                    {"subject": acc["subject"], "decision": "rejected", "reason": "trùng"})
@@ -559,7 +568,7 @@ def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
     # Chưa xác minh email ⇒ không duyệt được.
     assert duyet(kh, acc["subject"]).status_code == 409
     t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    kh.get(f"/tai-khoan/xac-minh-email?t={t}")
+    assert xac_minh(kh, t).status_code == 200
     assert duyet(kh, acc["subject"], portal_code="ABC").status_code == 400
     assert duyet(kh, acc["subject"], phone_verified_by="").status_code == 400
     assert duyet(kh, "cust:khong-co").status_code == 404
@@ -577,7 +586,7 @@ def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
     dang_ky(kh, 2)
     t = token_tu(outbox("kich_hoat_email", "khach2@example.test")[-1]["body_text"],
                  "/tai-khoan/xac-minh-email")
-    kh.get(f"/tai-khoan/xac-minh-email?t={t}")
+    assert xac_minh(kh, t).status_code == 200
     acc2 = acc_theo_sdt("+84900000002")
     assert duyet(kh, acc2["subject"], 2, portal_code="VG000001").status_code == 409
 
@@ -801,3 +810,70 @@ def test_bi_mat_khong_nam_trong_repo():
     # Tệp bí mật dev có quyền 0600.
     if config.PORTAL_SECRET_FILE.exists():
         assert (config.PORTAL_SECRET_FILE.stat().st_mode & 0o777) == 0o600
+
+
+# ------------------------------------------------------------------ GET không tiêu token
+def test_get_xac_minh_khong_tieu_token(kh, crm):
+    dang_ky(kh, 1)
+    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
+    for _ in range(2):  # trình quét email mở link nhiều lần
+        r = kh.get(f"/tai-khoan/xac-minh-email?t={t}")
+        assert r.status_code == 200 and 'name="t"' in r.text
+    assert acc_theo_sdt("+84900000001")["status"] == "cho_xac_minh_email"
+    assert crm.goi == []
+    csrf = csrf_tu(r.text)
+    # Thiếu/sai CSRF ⇒ không tiêu.
+    assert kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": "sai"}).status_code == 403
+    r1 = kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf})
+    assert r1.status_code == 200 and "đã được xác minh" in r1.text
+    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
+    r2 = kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf})
+    assert r2.status_code == 400
+    assert len(crm.goi) == 1
+
+
+def test_get_dat_lai_khong_tieu_token(kh):
+    tao_khach_hoat_dong(kh, 1)
+    csrf = _csrf(kh, "/tai-khoan/quen-mat-khau")
+    kh.post("/tai-khoan/quen-mat-khau", data={"dinh_danh": "0900000001", "_csrf": csrf})
+    t = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    for _ in range(2):
+        r = kh.get(f"/tai-khoan/dat-lai?t={t}")
+        assert r.status_code == 200
+    csrf = csrf_tu(r.text)
+    d = {"t": t, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI, "_csrf": csrf}
+    assert kh.post("/tai-khoan/dat-lai", data=d).status_code == 200
+    assert kh.post("/tai-khoan/dat-lai", data=d).status_code == 400
+
+
+def test_ten_danh_rieng_khach_tren_host_nhan_vien(client, bat, crm, owner):
+    from cowork import security, services, auth as nv_auth, rbac
+    ten = ["dang-ky", "dang-nhap", "quen-mat-khau", "dat-lai", "xac-minh-email", "vao-cong",
+           "dang-xuat", "static"]
+    # Chưa đăng nhập: 404 (không chuyển sang trang đăng nhập nhân viên).
+    for n in ten:
+        assert client.get(f"/tai-khoan/{n}", follow_redirects=False).status_code == 404, n
+    dang_nhap_nv(client, "anh-thanh", "Owner!Passw0rd")
+    for n in ten:
+        assert client.get(f"/tai-khoan/{n}", follow_redirects=False).status_code == 404, n
+        assert client.get(f"/tai-khoan/{n}/phan-quyen", follow_redirects=False).status_code == 404
+    # Route nhân viên khác vẫn hoạt động.
+    assert client.get("/tai-khoan/anh-thanh").status_code == 200
+    assert client.get("/tai-khoan/tao-moi").status_code == 200
+    # Không tạo được ID nhân viên trùng tên dành riêng.
+    for n in ten:
+        assert security.kiem_tra_id(n), n
+    conn = db.connect()
+    try:
+        actor = nv_auth.nguoi_dung_day_du(conn, "anh-thanh")
+        perms = rbac.quyen_hieu_luc(conn, actor)
+        from cowork.errors import ValidationError
+        with pytest.raises(ValidationError, match="dành riêng"):
+            services.tao_nguoi_dung(conn, actor, perms, {
+                "id": "dang-nhap", "display_name": "x", "email": "x@example.test",
+                "role_code": "employee", "department_id": "", "password": "User!Passw0rd",
+                "must_change": "0", "scope_mode": "tenant", "scope_departments": [],
+                "partner_org": ""})
+        assert db.scalar(conn, "SELECT COUNT(*) FROM users WHERE id='dang-nhap'") == 0
+    finally:
+        conn.close()
