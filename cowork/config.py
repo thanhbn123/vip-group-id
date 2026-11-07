@@ -177,3 +177,13 @@ KHACH_HOTLINE = os.environ.get("COWORK_KHACH_HOTLINE", "0961 102 655").strip() o
 KHACH_SIGNUP_GLOBAL_PER_HOUR = int(os.environ.get("COWORK_KHACH_SIGNUP_GLOBAL_PER_HOUR", "200"))
 #: Chu kỳ (giây) của vòng nền gửi hàng đợi sang CRM. Request KHÔNG BAO GIỜ gọi CRM trực tiếp.
 KHACH_SYNC_GIAY = float(os.environ.get("COWORK_KHACH_SYNC_GIAY", "5"))
+#: PILOT có kiểm soát (owner duyệt): chỉ SĐT trong danh sách trắng mới đăng ký/đăng nhập/khôi phục.
+#: Production BẮT BUỘC đặt tường minh COWORK_KHACH_PILOT=0 hoặc 1 (thiếu ⇒ từ chối khởi động).
+KHACH_PILOT_RAW = os.environ.get("COWORK_KHACH_PILOT", "").strip()
+KHACH_PILOT = KHACH_PILOT_RAW == "1"
+KHACH_PILOT_PHONES = [p.strip() for p in os.environ.get("COWORK_KHACH_PILOT_PHONES", "").split(",")
+                      if p.strip()]
+KHACH_PILOT_FILE = _path("COWORK_KHACH_PILOT_FILE", DATA_DIR / "khach_pilot.txt")
+#: Công tắc khẩn: tệp này TỒN TẠI ⇒ mọi request host khách trả 503 bảo trì (không cần khởi động
+#: lại). `touch` để đóng cổng, `rm` để mở lại. Realm nhân viên không bị ảnh hưởng.
+KHACH_MAINTENANCE_FILE = _path("COWORK_KHACH_MAINTENANCE_FILE", DATA_DIR / "khach_bao_tri.flag")

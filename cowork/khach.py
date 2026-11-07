@@ -68,6 +68,89 @@ class ChoDuyet(KhachLoi):
     pass
 
 
+class KhachPilot(KhachLoi):
+    """Đang chạy thử nội bộ: SĐT/tài khoản không thuộc danh sách pilot."""
+
+
+THONG_BAO_PILOT = ("Cổng khách hàng VIP GROUP đang chạy thử nội bộ, sẽ mở sớm. "
+                   "Liên hệ hotline/Zalo {hotline}.")
+
+
+# ------------------------------------------------------------------ pilot (danh sách trắng)
+_pilot_cache: dict = {"khoa": None, "ds": frozenset()}
+
+
+def _doc_tep_pilot() -> frozenset:
+    """Đọc tệp pilot (mỗi dòng một SĐT, '#' là chú thích); chỉ đọc lại khi tệp đổi (mtime/size)."""
+    p = config.KHACH_PILOT_FILE
+    try:
+        st = p.stat()
+    except OSError:
+        _pilot_cache.update(khoa=None, ds=frozenset())
+        return frozenset()
+    khoa = (str(p), st.st_mtime_ns, st.st_size)
+    if _pilot_cache["khoa"] != khoa:
+        ds = set()
+        for dong in p.read_text(encoding="utf-8").splitlines():
+            dong = dong.split("#", 1)[0].strip()
+            ph = chuan_hoa_sdt(dong)
+            if ph:
+                ds.add(ph)
+        _pilot_cache.update(khoa=khoa, ds=frozenset(ds))
+    return _pilot_cache["ds"]
+
+
+def ds_pilot() -> dict[str, str]:
+    """{sđt E.164: nguồn ('env'|'tep')}."""
+    kq = {ph: "tep" for ph in _doc_tep_pilot()}
+    for raw in config.KHACH_PILOT_PHONES:
+        ph = chuan_hoa_sdt(raw)
+        if ph:
+            kq[ph] = "env"
+    return kq
+
+
+def pilot_cho_phep(phone: str | None) -> bool:
+    """Pilot tắt ⇒ luôn cho. Bật ⇒ chỉ SĐT trong danh sách (env ∪ tệp)."""
+    if not config.KHACH_PILOT:
+        return True
+    return bool(phone) and phone in ds_pilot()
+
+
+def chan_pilot(phone: str | None) -> None:
+    if not pilot_cho_phep(phone):
+        raise KhachPilot(THONG_BAO_PILOT.format(hotline=config.KHACH_HOTLINE), 403, "PILOT")
+
+
+def sua_tep_pilot(phone_raw: str, them: bool, actor: str = "cli") -> tuple[bool, str]:
+    """Thêm/bớt một SĐT trong tệp pilot (ghi nguyên tử, 0600) + audit. Trả (đổi?, sđt)."""
+    import os
+    ph = chuan_hoa_sdt(phone_raw)
+    if not ph:
+        raise ValueError("SĐT không hợp lệ.")
+    p = config.KHACH_PILOT_FILE
+    hien = set(_doc_tep_pilot())
+    if (ph in hien) == them:
+        return False, ph
+    hien = hien | {ph} if them else hien - {ph}
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tam = p.with_name(p.name + ".tmp")
+    fd = os.open(str(tam), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("# Danh sách SĐT pilot cổng khách hàng (quản lý bằng cowork.cli khach-pilot)\n")
+        for x in sorted(hien):
+            fh.write(x + "\n")
+    os.replace(tam, p)
+    _pilot_cache.update(khoa=None)
+    conn = db.connect()
+    try:
+        _ghi_audit(conn, actor, "khach.pilot.them" if them else "khach.pilot.bot",
+                   target_id=ph, detail={"phone": che_sdt(ph)})
+    finally:
+        conn.close()
+    return True, ph
+
+
 # ------------------------------------------------------------------ cấu hình / bí mật
 _bi_mat_cache: str | None = None
 
@@ -116,6 +199,9 @@ def kiem_cau_hinh() -> None:
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
     if la_production():
+        if config.KHACH_PILOT_RAW not in ("0", "1"):
+            loi.append("Production bật realm khách phải đặt tường minh COWORK_KHACH_PILOT=0 hoặc 1 "
+                       "(quyết định có chạy thử giới hạn hay không).")
         if not config.TIN_PROXY:
             loi.append("Production bật realm khách phải chạy sau Caddy với COWORK_TIN_PROXY=1 "
                        "(IP thật cho giới hạn tần suất, X-Forwarded-Proto cho https).")
@@ -594,6 +680,9 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
         raise KhachLoi("Hai lần nhập mật khẩu không khớp.")
     if not dong_y:
         raise KhachLoi("Bạn cần đồng ý với chính sách bảo mật và điều khoản sử dụng.")
+    # Pilot: chỉ SĐT trong danh sách trắng. Quyết định chỉ dựa trên danh sách ⇒ không lộ việc SĐT
+    # đã có tài khoản hay chưa; không tạo tài khoản, không gửi CRM.
+    chan_pilot(phone)
     if vuot_tan_suat(conn, "dang_ky_ip", ip, config.KHACH_SIGNUP_IP_PER_HOUR, 3600):
         _ghi_audit(conn, "khach:anon", "khach.dang_ky.qua_tan_suat", detail={"ip": ip},
                    request=request, lay_mau=ip)
@@ -731,6 +820,10 @@ def kiem_chan(conn, dinh_danh: str, ip: str, thiet_bi: str | None = None,
     """
     w = config.KHACH_LOGIN_WINDOW_MIN
     acc, key = _tim_theo_dinh_danh(conn, dinh_danh)
+    # Pilot: chặn trước mọi kiểm tra (không kiểm mật khẩu, không đếm lượt). Quyết định theo SĐT
+    # của định danh (hoặc của tài khoản mang mã VG…): mã/SĐT không tồn tại cũng nhận cùng trang.
+    if config.KHACH_PILOT:
+        chan_pilot(acc["phone_e164"] if acc else chuan_hoa_sdt(dinh_danh))
     actor = acc["subject"] if acc else "khach:anon"
     tin_cay = thiet_bi_hop_le(thiet_bi, acc)
     if _dem_sai(conn, "account_key=? AND ip=?", (key, ip), w) >= config.KHACH_LOGIN_MAX_FAIL:
@@ -1342,6 +1435,8 @@ def tao_link_dat_lai(conn, data: dict, request=None) -> tuple[int, dict]:
         return 404, {"ma": "KHONG_TIM_THAY", "thongBao": "Không có tài khoản khách này."}
     if acc["status"] not in ("hoat_dong", "cho_duyet"):
         return 409, {"ma": "XUNG_DOT", "thongBao": f"Trạng thái {acc['status']} không cấp link được."}
+    if not pilot_cho_phep(acc["phone_e164"]):
+        return 403, {"ma": "PILOT", "thongBao": "Đang chạy thử: tài khoản không thuộc danh sách pilot."}
     now = _bay_gio()
     conn.execute("UPDATE customer_tokens SET used_at=? WHERE account_id=? AND purpose='khoi_phuc' "
                  "AND used_at IS NULL", (_iso(now), acc["id"]))
@@ -1362,6 +1457,8 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
         raise KhachLoi("Liên kết đặt lại mật khẩu không hợp lệ, đã dùng hoặc đã hết hạn.", 400,
                        "TOKEN_SAI")
     acc = tai_khoan(conn, tk["account_id"])
+    if acc:
+        chan_pilot(acc["phone_e164"])
     if not acc or acc["status"] not in ("hoat_dong", "cho_duyet"):
         raise KhachLoi("Tài khoản hiện không thể đặt lại mật khẩu. Vui lòng liên hệ VIP GROUP.",
                        403, "KHONG_DUOC_PHEP")

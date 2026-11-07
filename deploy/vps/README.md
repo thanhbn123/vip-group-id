@@ -104,3 +104,27 @@ COWORK_TIN_PROXY=1            # Caddy ghi đè X-Real-IP / X-Forwarded-Proto
 - Turnstile (thử thách đăng nhập khi tài khoản bị dò): `COWORK_KHACH_TURNSTILE_SITE_KEY` + secret
   qua env `COWORK_KHACH_TURNSTILE_SECRET` hoặc tệp 0600 `COWORK_KHACH_TURNSTILE_SECRET_FILE`.
   Staging có thể dùng khoá thử nghiệm của Cloudflare; production bắt buộc khoá thật.
+
+## Pilot production có kiểm soát (owner duyệt) + công tắc khẩn
+
+Chỉ owner và các tài khoản được chỉ định. Trong `.env` production:
+
+```
+COWORK_KHACH_ENABLED=1
+COWORK_KHACH_PILOT=1                       # BẮT BUỘC đặt tường minh 0 hoặc 1 ở production
+COWORK_KHACH_PILOT_PHONES=0961102655       # (tuỳ chọn) SĐT cố định, phân tách bằng dấu phẩy
+COWORK_KHACH_PILOT_FILE=/srv/…/data/khach_pilot.txt
+COWORK_KHACH_MAINTENANCE_FILE=/srv/…/data/khach_bao_tri.flag
+```
+
+Quản lý danh sách pilot (có audit `khach.pilot.them|bot`, hiệu lực ngay, không cần khởi động lại):
+
+```
+.venv/bin/python -m cowork.cli khach-pilot list
+.venv/bin/python -m cowork.cli khach-pilot add 0901234567
+.venv/bin/python -m cowork.cli khach-pilot remove 0901234567
+```
+
+**Đóng cổng khách NGAY (không khởi động lại):** `touch /srv/…/data/khach_bao_tri.flag` — mọi request
+host khách trả 503 trang bảo trì (kèm hotline), API nội bộ CRM → VIP ID trả 503 `BAO_TRI` (CRM tự
+thử lại). Realm nhân viên không bị ảnh hưởng. **Mở lại:** `rm /srv/…/data/khach_bao_tri.flag`.

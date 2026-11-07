@@ -2536,3 +2536,132 @@ def test_p2b_loi_nang_cap_khong_ghi_schema_version_va_thu_lai(client, bat, crm, 
     finally:
         conn.close()
     assert KC().get("/tai-khoan/dang-nhap").status_code == 200
+
+
+# ================================================================== PILOT + công tắc bảo trì
+@pytest.fixture()
+def pilot(monkeypatch, tmp_path):
+    tep = tmp_path / "pilot.txt"
+    monkeypatch.setattr(config, "KHACH_PILOT", True)
+    monkeypatch.setattr(config, "KHACH_PILOT_RAW", "1")
+    monkeypatch.setattr(config, "KHACH_PILOT_PHONES", ["0900000001"])   # env
+    monkeypatch.setattr(config, "KHACH_PILOT_FILE", tep)
+    khach._pilot_cache.update(khoa=None)
+    return tep
+
+
+def _la_trang_pilot(r) -> bool:
+    return r.status_code == 403 and "đang chạy thử nội bộ" in r.text and "0961 102 655" in r.text
+
+
+def test_pilot_dang_ky_chi_sdt_trong_danh_sach(kh, crm, pilot):
+    assert dang_ky(kh, 1).status_code == 303                     # trong danh sách (env)
+    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
+    r = dang_ky(KC(), 2)                                          # ngoài danh sách
+    assert _la_trang_pilot(r)
+    assert acc_theo_sdt("+84900000002") is None
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending WHERE kind='signup'") == 1
+    finally:
+        conn.close()
+
+
+def test_pilot_dang_nhap_vao_cong_khoi_phuc(kh, crm, pilot, monkeypatch):
+    _ip(monkeypatch)
+    monkeypatch.setattr(config, "KHACH_PILOT", False)
+    acc1 = tao_khach_hoat_dong(kh, 1)
+    acc2 = tao_khach_hoat_dong(kh, 2)
+    c2 = KC()
+    token_launch(dang_nhap(c2, "0900000002"))  # đăng nhập trước khi bật pilot
+    monkeypatch.setattr(config, "KHACH_PILOT", True)
+    token_launch(dang_nhap(kh, "0900000001"))  # trong danh sách
+    # Ngoài danh sách: cùng trang pilot dù mật khẩu đúng/sai, mã VG, SĐT không tồn tại.
+    trang = [dang_nhap(KC(), dd, mk, headers={"x-real-ip": "198.51.100.40"}) for dd, mk in (
+        ("0900000002", MK), ("0900000002", "Sai!Passw0rd-xx"), ("VG1002", MK),
+        ("0900000009", MK), ("VG9999", MK))]
+    assert all(_la_trang_pilot(r) for r in trang)
+    assert len({_bo_token(r.text) for r in trang}) == 1
+    conn = db.connect()
+    try:  # không kiểm mật khẩu / không đếm lượt sai
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_login_attempts WHERE ip=?",
+                         ("198.51.100.40",)) == 0
+    finally:
+        conn.close()
+    # Phiên có sẵn của tài khoản ngoài danh sách: vào cổng ⇒ trang pilot, không có token.
+    r = c2.get("/tai-khoan/vao-cong", follow_redirects=False)
+    assert _la_trang_pilot(r)
+    assert c2.get("/tai-khoan/ho-so", follow_redirects=False).headers["location"] == "/tai-khoan/dang-nhap"
+    # Khôi phục: CRM không cấp link cho tài khoản ngoài danh sách; link cũ cũng bị chặn.
+    r = goi_noi_bo(kh, "/api/internal/khach/tao-link-dat-lai",
+                   {"subject": acc2["subject"], "requested_by": "nv"})
+    assert r.status_code == 403 and r.json()["loi"]["ma"] == "PILOT"
+    monkeypatch.setattr(config, "KHACH_PILOT", False)
+    t2 = link_dat_lai(kh, acc2["subject"])
+    monkeypatch.setattr(config, "KHACH_PILOT", True)
+    assert _la_trang_pilot(kh.get(f"/tai-khoan/dat-lai?t={t2}"))
+    an_danh = KC()
+    csrf = _csrf(an_danh, "/tai-khoan/dang-nhap")
+    assert _la_trang_pilot(an_danh.post("/tai-khoan/dat-lai", data={
+        "t": t2, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI, "_csrf": csrf}))
+    assert acc_theo_sdt("+84900000002")["password_hash"] == acc2["password_hash"]
+    t1 = link_dat_lai(kh, acc1["subject"])  # trong danh sách ⇒ bình thường
+    assert kh.get(f"/tai-khoan/dat-lai?t={t1}").status_code == 200
+
+
+def test_pilot_tep_nap_lai_khi_doi_va_cli(kh, crm, pilot, capsys):
+    from cowork import cli
+    assert _la_trang_pilot(dang_ky(KC(), 3))
+    assert cli.main(["khach-pilot", "add", "090 000 0003"]) == 0
+    assert "+84900000003" in pilot.read_text()
+    assert (pilot.stat().st_mode & 0o777) == 0o600
+    assert dang_ky(KC(), 3).status_code == 303          # tệp đổi ⇒ nạp lại, không cần khởi động lại
+    assert cli.main(["khach-pilot", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "+84900000001  (env)" in out and "+84900000003  (tep)" in out
+    assert cli.main(["khach-pilot", "remove", "0900000003"]) == 0
+    assert _la_trang_pilot(dang_ky(KC(), 3, sdt="0900000003", email="x3@example.test"))
+    with pytest.raises(SystemExit):
+        cli.main(["khach-pilot", "remove", "0900000001"])  # SĐT env: không bỏ bằng CLI
+    with pytest.raises(SystemExit):
+        cli.main(["khach-pilot", "add", "123"])
+    # Sửa tay tệp cũng có hiệu lực ngay.
+    import os
+    pilot.write_text("# tay\n0900000004\n")
+    os.utime(pilot, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    assert dang_ky(KC(), 4).status_code == 303
+    conn = db.connect()
+    try:
+        acts = [r[0] for r in conn.execute("SELECT action FROM audit_log WHERE action LIKE 'khach.pilot.%'")]
+    finally:
+        conn.close()
+    assert acts == ["khach.pilot.them", "khach.pilot.bot"]
+
+
+def test_pilot_production_bat_buoc_dat_tuong_minh(monkeypatch, bat):
+    monkeypatch.setattr(config, "ENV", "production")
+    for raw, co_loi in (("", True), ("yes", True), ("0", False), ("1", False)):
+        monkeypatch.setattr(config, "KHACH_PILOT_RAW", raw)
+        with pytest.raises(RuntimeError) as e:  # production còn lỗi khác (Turnstile…)
+            khach.kiem_cau_hinh()
+        assert ("COWORK_KHACH_PILOT=0 hoặc 1" in str(e.value)) is co_loi, raw
+
+
+def test_cong_tac_bao_tri_khong_can_khoi_dong_lai(kh, client, owner, monkeypatch, tmp_path):
+    co = tmp_path / "bao-tri.flag"
+    monkeypatch.setattr(config, "KHACH_MAINTENANCE_FILE", co)
+    assert kh.get("/tai-khoan/dang-nhap").status_code == 200
+    co.touch()  # đóng cổng ngay
+    for p in ("/tai-khoan/dang-nhap", "/tai-khoan/dang-ky", "/tai-khoan/static/khach.css",
+              "/tai-khoan/vao-cong"):
+        r = kh.get(p, follow_redirects=False)
+        assert r.status_code == 503 and "bảo trì" in r.text and "0961 102 655" in r.text, p
+        assert r.headers["retry-after"] == "300" and r.headers["cache-control"] == "no-store"
+    r = goi_noi_bo(kh, "/api/internal/khach/thu-hoi", {"subject": "cust:x", "reason": "x"})
+    assert r.status_code == 503 and r.json()["loi"]["ma"] == "BAO_TRI"
+    assert kh.post("/tai-khoan/dang-nhap", data={}).status_code == 503
+    # Realm nhân viên không bị ảnh hưởng.
+    assert dang_nhap_nv(client, "anh-thanh", "Owner!Passw0rd").status_code == 303
+    assert client.get("/tai-khoan").status_code == 200
+    co.unlink()  # mở lại
+    assert kh.get("/tai-khoan/dang-nhap").status_code == 200

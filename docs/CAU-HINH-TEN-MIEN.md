@@ -299,3 +299,19 @@ chối launch (mốc `revoked_at_ms` ở tương lai).
    `khach.ops.dat_lai_moc`, in mốc mới.
 3. Yêu cầu phiên CRM đặt lại `revoked_at_ms` của subject đó (phía CRM) về **cùng mốc** đã in.
 4. Khách đăng nhập lại.
+
+### Pilot (chạy thử có kiểm soát) và công tắc bảo trì
+- `COWORK_KHACH_PILOT=1`: chỉ SĐT trong danh sách trắng (`COWORK_KHACH_PILOT_PHONES` ∪ tệp
+  `COWORK_KHACH_PILOT_FILE`, đọc lại khi tệp đổi) được **đăng ký, đăng nhập, vào cổng, khôi phục**.
+  Ngoài danh sách ⇒ trang "Cổng khách hàng VIP GROUP đang chạy thử nội bộ, sẽ mở sớm. Liên hệ
+  hotline/Zalo …" (403): không tạo tài khoản, không gửi CRM, không kiểm mật khẩu, không đếm lượt.
+  Quyết định chỉ dựa trên danh sách (SĐT của định danh, hoặc của tài khoản mang mã VG…) nên không lộ
+  SĐT đã có tài khoản hay chưa. Phiên đang có của tài khoản bị rút khỏi danh sách hết dùng được;
+  CRM xin link đặt lại cho tài khoản ngoài danh sách ⇒ 403 `PILOT`.
+- CLI `cowork.cli khach-pilot add|remove|list` (sửa tệp nguyên tử, 0600, audit). SĐT trong env chỉ
+  sửa được bằng env.
+- Production bật realm khách **bắt buộc** đặt `COWORK_KHACH_PILOT=0` hoặc `1` (thiếu ⇒ từ chối khởi
+  động) — buộc quyết định tường minh.
+- **Công tắc khẩn** `COWORK_KHACH_MAINTENANCE_FILE` (mặc định `data/khach_bao_tri.flag`):
+  `touch <tệp>` ⇒ mọi request host khách 503 bảo trì ngay; `rm <tệp>` ⇒ mở lại. Không ảnh hưởng
+  realm nhân viên. Lỗi kiểm tệp ⇒ coi như đang bảo trì (an toàn).

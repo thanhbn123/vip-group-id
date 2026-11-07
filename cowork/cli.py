@@ -280,6 +280,30 @@ def cmd_khach_dat_lai_moc(args) -> int:
     return 0
 
 
+def cmd_khach_pilot(args) -> int:
+    """Quản lý danh sách SĐT pilot (tệp COWORK_KHACH_PILOT_FILE; SĐT trong env chỉ liệt kê)."""
+    from . import khach
+    db.init_db()
+    actor = f"cli:{os.environ.get('USER', 'ops')}"
+    if args.hanh_dong == "list":
+        ds = khach.ds_pilot()
+        print(f"Pilot {'BẬT' if config.KHACH_PILOT else 'TẮT'} · tệp {config.KHACH_PILOT_FILE} · "
+              f"{len(ds)} SĐT")
+        for ph, nguon in sorted(ds.items()):
+            print(f"  {ph}  ({nguon})")
+        return 0
+    if not args.sdt:
+        raise SystemExit("Thiếu SĐT.")
+    if args.hanh_dong == "remove" and khach.ds_pilot().get(khach.chuan_hoa_sdt(args.sdt) or "") == "env":
+        raise SystemExit("SĐT này đặt trong COWORK_KHACH_PILOT_PHONES (env) — sửa env để bỏ.")
+    try:
+        doi, ph = khach.sua_tep_pilot(args.sdt, them=args.hanh_dong == "add", actor=actor)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    print(f"{'Đã' if doi else 'Không đổi:'} {'thêm' if args.hanh_dong == 'add' else 'bỏ'} {ph}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cowork", description="CLI quản trị VIP GROUP COWORK")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -346,6 +370,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--portal-code", default="VG1001")
     s.add_argument("--tu-choi", action="store_true")
     s.set_defaults(func=cmd_khach_duyet_dev)
+
+    s = sub.add_parser("khach-pilot", help="Danh sách SĐT pilot cổng khách hàng: add|remove|list")
+    s.add_argument("hanh_dong", choices=["add", "remove", "list"])
+    s.add_argument("sdt", nargs="?", default="")
+    s.set_defaults(func=cmd_khach_pilot)
 
     s = sub.add_parser("khach-dat-lai-moc",
                        help="Ops: đặt lại mốc thời gian thu hồi/launch của một khách về hiện tại")

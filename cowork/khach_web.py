@@ -18,7 +18,8 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+                               Response)
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -42,12 +43,46 @@ class KhachHostDispatch:
             return
         realm = khach.chon_realm(Headers(scope=scope).get("host"))
         if realm == "khach" and khach.realm_bat():
+            if _dang_bao_tri():  # công tắc khẩn: tệp tồn tại ⇒ đóng toàn bộ host khách
+                await _bao_tri(scope, receive, send)
+                return
             await khach_app(scope, receive, send)
         elif realm == "staff":
             await self.app(scope, receive, send)
         else:
             # Host thiếu/lạ/sai cú pháp: KHÔNG BAO GIỜ rơi về realm nhân viên.
             await _sai_host(scope, receive, send)
+
+
+def _dang_bao_tri() -> bool:
+    try:
+        return config.KHACH_MAINTENANCE_FILE.exists()
+    except OSError:
+        return True  # không kiểm được ⇒ an toàn: đóng cổng
+
+
+_TRANG_BAO_TRI = """<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>Bảo trì · Cổng khách hàng VIP GROUP</title></head><body>
+<main><h1>Cổng khách hàng VIP GROUP đang bảo trì</h1>
+<p>Vui lòng quay lại sau ít phút. Cần hỗ trợ, liên hệ hotline/Zalo <b>{hotline}</b>.</p>
+<p>CÔNG TY TNHH VIP GROUP</p></main></body></html>"""
+
+
+async def _bao_tri(scope, receive, send):
+    from html import escape
+    h = {"Cache-Control": "no-store", "Retry-After": "300", "X-Content-Type-Options": "nosniff",
+         "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"}
+    if scope["type"] != "http":
+        await send({"type": "websocket.close", "code": 1013})
+        return
+    if (scope.get("path") or "").startswith("/api/"):
+        resp = JSONResponse(status_code=503, headers=h, content={
+            "ok": False, "loi": {"ma": "BAO_TRI", "thongBao": "Cổng khách hàng đang bảo trì."}})
+    else:
+        resp = HTMLResponse(_TRANG_BAO_TRI.format(hotline=escape(config.KHACH_HOTLINE)),
+                            status_code=503, headers=h)
+    await resp(scope, receive, send)
 
 
 async def _sai_host(scope, receive, send):
@@ -222,7 +257,16 @@ async def _chay_kdf(request: Request, fn, *args) -> Response:
 
 
 def _ctx_phien(request: Request, conn) -> dict | None:
-    return khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
+    ctx = khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
+    if ctx and not khach.pilot_cho_phep(ctx["account"]["phone_e164"]):
+        return None  # pilot: tài khoản đã bị rút khỏi danh sách ⇒ phiên không còn dùng được
+    return ctx
+
+
+def _trang_pilot(request: Request) -> Response:
+    return _render(request, "thong_bao.html", 403, page_title="Đang chạy thử",
+                   tieu_de="Cổng khách hàng đang chạy thử nội bộ",
+                   noi_dung=khach.THONG_BAO_PILOT.format(hotline=config.KHACH_HOTLINE))
 
 
 def _ip_khoa(request: Request) -> str:
@@ -355,6 +399,8 @@ def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Respo
         khach.dang_ky(conn, ho_ten=ho_ten, sdt=sdt, email=email, mat_khau=mat_khau[:200],
                       mat_khau_2=mat_khau_2[:200], dong_y=dong_y == "1",
                       ip=_ip_khoa(request), request=request)
+    except khach.KhachPilot:
+        return _trang_pilot(request)
     except khach.KhachLoi as e:
         return _form_dang_ky(request, e.status, loi=e.message, form=form)
     finally:
@@ -443,6 +489,8 @@ def _kiem_truoc_dang_nhap(request: Request, dinh_danh: str, ip: str, thiet_bi: s
 
 
 def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
+    if isinstance(e, khach.KhachPilot):
+        return _trang_pilot(request)
     thu_thach = isinstance(e, khach.ThuThach)
     resp = _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
                    dinh_danh=dinh_danh,
@@ -549,6 +597,9 @@ def _doi_mat_khau(request: Request, ctx: dict, cu: str, moi: str, moi2: str) -> 
 def vao_cong(request: Request):
     conn = db.connect()
     try:
+        ctx_goc = khach.xac_thuc_phien(conn, request.cookies.get(khach.COOKIE_PHIEN))
+        if ctx_goc and not khach.pilot_cho_phep(ctx_goc["account"]["phone_e164"]):
+            return _trang_pilot(request)
         ctx = _ctx_phien(request, conn)
         if not ctx:
             return RedirectResponse("/tai-khoan/dang-nhap", status_code=303)
@@ -618,9 +669,13 @@ def quen(request: Request, dinh_danh: str = Form(""), csrf_form: str = Form("", 
 def dat_lai_form(request: Request, t: str = ""):
     conn = db.connect()
     try:
-        ok = khach.xem_token(conn, t, "khoi_phuc") is not None
+        tk = khach.xem_token(conn, t, "khoi_phuc")
+        ok = tk is not None
+        acc = khach.tai_khoan(conn, tk["account_id"]) if tk else None
     finally:
         conn.close()
+    if acc and not khach.pilot_cho_phep(acc["phone_e164"]):
+        return _trang_pilot(request)
     return _render(request, "dat_lai.html", 200 if ok else 400, page_title="Đặt lại mật khẩu",
                    token=t if ok else "", hop_le=ok)
 
@@ -637,6 +692,8 @@ def _dat_lai(request: Request, t: str, mat_khau: str, mat_khau_2: str) -> Respon
     conn = db.connect()
     try:
         khach.dat_lai_mat_khau(conn, t, mat_khau[:200], mat_khau_2[:200], request)
+    except khach.KhachPilot:
+        return _trang_pilot(request)
     except khach.KhachLoi as e:
         hop_le = khach.xem_token(conn, t, "khoi_phuc") is not None
         return _render(request, "dat_lai.html", e.status, page_title="Đặt lại mật khẩu",
