@@ -226,3 +226,12 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
 - Staging: xem `deploy/vps/README.md` — đặt `COWORK_STAFF_HOSTS` **tường minh**.
 - Trang thử thách Turnstile cần Caddy KHÔNG ghi đè CSP của VIP ID (CSP mở
   `challenges.cloudflare.com` chỉ trên trang đó).
+
+### Giới hạn đã biết (realm khách)
+- **Vượt ngưỡng trong một loạt đồng thời (P2-c, chấp nhận):** các bộ đếm tần suất/khoá được kiểm
+  rồi mới ghi (không khoá nguyên tử). Một loạt request **đồng thời** có thể vượt ngưỡng một ít
+  (ví dụ khoá cặp 5 lần có thể ghi nhận 6–8 lần sai) trước khi bị chặn. Mức vượt bị chặn trên bởi
+  hàng đợi băm (2 luồng, trần 16) và trần siteverify Turnstile (4), nên không mở đường dò mật khẩu
+  không giới hạn.
+- Production bật realm khách bắt buộc `COWORK_TIN_PROXY=1` và `COWORK_COOKIE_SECURE=1`
+  (thiếu ⇒ từ chối khởi động).

@@ -223,10 +223,23 @@ async def turnstile_siteverify(secret: str, token: str, remoteip: str) -> dict |
         return None
 
 
+TURNSTILE_DONG_THOI_TOI_DA = 4
+_ts_dang_goi = 0
+
+
 async def _vuot_turnstile(request: Request, token: str) -> bool:
+    """Gọi siteverify với trần đồng thời (không chờ): quá trần ⇒ coi như chưa vượt thử thách."""
+    global _ts_dang_goi
     if not khach.turnstile_bat() or not token or len(token) > 2048:
         return False
-    kq = await turnstile_siteverify(khach.turnstile_secret(), token, web.ip_cua(request))
+    if _ts_dang_goi >= TURNSTILE_DONG_THOI_TOI_DA:
+        log.warning("Turnstile: quá %s lượt siteverify đồng thời", TURNSTILE_DONG_THOI_TOI_DA)
+        return False
+    _ts_dang_goi += 1
+    try:
+        kq = await turnstile_siteverify(khach.turnstile_secret(), token, web.ip_cua(request))
+    finally:
+        _ts_dang_goi -= 1
     return khach.ket_qua_turnstile_hop_le(kq, request.headers.get("host"))
 
 
@@ -351,9 +364,8 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
                     cf_token: str = Form("", alias="cf-turnstile-response")):
     dinh_danh = dinh_danh[:40]
     thiet_bi = request.cookies.get(khach.COOKIE_THIET_BI)
-    # Token Turnstile (nếu có) được kiểm phía máy chủ trước; chỉ có tác dụng khi tài khoản đang
-    # bị giới hạn toàn cục và client chưa là thiết bị tin cậy.
-    ts_ok = await _vuot_turnstile(request, cf_token) if cf_token else False
+    ip = _ip_khoa(request)
+    ts_ok = False
     conn = db.connect()
     try:
         if not _kiem_csrf(request, csrf_form):
@@ -362,11 +374,19 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
                 return _loi_csrf(request)
         # Lớp chặn rẻ chạy ngay (không băm, không vào hàng đợi băm).
         try:
-            khach.kiem_chan(conn, dinh_danh, _ip_khoa(request), thiet_bi, request, ts_ok)
+            khach.kiem_chan(conn, dinh_danh, ip, thiet_bi, request)
+            thu_thach = None
+        except khach.ThuThach as e:
+            thu_thach = e
         except khach.KhachLoi as e:
             return _loi_dang_nhap(request, e, dinh_danh)
     finally:
         conn.close()
+    if thu_thach is not None:
+        # CHỈ gọi siteverify sau khi CSRF/cùng nguồn đạt VÀ chính lớp chặn đòi thử thách.
+        if not cf_token or not await _vuot_turnstile(request, cf_token):
+            return _loi_dang_nhap(request, thu_thach, dinh_danh)
+        ts_ok = True
     return await _chay_kdf(request, _dang_nhap, request, dinh_danh, mat_khau[:200], thiet_bi,
                            ts_ok)
 

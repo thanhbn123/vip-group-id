@@ -1507,3 +1507,63 @@ def test_r3_x_forwarded_proto_chi_tin_khi_tin_proxy(kh, monkeypatch):
     monkeypatch.setattr(config, "TIN_PROXY", True)
     r = kh.get("/tai-khoan/dang-nhap", headers={"x-forwarded-proto": "https"})
     assert "strict-transport-security" in r.headers
+
+
+# ================================================================== rà soát vòng 5
+def test_p2a_siteverify_chi_goi_khi_can(kh, monkeypatch, turnstile):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    tao_khach_hoat_dong(kh, 2)
+    # Tài khoản không bị giới hạn + có token ⇒ không gọi siteverify.
+    token_launch(_dang_nhap_ts(KC(), "0900000002", MK, "198.51.100.2", cf="tot"))
+    assert turnstile == []
+    _do_phan_tan()
+    # POST khác nguồn kèm token rác ⇒ 403, không gọi siteverify.
+    tho = TestClient(app, base_url=HOST_KHACH)
+    tok = csrf_tu(tho.get("/tai-khoan/dang-nhap").text)
+    for h in ({}, {"origin": "https://evil.example"}, {"sec-fetch-site": "cross-site"}):
+        r = tho.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000001", "mat_khau": MK,
+                     "_csrf": tok, "cf-turnstile-response": "rac"},
+                     headers={"x-real-ip": "10.99.0.5", **h}, follow_redirects=False)
+        assert r.status_code == 403, h
+    # CSRF sai ⇒ 403, không gọi.
+    r = KC().post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000001", "mat_khau": MK,
+                  "_csrf": "sai", "cf-turnstile-response": "tot"}, headers={"x-real-ip": "10.99.0.6"})
+    assert r.status_code == 403
+    # Khoá theo cặp (tài khoản, IP) chặn trước thử thách ⇒ không gọi.
+    ip_khoa = "203.0.113.66"
+    monkeypatch.setattr(config, "KHACH_LOGIN_IP_MAX_FAIL", 1000)
+    for _ in range(config.KHACH_LOGIN_MAX_FAIL):
+        dang_nhap(KC(), "0900000002", "Sai!Passw0rd-xx", headers={"x-real-ip": ip_khoa})
+    assert _dang_nhap_ts(KC(), "0900000002", MK, ip_khoa, cf="tot").status_code == 429
+    assert turnstile == []
+    # Đúng trường hợp cần thử thách ⇒ gọi đúng một lần.
+    token_launch(_dang_nhap_ts(KC(), "0900000001", MK, "10.99.0.7", cf="tot"))
+    assert len(turnstile) == 1
+
+
+def test_p2a_tran_dong_thoi_siteverify(kh, monkeypatch, turnstile):
+    from cowork import khach_web
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    _do_phan_tan()
+    monkeypatch.setattr(khach_web, "_ts_dang_goi", khach_web.TURNSTILE_DONG_THOI_TOI_DA)
+    r = _dang_nhap_ts(KC(), "0900000001", MK, "10.99.0.8", cf="tot")
+    assert r.status_code == 429 and "cf-turnstile" in r.text  # coi như chưa vượt
+    assert turnstile == []
+    monkeypatch.setattr(khach_web, "_ts_dang_goi", 0)
+    token_launch(_dang_nhap_ts(KC(), "0900000001", MK, "10.99.0.8", cf="tot"))
+
+
+def test_p2b_production_bat_buoc_tin_proxy_va_cookie_secure(monkeypatch, bat):
+    monkeypatch.setattr(config, "ENV", "production")
+    monkeypatch.setattr(config, "TIN_PROXY", False)
+    monkeypatch.setattr(config, "COOKIE_SECURE", False)
+    with pytest.raises(RuntimeError) as e:
+        khach.kiem_cau_hinh()
+    assert "COWORK_TIN_PROXY=1" in str(e.value) and "COWORK_COOKIE_SECURE=1" in str(e.value)
+    monkeypatch.setattr(config, "TIN_PROXY", True)
+    monkeypatch.setattr(config, "COOKIE_SECURE", True)
+    with pytest.raises(RuntimeError) as e:
+        khach.kiem_cau_hinh()
+    assert "COWORK_TIN_PROXY" not in str(e.value) and "COWORK_COOKIE_SECURE" not in str(e.value)

@@ -108,6 +108,11 @@ def kiem_cau_hinh() -> None:
     if not host_nhan_vien():
         loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
     if la_production():
+        if not config.TIN_PROXY:
+            loi.append("Production bật realm khách phải chạy sau Caddy với COWORK_TIN_PROXY=1 "
+                       "(IP thật cho giới hạn tần suất, X-Forwarded-Proto cho https).")
+        if not config.COOKIE_SECURE:
+            loi.append("Production bật realm khách phải đặt COWORK_COOKIE_SECURE=1.")
         if not turnstile_bat():
             loi.append("Production bật realm khách phải cấu hình Cloudflare Turnstile "
                        "(COWORK_KHACH_TURNSTILE_SITE_KEY + secret) cho thử thách đăng nhập.")
