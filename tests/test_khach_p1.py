@@ -145,7 +145,7 @@ def goi_noi_bo(c: TestClient, path: str, payload: dict, ts: int | None = None, h
 
 def duyet(c: TestClient, subject: str, n: int = 1, **extra):
     payload = {"subject": subject, "decision": "approved", "crm_customer_id": f"crm-uuid-{n}",
-               "customer_code": f"KH-{n}", "portal_code": f"VG00000{n}",
+               "customer_code": f"KH-{n}", "portal_code": f"VG{1000 + n}",
                "phone_verified_by": "nv-duyet", **extra}
     return goi_noi_bo(c, "/api/internal/khach/ket-qua-duyet", payload)
 
@@ -249,8 +249,7 @@ def test_chuan_hoa_sdt_email():
         assert khach.chuan_hoa_sdt(bad) is None, bad
     assert khach.chuan_hoa_email("  KHACH1@Example.TEST ") == "khach1@example.test"
     assert khach.chuan_hoa_email("khong-hop-le") is None
-    assert khach.chuan_hoa_portal_code(" vg000123 ") == "VG000123"
-    assert khach.chuan_hoa_portal_code("VG12345") is None
+    assert khach.chuan_hoa_portal_code(" vg1001 ") == "VG1001"
 
 
 def test_dang_ky_kiem_tra_du_lieu(kh):
@@ -432,7 +431,7 @@ def test_tu_choi_va_tam_khoa_khong_dang_nhap(kh):
     assert r.status_code == 401 and "launch" not in r.headers.get("location", "")
 
     acc2 = tao_khach_hoat_dong(kh, 2)
-    assert token_launch(dang_nhap(kh, "VG000002"))
+    assert token_launch(dang_nhap(kh, "VG1002"))
     r = goi_noi_bo(kh, "/api/internal/khach/tam-khoa",
                    {"subject": acc2["subject"], "action": "khoa", "reason": "nợ cước"})
     assert r.status_code == 200
@@ -456,7 +455,7 @@ def test_dang_nhap_phat_launch_token_hop_le(kh):
     assert "samesite=lax" in ck.lower()
     claims = crm_xac_minh_launch(tok, khach.portal_secret())
     assert claims["sub"] == acc["subject"] and claims["crm_customer_id"] == "crm-uuid-1"
-    assert claims["portal_code"] == "VG000001"
+    assert claims["portal_code"] == "VG1001"
     assert set(claims) == {"ver", "aud", "sub", "crm_customer_id", "portal_code", "iat", "exp",
                            "nonce"}
     # Hết hạn sau ≤ 60 giây.
@@ -472,7 +471,7 @@ def test_dang_nhap_phat_launch_token_hop_le(kh):
         nonces.add(crm_xac_minh_launch(t2, khach.portal_secret())["nonce"])
     assert len(nonces) == 4
     # Đăng nhập bằng mã khách (không phân biệt hoa thường).
-    token_launch(dang_nhap(kh, "vg000001"))
+    token_launch(dang_nhap(kh, "vg1001"))
 
 
 def test_vao_cong_can_phien(kh):
@@ -516,7 +515,7 @@ def test_ke_la_nhieu_ip_chi_gioi_han_thiet_bi_moi(kh, monkeypatch):
     chu = KC()
     token_launch(dang_nhap(chu, "0900000001", MK, headers={"x-real-ip": "198.51.100.7"}))
     for i in range(40):  # 40 lần sai từ 10 IP khác nhau
-        dang_nhap(kh, "VG000001", "Sai!Passw0rd-12", headers={"x-real-ip": f"203.0.113.{i % 10}"})
+        dang_nhap(kh, "VG1001", "Sai!Passw0rd-12", headers={"x-real-ip": f"203.0.113.{i % 10}"})
     conn = db.connect()
     try:
         assert khach.dang_gioi_han_toan_cuc(conn, acc_theo_sdt("+84900000001")["id"])
@@ -591,7 +590,7 @@ def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
     a = acc_theo_sdt("+84900000001")
     assert a["status"] == "hoat_dong" and a["phone_verified_by"] == "nv-duyet"
     assert a["phone_verified_at"] and a["crm_customer_id"] == "crm-uuid-1"
-    assert a["portal_code"] == "VG000001" and a["customer_code"] == "KH-1"
+    assert a["portal_code"] == "VG1001" and a["customer_code"] == "KH-1"
     r = duyet(kh, acc["subject"])
     assert r.status_code == 200 and r.json()["data"]["idempotent"] is True
     assert len(outbox("kich_hoat_xong")) == 1
@@ -603,7 +602,7 @@ def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
                  "/tai-khoan/xac-minh-email")
     assert xac_minh(kh, t).status_code == 200
     acc2 = acc_theo_sdt("+84900000002")
-    assert duyet(kh, acc2["subject"], 2, portal_code="VG000001").status_code == 409
+    assert duyet(kh, acc2["subject"], 2, portal_code="VG1001").status_code == 409
 
 
 # ------------------------------------------------------------------ đăng xuất / khôi phục
@@ -724,7 +723,7 @@ def test_bang_users_nhan_vien_khong_doi_va_khong_leo_thang(kh, client, owner):
     assert c2.get("/", cookies={"cowork_session": nv}).status_code == 404
     # Khách không đăng nhập được realm nhân viên bằng SĐT/mã khách + mật khẩu khách.
     c3 = TestClient(app)
-    for dd in ("VG000001", "vg000001", "+84900000001", acc_theo_sdt("+84900000001")["subject"]):
+    for dd in ("VG1001", "vg1001", "+84900000001", acc_theo_sdt("+84900000001")["subject"]):
         r = dang_nhap_nv(c3, dd, MK)
         assert r.headers.get("location", "").startswith("/dang-nhap") or r.status_code != 303
         assert c3.get("/", follow_redirects=False).status_code == 303
@@ -749,7 +748,7 @@ def test_audit_su_kien_khach(kh):
 
 def test_migration_them_bang_khong_dong_du_lieu_cu(client, owner):
     from cowork import schema
-    assert schema.SCHEMA_VERSION == 4
+    assert schema.SCHEMA_VERSION == 5
     conn = db.connect()
     try:
         truoc = db.q(conn, "SELECT * FROM users ORDER BY id")
@@ -768,7 +767,7 @@ def test_migration_them_bang_khong_dong_du_lieu_cu(client, owner):
     conn = db.connect()
     try:
         assert db.q(conn, "SELECT * FROM users ORDER BY id") == truoc
-        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "4"
+        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "5"
         assert db.scalar(conn, "SELECT COUNT(*) FROM customer_accounts") == 0
     finally:
         conn.close()
@@ -962,7 +961,7 @@ def test_p1_2_ke_la_khong_chan_duoc_khoi_phuc(kh, monkeypatch):
     _quen(kh, "0900000001", "1.2.3.4")  # chủ yêu cầu
     t_chu = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
     for i in range(8):  # kẻ lạ yêu cầu hộ từ nhiều IP
-        _quen(kh, ["0900000001", "VG000001", "khach1@example.test"][i % 3], f"10.9.9.{i}")
+        _quen(kh, ["0900000001", "VG1001", "khach1@example.test"][i % 3], f"10.9.9.{i}")
     mails = outbox("khoi_phuc")
     assert len(mails) == config.KHACH_TOKEN_TOI_DA  # tối đa 3 link còn hiệu lực cùng lúc
     assert all(m["to_email"] == "khach1@example.test" for m in mails)
@@ -1567,3 +1566,127 @@ def test_p2b_production_bat_buoc_tin_proxy_va_cookie_secure(monkeypatch, bat):
     with pytest.raises(RuntimeError) as e:
         khach.kiem_cau_hinh()
     assert "COWORK_TIN_PROXY" not in str(e.value) and "COWORK_COOKIE_SECURE" not in str(e.value)
+
+
+# ================================================================== mã khách VG1001… (owner)
+@pytest.mark.parametrize("raw, mong", [
+    ("VG1001", "VG1001"), ("vg1001", "VG1001"), (" Vg1002 ", "VG1002"), ("VG10000", "VG10000"),
+    ("VG123456789", "VG123456789"), ("VG999", None), ("VG1000", None), ("VG01001", None),
+    ("VG0001001", None), ("VG000001", None), ("VG1234567890", None), ("VG10O1", None),
+    ("VG 1001", None), ("XG1001", None), ("1001", None), ("VG", None), ("VG-1001", None),
+])
+def test_dinh_dang_portal_code(raw, mong):
+    assert khach.chuan_hoa_portal_code(raw) == mong
+
+
+def _cho_duyet(kh, n):
+    dang_ky(kh, n)
+    xac_minh(kh, token_tu(outbox("kich_hoat_email", f"khach{n}@example.test")[-1]["body_text"],
+                          "/tai-khoan/xac-minh-email"))
+    return acc_theo_sdt(f"+8490000000{n}")
+
+
+def test_ket_qua_duyet_dinh_dang_ma_moi(kh):
+    acc = _cho_duyet(kh, 1)
+    for bad in ("VG999", "VG01001", "VG000001", "VG1000", "VG1234567890"):
+        r = duyet(kh, acc["subject"], portal_code=bad)
+        assert r.status_code == 400, bad
+    r = duyet(kh, acc["subject"], portal_code="vg10000")  # chữ thường ⇒ lưu chữ hoa
+    assert r.status_code == 200
+    assert acc_theo_sdt("+84900000001")["portal_code"] == "VG10000"
+    # Trùng portal_code ⇒ 409.
+    acc2 = _cho_duyet(kh, 2)
+    r = duyet(kh, acc2["subject"], 2, portal_code="VG10000")
+    assert r.status_code == 409
+    assert duyet(kh, acc2["subject"], 2, portal_code="VG1002").status_code == 200
+    # Đăng nhập bằng mã chữ thường; mã và SĐT không nhập nhằng.
+    token_launch(dang_nhap(kh, "vg10000"))
+    tok = token_launch(dang_nhap(kh, "Vg1002"))
+    assert crm_xac_minh_launch(tok, khach.portal_secret())["portal_code"] == "VG1002"
+    assert dang_nhap(kh, "VG01002").status_code == 401  # số 0 đầu ⇒ không phải mã, sai chung
+    assert dang_nhap(kh, "1002").status_code == 401
+
+
+def test_db_check_tu_choi_ma_sai_dinh_dang(kh):
+    acc = tao_khach_hoat_dong(kh, 1)
+    assert acc["portal_code"] == "VG1001"
+    conn = db.connect()
+    try:
+        for bad in ("VG01001", "VG999", "VG000001", "VG12a4", "VG1234567890"):
+            with pytest.raises(__import__("sqlite3").IntegrityError):
+                conn.execute("UPDATE customer_accounts SET portal_code=? WHERE id=?", (bad, acc["id"]))
+        conn.execute("UPDATE customer_accounts SET portal_code='VG123456789' WHERE id=?", (acc["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dung_bang_v4(conn, portal_code):
+    """Dựng lại customer_accounts theo DDL v4 (CHECK VG + 6 số) với một dòng."""
+    from cowork import schema
+    import re as _re
+    ddl = _re.search(r"CREATE TABLE IF NOT EXISTS customer_accounts\((.*?)\n\);", schema.DDL, _re.S).group(1)
+    ddl_v4 = _re.sub(r"portal_code TEXT UNIQUE CHECK\(portal_code IS NULL OR \(.*?1001\)\),",
+                     "portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR portal_code GLOB "
+                     "'VG[0-9][0-9][0-9][0-9][0-9][0-9]'),", ddl, flags=_re.S)
+    assert "VG[0-9][0-9][0-9][0-9][0-9][0-9]" in ddl_v4
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE customer_accounts")
+    conn.execute(f"CREATE TABLE customer_accounts({ddl_v4}\n)")
+    now = db.now_iso()
+    conn.execute(
+        "INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
+        "password_hash, password_salt, status, consent_at, portal_code, crm_customer_id, "
+        "created_at, updated_at) VALUES('kh_x','cust:kh_x','+84900000001','a@example.test','A',"
+        "'h','s','hoat_dong',?,?,?,?,?)", (now, portal_code, "crm-x" if portal_code else None, now, now))
+    conn.execute("INSERT INTO customer_sessions(id, token_hash, csrf_token, account_id, token_version, "
+                 "created_at, last_seen_at, expires_at) VALUES('s1','th','c','kh_x',1,?,?,?)", (now, now, now))
+    conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def test_migration_v5_dung_lai_bang_giu_du_lieu(client):
+    conn = db.connect()
+    try:
+        _dung_bang_v4(conn, None)
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()
+    conn = db.connect()
+    try:
+        sql = db.scalar(conn, "SELECT sql FROM sqlite_master WHERE name='customer_accounts'")
+        assert "1001" in sql and "VG[0-9][0-9][0-9][0-9][0-9][0-9]" not in sql
+        row = db.one(conn, "SELECT * FROM customer_accounts WHERE id='kh_x'")
+        assert row["phone_e164"] == "+84900000001" and row["status"] == "hoat_dong"
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id='kh_x'") == 1
+        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "5"
+        assert db.scalar(conn, "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_customer_crm_id'") == 1
+        conn.execute("UPDATE customer_accounts SET portal_code='VG1001' WHERE id='kh_x'")
+        conn.commit()
+        # Khoá ngoại vẫn trỏ đúng bảng mới (xoá tài khoản ⇒ xoá phiên).
+        conn.execute("DELETE FROM customer_accounts WHERE id='kh_x'")
+        conn.commit()
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions") == 0
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()  # chạy lại an toàn
+
+
+def test_migration_v5_dung_khi_co_ma_kieu_cu(client):
+    conn = db.connect()
+    try:
+        _dung_bang_v4(conn, "VG000001")
+    finally:
+        conn.close()
+    db._initialized = False
+    with pytest.raises(RuntimeError, match="VG1001"):
+        db.init_db()
+    conn = db.connect()
+    try:  # không mất dữ liệu: bảng cũ còn nguyên
+        assert db.scalar(conn, "SELECT portal_code FROM customer_accounts WHERE id='kh_x'") == "VG000001"
+    finally:
+        conn.close()
+    db._initialized = False

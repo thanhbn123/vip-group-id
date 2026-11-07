@@ -7,7 +7,7 @@
 #
 # Xem email (outbox):   COWORK_DATA_DIR=data/khach-dev COWORK_DB_PATH=data/khach-dev.db \
 #                         .venv/bin/python -m cowork.cli khach-outbox
-# Duyệt giả (thay CRM): ... cowork.cli khach-duyet-dev 0900000001 --portal-code VG000001
+# Duyệt giả (thay CRM): ... cowork.cli khach-duyet-dev 0900000001 --portal-code VG1001
 set -eu
 cd "$(dirname "$0")/.."
 umask 077

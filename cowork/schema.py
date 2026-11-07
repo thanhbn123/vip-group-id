@@ -1,7 +1,7 @@
 """Schema + dữ liệu nền COWORK. Idempotent: chạy nhiều lần không nhân đôi dữ liệu."""
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -254,7 +254,10 @@ CREATE TABLE IF NOT EXISTS customer_accounts(
     phone_verified_by TEXT,
     crm_customer_id TEXT,
     customer_code TEXT,
-    portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR portal_code GLOB 'VG[0-9][0-9][0-9][0-9][0-9][0-9]'),
+    portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR (
+        portal_code GLOB 'VG[1-9][0-9][0-9][0-9]*' AND length(portal_code) BETWEEN 6 AND 11
+        AND substr(portal_code, 3) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(portal_code, 3) AS INTEGER) >= 1001)),
     token_version INTEGER NOT NULL DEFAULT 1,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until TEXT,

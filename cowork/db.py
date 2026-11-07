@@ -83,7 +83,46 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _them_cot(conn, "users", "mfa_secret", "TEXT")
     # Realm khách (v4) — cột thêm sau bản đầu của bảng; DB dev cũ được bổ sung.
     _them_cot(conn, "customer_accounts", "phone_conflict_count", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_portal_code_v5(conn)
     conn.commit()
+
+
+def _migrate_portal_code_v5(conn: sqlite3.Connection) -> None:
+    """v5: mã khách đổi từ VG + 6 số sang VG1001, VG1002… (owner). SQLite không sửa được CHECK
+    tại chỗ ⇒ dựng lại bảng customer_accounts theo DDL mới, CHÉP NGUYÊN mọi dòng (không đổi dữ
+    liệu). Dòng có mã kiểu cũ không hợp lệ theo luật mới ⇒ dừng, báo lỗi rõ (không tự sửa)."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                       "AND name='customer_accounts'").fetchone()
+    if not row or "VG[0-9][0-9][0-9][0-9][0-9][0-9]" not in (row["sql"] or ""):
+        return
+    import re as _re
+    m = _re.search(r"CREATE TABLE IF NOT EXISTS customer_accounts\((.*?)\n\);", DDL, _re.S)
+    if not m:
+        raise RuntimeError("Không tìm thấy DDL customer_accounts để nâng cấp v5.")
+    cot = [r["name"] for r in conn.execute("PRAGMA table_info(customer_accounts)").fetchall()]
+    ds = ", ".join(cot)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(f"CREATE TABLE customer_accounts_v5({m.group(1)}\n)")
+        try:
+            conn.execute(f"INSERT INTO customer_accounts_v5({ds}) SELECT {ds} FROM customer_accounts")
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError("Nâng cấp v5 dừng: có portal_code kiểu cũ (VG + 6 số) không hợp lệ "
+                               "theo định dạng mới VG1001…; cần xử lý tay trước.") from exc
+        conn.execute("DROP TABLE customer_accounts")
+        conn.execute("ALTER TABLE customer_accounts_v5 RENAME TO customer_accounts")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_crm_id ON "
+                     "customer_accounts(crm_customer_id) WHERE crm_customer_id IS NOT NULL")
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise RuntimeError(f"Nâng cấp v5: vi phạm khoá ngoại {len(bad)} dòng.")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _seed(conn: sqlite3.Connection) -> None:

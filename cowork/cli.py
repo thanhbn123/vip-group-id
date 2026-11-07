@@ -323,7 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("khach-duyet-dev", help="DEV: mô phỏng CRM duyệt/từ chối đăng ký")
     s.add_argument("ai", help="SĐT hoặc subject cust:…")
-    s.add_argument("--portal-code", default="VG000001")
+    s.add_argument("--portal-code", default="VG1001")
     s.add_argument("--tu-choi", action="store_true")
     s.set_defaults(func=cmd_khach_duyet_dev)
     return p

@@ -39,7 +39,9 @@ PATH_THU_HOI = "/api/internal/portal/thu-hoi"
 COOKIE_PHIEN = "vg_khach"
 COOKIE_THIET_BI = "vg_khach_tb"
 COOKIE_PATH = "/tai-khoan"
-PORTAL_CODE_RE = re.compile(r"^VG\d{6}$")
+#: Mã khách VG + số ≥ 1001, không số 0 đầu, 4–9 chữ số (VG1001, VG1002, … VG10000, …).
+PORTAL_CODE_RE = re.compile(r"^VG([1-9][0-9]{3,8})$")
+PORTAL_CODE_MIN = 1001
 EMAIL_RE = re.compile(r"^[^@\s<>\"'(),;:\\]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                       r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 #: Kênh gửi email đã cài thật. Hiện CHƯA có kênh nào ⇒ production luôn bị chặn (A8).
@@ -427,7 +429,8 @@ def chuan_hoa_ten(raw: str | None) -> str | None:
 
 def chuan_hoa_portal_code(raw: str | None) -> str | None:
     c = (raw or "").strip().upper()
-    return c if PORTAL_CODE_RE.match(c) else None
+    m = PORTAL_CODE_RE.match(c)
+    return c if m and int(m.group(1)) >= PORTAL_CODE_MIN else None
 
 
 def _ghi_audit(conn, actor: str, action: str, *, target_id: str | None = None,
@@ -709,7 +712,7 @@ def _gui_signup(conn, acc: dict) -> None:
 
 # ------------------------------------------------------------------ đăng nhập
 def _tim_theo_dinh_danh(conn, dinh_danh: str) -> tuple[dict | None, str]:
-    """Trả (account|None, khoá đếm). Định danh: SĐT E.164 hoặc portal_code VGxxxxxx."""
+    """Trả (account|None, khoá đếm). Định danh: SĐT E.164 hoặc portal_code (VG1001…)."""
     raw = (dinh_danh or "").strip()
     code = chuan_hoa_portal_code(raw)
     if code:
