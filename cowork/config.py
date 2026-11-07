@@ -152,9 +152,6 @@ KHACH_LOGIN_WINDOW_MIN = int(os.environ.get("COWORK_KHACH_LOGIN_WINDOW_MIN", "15
 KHACH_LOCK_MIN = int(os.environ.get("COWORK_KHACH_LOCK_MIN", "15"))
 KHACH_SIGNUP_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_SIGNUP_IP_PER_HOUR", "5"))
 KHACH_FORGOT_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_FORGOT_IP_PER_HOUR", "10"))
-#: Đăng ký chưa xác minh email quá hạn này thì bị giải phóng khi có người đăng ký trùng
-#: (chống "giữ chỗ" SĐT/email của người khác bằng tài khoản không bao giờ xác minh).
-KHACH_UNVERIFIED_TTL_HOURS = int(os.environ.get("COWORK_KHACH_UNVERIFIED_TTL_HOURS", "48"))
 #: scrypt riêng cho realm khách (mạnh hơn nhân viên). Tham số lưu trong password_algo nên
 #: hash cũ vẫn xác minh được. Giới hạn số lượt băm đồng thời để chặn DoS bộ nhớ (128 MiB/lượt).
 KHACH_SCRYPT_LOG2_N = int(os.environ.get("COWORK_KHACH_SCRYPT_LOG2_N", "17"))
@@ -171,3 +168,8 @@ KHACH_TURNSTILE_SECRET_FILE = _path("COWORK_KHACH_TURNSTILE_SECRET_FILE",
                                     DATA_DIR / "turnstile_secret.key")
 KHACH_TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 KHACH_TURNSTILE_TIMEOUT = 5.0
+#: Owner 07/11: KHÔNG xác minh email/SĐT khi đăng ký; email chỉ là thông tin liên hệ tuỳ chọn.
+#: Email tự phục vụ (khôi phục mật khẩu, thông báo) chỉ chạy khi bật cờ này VÀ có kênh gửi thật.
+KHACH_EMAIL_ENABLED = os.environ.get("COWORK_KHACH_EMAIL_ENABLED", "0").strip() == "1"
+#: Hotline/Zalo hiển thị trên trang quên mật khẩu (khôi phục do nhân viên hỗ trợ).
+KHACH_HOTLINE = os.environ.get("COWORK_KHACH_HOTLINE", "0961 102 655").strip() or "0961 102 655"

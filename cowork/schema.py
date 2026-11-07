@@ -1,7 +1,7 @@
 """Schema + dữ liệu nền COWORK. Idempotent: chạy nhiều lần không nhân đôi dữ liệu."""
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -241,17 +241,18 @@ CREATE TABLE IF NOT EXISTS customer_accounts(
     id TEXT PRIMARY KEY,
     subject TEXT NOT NULL UNIQUE CHECK(subject = 'cust:' || id),
     phone_e164 TEXT NOT NULL UNIQUE,
-    email_norm TEXT NOT NULL UNIQUE,
+    email_norm TEXT,
     display_name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     password_salt TEXT NOT NULL,
     password_algo TEXT NOT NULL DEFAULT 'scrypt',
-    status TEXT NOT NULL DEFAULT 'cho_xac_minh_email'
+    status TEXT NOT NULL DEFAULT 'cho_duyet'
         CHECK(status IN ('cho_xac_minh_email','cho_duyet','hoat_dong','tu_choi','tam_khoa')),
     consent_at TEXT NOT NULL,
     email_verified_at TEXT,
     phone_verified_at TEXT,
     phone_verified_by TEXT,
+    phone_verified_method TEXT,
     crm_customer_id TEXT,
     customer_code TEXT,
     portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR (
@@ -268,6 +269,7 @@ CREATE TABLE IF NOT EXISTS customer_accounts(
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_crm_id ON customer_accounts(crm_customer_id)
     WHERE crm_customer_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_email ON customer_accounts(email_norm);
 
 CREATE TABLE IF NOT EXISTS customer_sessions(
     id TEXT PRIMARY KEY,

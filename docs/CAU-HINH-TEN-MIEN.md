@@ -235,3 +235,18 @@ Khi bật `COWORK_KHACH_ENABLED=1`, VIP ID chọn realm theo header `Host`:
   không giới hạn.
 - Production bật realm khách bắt buộc `COWORK_TIN_PROXY=1` và `COWORK_COOKIE_SECURE=1`
   (thiếu ⇒ từ chối khởi động).
+
+### Đăng ký & khôi phục (quyết định owner 07/11/2026)
+- **Không xác minh email, không gọi xác minh SĐT.** Đăng ký tạo ngay tài khoản `cho_duyet` và gửi
+  signup HMAC sang CRM (lỗi mạng ⇒ hàng đợi `crm_sync_pending`, chạy `cowork.cli khach-dong-bo`).
+  Nhân viên duyệt là cổng duy nhất; đăng nhập chỉ khi `hoat_dong`.
+- Email là thông tin liên hệ **tuỳ chọn** (kiểm định dạng nếu nhập, không unique). SĐT vẫn unique.
+- Đăng ký trùng SĐT: phản hồi y hệt, không tạo tài khoản, đánh dấu `phone_conflict` gửi CRM.
+- **Quên mật khẩu do nhân viên hỗ trợ:** trang `/tai-khoan/quen-mat-khau` chỉ hướng dẫn gọi
+  hotline/Zalo (`COWORK_KHACH_HOTLINE`, mặc định `0961 102 655`). CRM cấp link qua
+  `POST /api/internal/khach/tao-link-dat-lai` `{subject, requested_by}` ⇒ `{url, expires_at}`.
+- `COWORK_KHACH_EMAIL_ENABLED=0` (mặc định): không ghi outbox email, không có tự khôi phục qua
+  email; production **không** đòi kênh email thật. Bật `=1` thì phải có kênh gửi thật (A8).
+- Lỗi BUG-VIPID-01 (đã sửa): không dùng `<meta name="referrer" content="no-referrer">` trong trang
+  khách — Chrome gửi `Origin: null` khi POST ⇒ mọi form 403. Header `Referrer-Policy: same-origin`
+  đã đủ.

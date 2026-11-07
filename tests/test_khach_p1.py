@@ -83,7 +83,7 @@ def _csrf(c: TestClient, path: str) -> str:
 def dang_ky(c: TestClient, n: int = 1, *, email: str | None = None, sdt: str | None = None,
             mk: str = MK, mk2: str | None = None, dong_y: bool = True, headers=None):
     data = {"ho_ten": f"Khách Thử {n}", "sdt": sdt or f"090000000{n}",
-            "email": email or f"khach{n}@example.test", "mat_khau": mk,
+            "email": f"khach{n}@example.test" if email is None else email, "mat_khau": mk,
             "mat_khau_2": mk if mk2 is None else mk2, "_csrf": _csrf(c, "/tai-khoan/dang-ky")}
     if dong_y:
         data["dong_y"] = "1"
@@ -111,11 +111,12 @@ def token_tu(body: str, path: str) -> str:
     return m.group(1)
 
 
-def xac_minh(c: TestClient, t: str):
-    """GET hiện trang xác nhận (không tiêu token) rồi POST để tiêu."""
-    r = c.get(f"/tai-khoan/xac-minh-email?t={t}")
-    assert r.status_code == 200, r.text[:300]
-    return c.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf_tu(r.text)})
+def link_dat_lai(c: TestClient, subject: str, nguoi: str = "nv-ho-tro") -> str:
+    """CRM (HMAC) xin link đặt lại mật khẩu cho khách; trả token thô trong URL."""
+    r = goi_noi_bo(c, "/api/internal/khach/tao-link-dat-lai",
+                   {"subject": subject, "requested_by": nguoi})
+    assert r.status_code == 200, r.text
+    return token_tu(r.json()["data"]["url"], "/tai-khoan/dat-lai")
 
 
 def acc_theo_sdt(phone: str) -> dict | None:
@@ -126,14 +127,16 @@ def acc_theo_sdt(phone: str) -> dict | None:
         conn.close()
 
 
-_lech = [0]
+_da_ky: set[tuple[int, str, bytes]] = set()
 
 
 def ky_vao(path: str, body: bytes, ts: int | None = None, method: str = "POST") -> dict:
-    # Mỗi lần ký một ts khác (CRM thật cũng ký lại mỗi lần gửi); cùng (ts, body) = phát lại.
+    # CRM thật ký lại mỗi lần gửi; cùng (ts, path, body) = phát lại ⇒ chọn ts chưa dùng.
     if ts is None:
-        _lech[0] = (_lech[0] + 1) % 250
-        ts = int(time.time()) - _lech[0]
+        ts = int(time.time())
+        while (ts, path, body) in _da_ky:
+            ts -= 1
+        _da_ky.add((ts, path, body))
     h = khach.ky_portal(khach.HUONG_VAO, method, path, body, ts)
     return {**h, "Content-Type": "application/json"}
 
@@ -152,9 +155,6 @@ def duyet(c: TestClient, subject: str, n: int = 1, **extra):
 
 def tao_khach_hoat_dong(c: TestClient, n: int = 1) -> dict:
     assert dang_ky(c, n).status_code == 303
-    mail = outbox("kich_hoat_email", f"khach{n}@example.test")[-1]
-    t = token_tu(mail["body_text"], "/tai-khoan/xac-minh-email")
-    assert xac_minh(c, t).status_code == 200
     acc = acc_theo_sdt(f"+8490000000{n}")
     assert acc["status"] == "cho_duyet"
     r = duyet(c, acc["subject"], n)
@@ -266,36 +266,37 @@ def test_dang_ky_kiem_tra_du_lieu(kh):
     assert r.status_code == 403
     assert acc_theo_sdt("+84900000001") is None
     r = dang_ky(kh, 1)
-    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/da-gui-email"
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
     acc = acc_theo_sdt("+84900000001")
-    assert acc["status"] == "cho_xac_minh_email" and acc["subject"] == "cust:" + acc["id"]
+    assert acc["status"] == "cho_duyet" and acc["subject"] == "cust:" + acc["id"]
     assert acc["id"].startswith("kh_") and len(acc["id"]) == 29
     assert acc["email_norm"] == "khach1@example.test" and acc["password_hash"] != MK
 
 
-def test_dang_ky_khong_lo_tai_khoan(kh):
+def test_dang_ky_khong_lo_tai_khoan(kh, crm):
     r1 = dang_ky(kh, 1)
-    trung_sdt = dang_ky(kh, 1, email="nguoi-khac@example.test")
-    trung_email = dang_ky(kh, 2, email="khach1@example.test")
-    for r in (trung_sdt, trung_email):
+    trung_sdt = dang_ky(kh, 1, email="nguoi-khac@example.test", mk="Khac!Passw0rd-99")
+    trung_sdt_dd = dang_ky(kh, 1, sdt="+84 90 000 0001", email="")
+    for r in (trung_sdt, trung_sdt_dd):
         assert r.status_code == r1.status_code == 303
-        assert r.headers["location"] == r1.headers["location"]
-    # Không tạo thêm tài khoản; không gửi gì tới email lạ.
+        assert r.headers["location"] == r1.headers["location"] == "/tai-khoan/cho-duyet"
+    assert _bo_token(kh.get("/tai-khoan/cho-duyet").text) == _bo_token(KC().get("/tai-khoan/cho-duyet").text)
     conn = db.connect()
     try:
         assert db.scalar(conn, "SELECT COUNT(*) FROM customer_accounts") == 1
+        acc = db.one(conn, "SELECT * FROM customer_accounts")
+        assert acc["email_norm"] == "khach1@example.test"  # không bị ghi đè
+        assert acc["phone_conflict_count"] == 2
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE action='khach.dang_ky.trung'") >= 1
     finally:
         conn.close()
-    assert outbox(to="nguoi-khac@example.test") == []
-    # Email cũ nhận tối đa một thông báo/giờ (ở đây: gửi lại link kích hoạt vì đang chờ xác minh).
-    assert len(outbox(to="khach1@example.test")) <= 3
-
-
-def test_dang_ky_trung_tai_khoan_da_kich_hoat_bao_email_cu(kh):
-    tao_khach_hoat_dong(kh, 1)
-    assert dang_ky(kh, 1, email="ke-gia@example.test").status_code == 303
-    assert outbox("dang_ky_trung", "khach1@example.test")
-    assert outbox(to="ke-gia@example.test") == []
+    assert outbox() == []  # email tắt: không gửi gì
+    # Email KHÔNG unique: SĐT khác dùng chung email vẫn đăng ký được.
+    assert dang_ky(kh, 2, email="khach1@example.test").status_code == 303
+    assert acc_theo_sdt("+84900000002")["email_norm"] == "khach1@example.test"
+    # Email để trống ⇒ hợp lệ, lưu NULL.
+    assert dang_ky(kh, 3, email="").status_code == 303
+    assert acc_theo_sdt("+84900000003")["email_norm"] is None
 
 
 def test_dang_ky_gioi_han_tan_suat_ip(kh):
@@ -304,36 +305,11 @@ def test_dang_ky_gioi_han_tan_suat_ip(kh):
     assert dang_ky(kh, 9).status_code == 429
 
 
-def test_giai_phong_dang_ky_giu_cho_qua_han(kh):
-    dang_ky(kh, 1, email="ke-giu-cho@example.test")
-    conn = db.connect()
-    try:
-        conn.execute("UPDATE customer_accounts SET created_at='2020-01-01T00:00:00+07:00'")
-        conn.commit()
-    finally:
-        conn.close()
-    dang_ky(kh, 1)  # chủ thật của SĐT
-    acc = acc_theo_sdt("+84900000001")
-    assert acc["email_norm"] == "khach1@example.test"
-
-
 # ------------------------------------------------------------------ xác minh email
-def test_token_email_mot_lan_va_het_han(kh, crm):
-    dang_ky(kh, 1)
-    mail = outbox("kich_hoat_email")[-1]
-    t = token_tu(mail["body_text"], "/tai-khoan/xac-minh-email")
-    conn = db.connect()
-    try:
-        # Chỉ lưu sha256.
-        row = db.one(conn, "SELECT * FROM customer_tokens")
-        assert row["token_hash"] == hashlib.sha256(t.encode()).hexdigest()
-        assert t not in json.dumps(db.q(conn, "SELECT * FROM customer_tokens"))
-    finally:
-        conn.close()
-    assert xac_minh(kh, t).status_code == 200
+def test_dang_ky_gui_signup_crm_ngay(kh, crm):
+    assert dang_ky(kh, 1).status_code == 303
     acc = acc_theo_sdt("+84900000001")
-    assert acc["status"] == "cho_duyet" and acc["email_verified_at"]
-    # Signup đã gửi sang CRM, ký HMAC đúng chiều.
+    assert acc["status"] == "cho_duyet" and acc["email_verified_at"] is None
     goi = crm.goi[-1]
     assert goi["url"] == "http://127.0.0.1:8897/api/internal/portal/signups"
     assert goi["body"] == {"subject": acc["subject"], "display_name": "Khách Thử 1",
@@ -345,31 +321,15 @@ def test_token_email_mot_lan_va_het_han(kh, crm):
                     f"vipid->crm.POST./api/internal/portal/signups.{ts}.".encode() + goi["raw"],
                     hashlib.sha256).hexdigest()
     assert hmac.compare_digest(mong, goi["headers"]["X-Portal-Sig"])
-    # Dùng lại ⇒ không hợp lệ (cả GET lẫn POST).
-    assert kh.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 400
-    csrf = _csrf(kh, "/tai-khoan/dang-nhap")
-    assert kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf}).status_code == 400
-    # Token hết hạn.
-    dang_ky(kh, 2)
-    t2 = token_tu(outbox("kich_hoat_email", "khach2@example.test")[-1]["body_text"],
-                  "/tai-khoan/xac-minh-email")
-    conn = db.connect()
-    try:
-        conn.execute("UPDATE customer_tokens SET expires_at='2020-01-01T00:00:00+07:00' "
-                     "WHERE used_at IS NULL")
-        conn.commit()
-    finally:
-        conn.close()
-    assert kh.get(f"/tai-khoan/xac-minh-email?t={t2}").status_code == 400
-    assert acc_theo_sdt("+84900000002")["status"] == "cho_xac_minh_email"
-    assert kh.get("/tai-khoan/xac-minh-email?t=bia-dat").status_code == 400
+    # Không có email ⇒ email null trong signup.
+    dang_ky(kh, 2, email="")
+    assert crm.goi[-1]["body"]["email"] is None
+    assert outbox() == []
 
 
 def test_crm_loi_thi_xep_hang_va_thu_lai(kh, crm):
     crm.song = False
-    dang_ky(kh, 1)
-    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    assert xac_minh(kh, t).status_code == 200
+    assert dang_ky(kh, 1).status_code == 303  # CRM lỗi vẫn nhận đăng ký
     conn = db.connect()
     try:
         row = db.one(conn, "SELECT * FROM crm_sync_pending")
@@ -387,14 +347,11 @@ def test_crm_loi_thi_xep_hang_va_thu_lai(kh, crm):
 
 
 # ------------------------------------------------------------------ đăng nhập theo trạng thái
-def test_khong_dang_nhap_truoc_xac_minh_va_truoc_duyet(kh):
+def test_khong_dang_nhap_truoc_duyet(kh):
     dang_ky(kh, 1)
     r = dang_nhap(kh, "0900000001")
-    assert r.status_code == 403 and "chưa xác minh email" in r.text
-    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    assert xac_minh(kh, t).status_code == 200
-    r = dang_nhap(kh, "0900000001")
     assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
+    assert "vg_khach=" not in r.headers.get("set-cookie", "")
     # Sai mật khẩu ở trạng thái chờ ⇒ thông báo chung, không lộ trạng thái.
     r = dang_nhap(kh, "0900000001", "Sai!Passw0rd-12")
     assert r.status_code == 401 and khach.THONG_BAO_SAI in r.text
@@ -416,8 +373,6 @@ def test_khong_dang_nhap_khi_sdt_chua_xac_minh(kh):
 
 def test_tu_choi_va_tam_khoa_khong_dang_nhap(kh):
     dang_ky(kh, 1)
-    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    assert xac_minh(kh, t).status_code == 200
     acc = acc_theo_sdt("+84900000001")
     r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet",
                    {"subject": acc["subject"], "decision": "rejected", "reason": "trùng"})
@@ -579,12 +534,8 @@ def test_hmac_tu_choi_chu_ky_sai_cu_va_phat_lai(kh):
 def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
     dang_ky(kh, 1)
     acc = acc_theo_sdt("+84900000001")
-    # Chưa xác minh email ⇒ không duyệt được.
-    assert duyet(kh, acc["subject"]).status_code == 409
-    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    assert xac_minh(kh, t).status_code == 200
     assert duyet(kh, acc["subject"], portal_code="ABC").status_code == 400
-    assert duyet(kh, acc["subject"], phone_verified_by="").status_code == 400
+    assert duyet(kh, acc["subject"], phone_verified_by="x" * 121).status_code == 400
     assert duyet(kh, "cust:khong-co").status_code == 404
     assert duyet(kh, acc["subject"]).status_code == 200
     a = acc_theo_sdt("+84900000001")
@@ -593,14 +544,11 @@ def test_ket_qua_duyet_idempotent_va_kiem_du_lieu(kh):
     assert a["portal_code"] == "VG1001" and a["customer_code"] == "KH-1"
     r = duyet(kh, acc["subject"])
     assert r.status_code == 200 and r.json()["data"]["idempotent"] is True
-    assert len(outbox("kich_hoat_xong")) == 1
+    assert outbox("kich_hoat_xong") == []  # email tắt (mặc định)
     # Duyệt lại với hồ sơ CRM khác ⇒ xung đột.
     assert duyet(kh, acc["subject"], crm_customer_id="crm-khac").status_code == 409
     # portal_code đã dùng cho tài khoản khác ⇒ xung đột.
     dang_ky(kh, 2)
-    t = token_tu(outbox("kich_hoat_email", "khach2@example.test")[-1]["body_text"],
-                 "/tai-khoan/xac-minh-email")
-    assert xac_minh(kh, t).status_code == 200
     acc2 = acc_theo_sdt("+84900000002")
     assert duyet(kh, acc2["subject"], 2, portal_code="VG1001").status_code == 409
 
@@ -633,6 +581,7 @@ def test_thu_hoi_tu_crm(kh):
 
 def test_quen_mat_khau_khong_lo_va_dat_lai_thu_hoi_phien(kh, crm, monkeypatch):
     _ip(monkeypatch)
+    monkeypatch.setattr(config, "KHACH_EMAIL_ENABLED", True)  # đường email (cờ)
     acc = tao_khach_hoat_dong(kh, 1)
     token_launch(dang_nhap(kh, "0900000001"))
     csrf = _csrf(kh, "/tai-khoan/quen-mat-khau")
@@ -739,7 +688,7 @@ def test_audit_su_kien_khach(kh):
         rows = db.q(conn, "SELECT detail FROM audit_log WHERE tenant_id='khach'")
     finally:
         conn.close()
-    for a in ("khach.dang_ky", "khach.xac_minh_email", "khach.duyet", "khach.dang_nhap.sai",
+    for a in ("khach.dang_ky", "khach.duyet", "khach.dang_nhap.sai",
               "khach.dang_nhap", "khach.launch"):
         assert a in acts, a
     blob = json.dumps(rows)
@@ -748,7 +697,7 @@ def test_audit_su_kien_khach(kh):
 
 def test_migration_them_bang_khong_dong_du_lieu_cu(client, owner):
     from cowork import schema
-    assert schema.SCHEMA_VERSION == 5
+    assert schema.SCHEMA_VERSION == 6
     conn = db.connect()
     try:
         truoc = db.q(conn, "SELECT * FROM users ORDER BY id")
@@ -767,7 +716,7 @@ def test_migration_them_bang_khong_dong_du_lieu_cu(client, owner):
     conn = db.connect()
     try:
         assert db.q(conn, "SELECT * FROM users ORDER BY id") == truoc
-        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "5"
+        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "6"
         assert db.scalar(conn, "SELECT COUNT(*) FROM customer_accounts") == 0
     finally:
         conn.close()
@@ -779,11 +728,16 @@ def test_kiem_cau_hinh(monkeypatch, bat):
     monkeypatch.setattr(config, "ENV", "production")
     monkeypatch.setattr(config, "CRM_PORTAL_PUBLIC_URL", "https://khachhang.example.test")
     monkeypatch.setattr(config, "KHACH_PUBLIC_URL", "https://khachhang.example.test")
+    with pytest.raises(RuntimeError) as e:  # production cần Turnstile/TIN_PROXY/...
+        khach.kiem_cau_hinh()
+    assert "A8" not in str(e.value)  # email tắt ⇒ không đòi kênh email thật
+    monkeypatch.setattr(config, "KHACH_EMAIL_ENABLED", True)
     with pytest.raises(RuntimeError, match="A8"):
         khach.kiem_cau_hinh()
     monkeypatch.setattr(config, "KHACH_MAIL_TRANSPORT", "smtp")  # chưa cài ⇒ vẫn chặn
     with pytest.raises(RuntimeError, match="A8"):
         khach.kiem_cau_hinh()
+    monkeypatch.setattr(config, "KHACH_EMAIL_ENABLED", False)
     monkeypatch.setattr(config, "ENV", "test")
     monkeypatch.setattr(khach, "_bi_mat_cache", config.BRAIN_SHARED_SECRET)
     with pytest.raises(RuntimeError, match="KHÁC"):
@@ -827,30 +781,18 @@ def test_bi_mat_khong_nam_trong_repo():
 
 
 # ------------------------------------------------------------------ GET không tiêu token
-def test_get_xac_minh_khong_tieu_token(kh, crm):
-    dang_ky(kh, 1)
-    t = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    for _ in range(2):  # trình quét email mở link nhiều lần
-        r = kh.get(f"/tai-khoan/xac-minh-email?t={t}")
-        assert r.status_code == 200 and 'name="t"' in r.text
-    assert acc_theo_sdt("+84900000001")["status"] == "cho_xac_minh_email"
-    assert crm.goi == []
-    csrf = csrf_tu(r.text)
-    # Thiếu/sai CSRF ⇒ không tiêu.
-    assert kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": "sai"}).status_code == 403
-    r1 = kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf})
-    assert r1.status_code == 200 and "đã được xác minh" in r1.text
-    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
-    r2 = kh.post("/tai-khoan/xac-minh-email", data={"t": t, "_csrf": csrf})
-    assert r2.status_code == 400
-    assert len(crm.goi) == 1
+def test_route_xac_minh_email_da_go(kh):
+    for p in ("/tai-khoan/xac-minh-email?t=abc", "/tai-khoan/gui-lai-xac-minh",
+              "/tai-khoan/da-gui-email"):
+        assert kh.get(p).status_code == 404, p
+    tok = csrf_tu(kh.get("/tai-khoan/dang-nhap").text)
+    for p in ("/tai-khoan/xac-minh-email", "/tai-khoan/gui-lai-xac-minh"):
+        assert kh.post(p, data={"_csrf": tok, "t": "x", "email": "a@example.test"}).status_code == 404
 
 
 def test_get_dat_lai_khong_tieu_token(kh):
-    tao_khach_hoat_dong(kh, 1)
-    csrf = _csrf(kh, "/tai-khoan/quen-mat-khau")
-    kh.post("/tai-khoan/quen-mat-khau", data={"dinh_danh": "0900000001", "_csrf": csrf})
-    t = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    acc = tao_khach_hoat_dong(kh, 1)
+    t = link_dat_lai(kh, acc["subject"])
     for _ in range(2):
         r = kh.get(f"/tai-khoan/dat-lai?t={t}")
         assert r.status_code == 200
@@ -957,6 +899,7 @@ def _quen(c, dd, ip):
 
 def test_p1_2_ke_la_khong_chan_duoc_khoi_phuc(kh, monkeypatch):
     _ip(monkeypatch)
+    monkeypatch.setattr(config, "KHACH_EMAIL_ENABLED", True)  # đường email (cờ)
     tao_khach_hoat_dong(kh, 1)
     _quen(kh, "0900000001", "1.2.3.4")  # chủ yêu cầu
     t_chu = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
@@ -984,23 +927,9 @@ def test_p1_2_ke_la_khong_chan_duoc_khoi_phuc(kh, monkeypatch):
         conn.close()
 
 
-def test_p1_2_gui_lai_xac_minh_khong_thu_hoi_link_cu(kh, monkeypatch):
-    _ip(monkeypatch)
-    dang_ky(kh, 1)
-    t_dau = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
-    for i in range(6):
-        kh.post("/tai-khoan/gui-lai-xac-minh", data={"email": "khach1@example.test",
-                "_csrf": _csrf(kh, "/tai-khoan/gui-lai-xac-minh")}, headers={"x-real-ip": f"10.8.0.{i}"})
-    assert len(outbox("kich_hoat_email")) == config.KHACH_TOKEN_TOI_DA
-    assert xac_minh(kh, t_dau).status_code == 200
-    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
-
-
 def test_p1_3_xung_dot_sdt_bao_crm_va_tu_choi_giai_phong(kh, crm):
-    # Kẻ giữ chỗ đăng ký SĐT của nạn nhân bằng email của mình và xác minh email.
+    # Kẻ giữ chỗ đăng ký SĐT của nạn nhân bằng email của mình.
     dang_ky(kh, 5, email="ke-gia@example.test")
-    xac_minh(kh, token_tu(outbox("kich_hoat_email", "ke-gia@example.test")[-1]["body_text"],
-                          "/tai-khoan/xac-minh-email"))
     ke = acc_theo_sdt("+84900000005")
     assert crm.goi[-1]["body"]["phone_conflict"] is False
     # Chủ thật đăng ký cùng SĐT.
@@ -1016,7 +945,7 @@ def test_p1_3_xung_dot_sdt_bao_crm_va_tu_choi_giai_phong(kh, crm):
                          "action='khach.dang_ky.xung_dot_sdt' AND target_id=?", (ke["subject"],)) == 1
     finally:
         conn.close()
-    # Nhân viên gọi điện, phát hiện sai ⇒ từ chối ⇒ SĐT/email được giải phóng.
+    # Nhân viên thấy cờ xung đột, kiểm tra ⇒ từ chối ⇒ SĐT được giải phóng.
     r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet",
                    {"subject": ke["subject"], "decision": "rejected", "reason": "sai chủ"})
     assert r.status_code == 200
@@ -1033,7 +962,7 @@ def test_p1_3_xung_dot_sdt_bao_crm_va_tu_choi_giai_phong(kh, crm):
     assert dang_ky(chu2, 5, email="chu-that@example.test").status_code == 303
     moi = acc_theo_sdt("+84900000005")
     assert moi and moi["email_norm"] == "chu-that@example.test" and moi["id"] != ke["id"]
-    # Kẻ giữ chỗ cũng đăng ký lại được bằng email của mình (email đã giải phóng) — không lỗi.
+    # Email không unique: dùng lại email cũ cho SĐT khác vẫn được.
     assert dang_ky(chu2, 6, email="ke-gia@example.test").status_code == 303
 
 
@@ -1073,7 +1002,7 @@ def test_p1_4_tat_realm_khong_kiem_host(client):
 def test_p2_6_env_chuan_hoa(monkeypatch, bat):
     monkeypatch.setattr(config, "ENV", "PROD ")
     assert khach.la_production()
-    with pytest.raises(RuntimeError, match="A8"):
+    with pytest.raises(RuntimeError, match="Turnstile"):
         khach.kiem_cau_hinh()
     monkeypatch.setattr(config, "ENV", "prodution")
     with pytest.raises(RuntimeError, match="không hợp lệ"):
@@ -1128,31 +1057,32 @@ def test_p2_9_gioi_han_body_truoc_khi_doc(kh):
 
 
 def _form_gui_lai(c, csrf, **h):
-    return c.post("/tai-khoan/gui-lai-xac-minh", data={"email": "x@example.test", "_csrf": csrf},
-                  headers=h, follow_redirects=False)
+    """POST biểu mẫu ẩn danh (đăng nhập sai): CSRF đạt ⇒ 401, CSRF/nguồn hỏng ⇒ 403."""
+    return c.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000099",
+                  "mat_khau": "Sai!Passw0rd-xx", "_csrf": csrf}, headers=h, follow_redirects=False)
 
 
 def test_p2_10_csrf_gan_tien_phien_va_cung_nguon(kh):
     # Token hợp lệ của chính trình duyệt này ⇒ qua.
-    tok = csrf_tu(kh.get("/tai-khoan/gui-lai-xac-minh").text)
-    assert _form_gui_lai(kh, tok).status_code == 303
+    tok = csrf_tu(kh.get("/tai-khoan/dang-nhap").text)
+    assert _form_gui_lai(kh, tok).status_code == 401
     # Giá trị tuỳ ý ⇒ 403.
     assert _form_gui_lai(kh, "A" * 32).status_code == 403
     # Cookie tossing: kẻ tấn công lấy cặp token hợp lệ CỦA MÌNH, cài token vào nạn nhân.
     ke = KC()
-    tok_ke = csrf_tu(ke.get("/tai-khoan/gui-lai-xac-minh").text)
+    tok_ke = csrf_tu(ke.get("/tai-khoan/dang-nhap").text)
     nan_nhan = KC()
-    nan_nhan.get("/tai-khoan/gui-lai-xac-minh")  # nạn nhân có id tiền-phiên riêng
+    nan_nhan.get("/tai-khoan/dang-nhap")  # nạn nhân có id tiền-phiên riêng
     assert _form_gui_lai(nan_nhan, tok_ke).status_code == 403
     # ... kể cả khi cài cả token CSRF cũ dạng double-submit.
     nan_nhan.cookies.set("vg_khach_csrf", tok_ke, domain="khach.localhost", path="/tai-khoan")
     assert _form_gui_lai(nan_nhan, tok_ke).status_code == 403
     # Không chứng minh được cùng nguồn ⇒ 403 dù token đúng.
     tho = TestClient(app, base_url=HOST_KHACH)  # không gửi Origin
-    tok_tho = csrf_tu(tho.get("/tai-khoan/gui-lai-xac-minh").text)
+    tok_tho = csrf_tu(tho.get("/tai-khoan/dang-nhap").text)
     assert _form_gui_lai(tho, tok_tho).status_code == 403
     assert _form_gui_lai(tho, tok_tho, **{"sec-fetch-site": "cross-site"}).status_code == 403
-    assert _form_gui_lai(tho, tok_tho, **{"sec-fetch-site": "same-origin"}).status_code == 303
+    assert _form_gui_lai(tho, tok_tho, **{"sec-fetch-site": "same-origin"}).status_code == 401
     for origin in ("null", "https://evil.example", "http://testserver",
                    "http://khach.localhost:9999"):
         assert _form_gui_lai(kh, tok, origin=origin).status_code == 403, origin
@@ -1164,8 +1094,7 @@ def test_p2_10_csrf_gan_tien_phien_va_cung_nguon(kh):
 
 def test_p2_11_dat_lai_khi_bi_khoa_bi_tu_choi(kh):
     acc = tao_khach_hoat_dong(kh, 1)
-    _quen(kh, "0900000001", "1.1.1.1")
-    t = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    t = link_dat_lai(kh, acc["subject"])
     assert goi_noi_bo(kh, "/api/internal/khach/tam-khoa",
                       {"subject": acc["subject"], "action": "khoa"}).status_code == 200
     csrf = _csrf(kh, "/tai-khoan/dang-nhap")
@@ -1242,9 +1171,8 @@ def test_n1_gioi_han_toan_cuc_tra_429_giong_het_cho_thiet_bi_moi(kh, monkeypatch
     assert goi == []  # không băm trên đường bị chặn
     # Thiết bị tin cậy vẫn vào được.
     token_launch(dang_nhap(cu, "0900000001", MK, headers={"x-real-ip": "1.2.3.4"}))
-    # Thiết bị mới: đặt lại mật khẩu qua email ⇒ xoá bộ đếm ⇒ đăng nhập được.
-    _quen(moi, "0900000001", "10.99.0.1")
-    t = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    # Thiết bị mới: nhân viên cấp link đặt lại (qua Zalo) ⇒ xoá bộ đếm ⇒ đăng nhập được.
+    t = link_dat_lai(kh, acc_theo_sdt("+84900000001")["subject"])
     csrf = _csrf(moi, f"/tai-khoan/dat-lai?t={t}")
     assert moi.post("/tai-khoan/dat-lai", data={"t": t, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI,
                                                 "_csrf": csrf}).status_code == 200
@@ -1581,8 +1509,6 @@ def test_dinh_dang_portal_code(raw, mong):
 
 def _cho_duyet(kh, n):
     dang_ky(kh, n)
-    xac_minh(kh, token_tu(outbox("kich_hoat_email", f"khach{n}@example.test")[-1]["body_text"],
-                          "/tai-khoan/xac-minh-email"))
     return acc_theo_sdt(f"+8490000000{n}")
 
 
@@ -1629,7 +1555,9 @@ def _dung_bang_v4(conn, portal_code):
     ddl_v4 = _re.sub(r"portal_code TEXT UNIQUE CHECK\(portal_code IS NULL OR \(.*?1001\)\),",
                      "portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR portal_code GLOB "
                      "'VG[0-9][0-9][0-9][0-9][0-9][0-9]'),", ddl, flags=_re.S)
-    assert "VG[0-9][0-9][0-9][0-9][0-9][0-9]" in ddl_v4
+    ddl_v4 = ddl_v4.replace("    email_norm TEXT,\n", "    email_norm TEXT NOT NULL UNIQUE,\n")
+    ddl_v4 = ddl_v4.replace("    phone_verified_method TEXT,\n", "")
+    assert "VG[0-9][0-9][0-9][0-9][0-9][0-9]" in ddl_v4 and "email_norm TEXT NOT NULL UNIQUE" in ddl_v4
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("DROP TABLE customer_accounts")
     conn.execute(f"CREATE TABLE customer_accounts({ddl_v4}\n)")
@@ -1661,7 +1589,7 @@ def test_migration_v5_dung_lai_bang_giu_du_lieu(client):
         row = db.one(conn, "SELECT * FROM customer_accounts WHERE id='kh_x'")
         assert row["phone_e164"] == "+84900000001" and row["status"] == "hoat_dong"
         assert db.scalar(conn, "SELECT COUNT(*) FROM customer_sessions WHERE account_id='kh_x'") == 1
-        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "5"
+        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "6"
         assert db.scalar(conn, "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_customer_crm_id'") == 1
         conn.execute("UPDATE customer_accounts SET portal_code='VG1001' WHERE id='kh_x'")
         conn.commit()
@@ -1719,7 +1647,8 @@ def test_ho_so_can_phien_va_hien_thong_tin(kh):
     assert 'href="/tai-khoan/ho-so"' in kh.get("/tai-khoan/dang-nhap").text
 
 
-def test_doi_mat_khau_thanh_cong(kh, crm):
+def test_doi_mat_khau_thanh_cong(kh, crm, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_EMAIL_ENABLED", True)  # để kiểm email thông báo
     acc = tao_khach_hoat_dong(kh, 1)
     token_launch(dang_nhap(kh, "0900000001"))
     khac = KC()  # một thiết bị khác cũng đang đăng nhập
@@ -1802,3 +1731,148 @@ def test_ten_danh_rieng_moi_tren_host_nhan_vien(client, bat, crm, owner):
         assert client.get(f"/tai-khoan/{n}", follow_redirects=False).status_code == 404
         from cowork import security
         assert security.kiem_tra_id(n)
+
+
+# ================================================================== owner 07/11: bỏ xác minh
+def test_bug_vipid_01_khong_meta_referrer_va_post_trinh_duyet(kh):
+    """Chrome gửi Origin: null khi trang có <meta name=referrer content=no-referrer> ⇒ mọi form
+    bị 403. Trang không được có meta đó; header Referrer-Policy: same-origin là đủ."""
+    for p in ("/tai-khoan/dang-ky", "/tai-khoan/dang-nhap", "/tai-khoan/quen-mat-khau",
+              "/tai-khoan/cho-duyet"):
+        r = kh.get(p)
+        assert 'name="referrer"' not in r.text, p
+        assert r.headers["referrer-policy"] == "same-origin"
+    tpl = (config.BASE_DIR / "cowork" / "templates" / "khach" / "base.html").read_text()
+    assert "no-referrer" not in tpl
+    # Trình duyệt thật: POST cùng nguồn gửi Origin thật + Sec-Fetch-Site ⇒ đi qua.
+    trinh_duyet = TestClient(app, base_url=HOST_KHACH)
+    tok = csrf_tu(trinh_duyet.get("/tai-khoan/dang-ky").text)
+    r = trinh_duyet.post("/tai-khoan/dang-ky", data={
+        "ho_ten": "Khách Trình Duyệt", "sdt": "0900000007", "email": "", "mat_khau": MK,
+        "mat_khau_2": MK, "dong_y": "1", "_csrf": tok},
+        headers={"origin": HOST_KHACH, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate",
+                 "referer": HOST_KHACH + "/tai-khoan/dang-ky"}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
+    # Origin: null vẫn bị từ chối (sửa nguyên nhân, không nới kiểm tra).
+    r = trinh_duyet.post("/tai-khoan/dang-nhap", data={"dinh_danh": "0900000007", "mat_khau": MK,
+                         "_csrf": tok}, headers={"origin": "null", "sec-fetch-site": "same-origin"})
+    assert r.status_code == 403
+
+
+def test_duyet_khong_can_phone_verified_by(kh):
+    dang_ky(kh, 1)
+    acc = acc_theo_sdt("+84900000001")
+    payload = {"subject": acc["subject"], "decision": "approved", "crm_customer_id": "crm-1",
+               "portal_code": "VG1001"}
+    r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet", payload)
+    assert r.status_code == 200, r.text
+    a = acc_theo_sdt("+84900000001")
+    assert a["status"] == "hoat_dong" and a["phone_verified_at"]
+    assert a["phone_verified_method"] == "duyet_crm" and a["phone_verified_by"] == "crm"
+    token_launch(dang_nhap(kh, "VG1001"))
+    # Có người duyệt ⇒ lưu đúng người duyệt.
+    dang_ky(kh, 2)
+    acc2 = acc_theo_sdt("+84900000002")
+    r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet", {**payload, "subject": acc2["subject"],
+                   "crm_customer_id": "crm-2", "portal_code": "VG1002", "approved_by": "nv-lan"})
+    assert r.status_code == 200 and acc_theo_sdt("+84900000002")["phone_verified_by"] == "nv-lan"
+
+
+def test_quen_mat_khau_hien_hotline(kh, monkeypatch):
+    r = kh.get("/tai-khoan/quen-mat-khau")
+    assert r.status_code == 200 and "0961 102 655" in r.text and "Zalo" in r.text
+    assert "<form" not in r.text
+    tok = csrf_tu(kh.get("/tai-khoan/dang-nhap").text)
+    assert kh.post("/tai-khoan/quen-mat-khau", data={"dinh_danh": "0900000001",
+                   "_csrf": tok}).status_code == 404
+    monkeypatch.setattr(config, "KHACH_HOTLINE", "0900 000 999")
+    assert "0900 000 999" in kh.get("/tai-khoan/quen-mat-khau").text
+
+
+def test_tao_link_dat_lai_hmac_mot_lan_het_han_thu_hoi_phien(kh, crm):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    path = "/api/internal/khach/tao-link-dat-lai"
+    body = json.dumps({"subject": acc["subject"], "requested_by": "nv-ho-tro"}).encode()
+    # HMAC bắt buộc; sai đường dẫn ký ⇒ 401.
+    assert kh.post(path, content=body).status_code == 401
+    assert kh.post(path, content=body, headers=ky_vao("/api/internal/khach/thu-hoi", body)).status_code == 401
+    assert goi_noi_bo(kh, path, {"subject": acc["subject"]}).status_code == 400  # thiếu requested_by
+    assert goi_noi_bo(kh, path, {"subject": "cust:khong-co", "requested_by": "x"}).status_code == 404
+    r = goi_noi_bo(kh, path, {"subject": acc["subject"], "requested_by": "nv-ho-tro"})
+    assert r.status_code == 200
+    d = r.json()["data"]
+    assert d["url"].startswith(HOST_KHACH + "/tai-khoan/dat-lai?t=") and d["expires_at"]
+    t1 = token_tu(d["url"], "/tai-khoan/dat-lai")
+    conn = db.connect()
+    try:  # chỉ lưu sha256; audit có người yêu cầu
+        assert db.scalar(conn, "SELECT COUNT(*) FROM customer_tokens WHERE token_hash=?",
+                         (hashlib.sha256(t1.encode()).hexdigest(),)) == 1
+        assert t1 not in json.dumps(db.q(conn, "SELECT * FROM customer_tokens"))
+        det = db.scalar(conn, "SELECT detail FROM audit_log WHERE action='khach.tao_link_dat_lai'")
+        assert "nv-ho-tro" in det and t1 not in det
+    finally:
+        conn.close()
+    # Link mới thay link cũ.
+    t2 = link_dat_lai(kh, acc["subject"])
+    assert kh.get(f"/tai-khoan/dat-lai?t={t1}").status_code == 400
+    # GET không tiêu; POST tiêu một lần; thu hồi phiên; báo CRM.
+    for _ in range(2):
+        assert kh.get(f"/tai-khoan/dat-lai?t={t2}").status_code == 200
+    csrf = _csrf(kh, f"/tai-khoan/dat-lai?t={t2}")
+    d2 = {"t": t2, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI, "_csrf": csrf}
+    assert kh.post("/tai-khoan/dat-lai", data=d2).status_code == 200
+    assert kh.post("/tai-khoan/dat-lai", data=d2).status_code == 400
+    assert "dang-nhap" in kh.get("/tai-khoan/vao-cong", follow_redirects=False).headers["location"]
+    assert crm.goi[-1]["body"] == {"subject": acc["subject"], "reason": "dat_lai_mat_khau"}
+    token_launch(dang_nhap(KC(), "0900000001", MK_MOI))
+    # Hết hạn.
+    t3 = link_dat_lai(kh, acc["subject"])
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_tokens SET expires_at='2020-01-01T00:00:00+07:00' "
+                     "WHERE used_at IS NULL")
+        conn.commit()
+    finally:
+        conn.close()
+    assert kh.get(f"/tai-khoan/dat-lai?t={t3}").status_code == 400
+    # Tài khoản bị khoá ⇒ không cấp link.
+    goi_noi_bo(kh, "/api/internal/khach/tam-khoa", {"subject": acc["subject"], "action": "khoa"})
+    assert goi_noi_bo(kh, path, {"subject": acc["subject"], "requested_by": "x"}).status_code == 409
+
+
+def test_khong_gui_email_khi_tat(kh, crm):
+    acc = tao_khach_hoat_dong(kh, 1)
+    token_launch(dang_nhap(kh, "0900000001"))
+    t = link_dat_lai(kh, acc["subject"])
+    kh.post("/tai-khoan/dat-lai", data={"t": t, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI,
+                                       "_csrf": _csrf(kh, f"/tai-khoan/dat-lai?t={t}")})
+    assert outbox() == []
+
+
+def test_migration_v6_email_tuy_chon(client):
+    conn = db.connect()
+    try:
+        _dung_bang_v4(conn, None)  # DDL cũ còn email_norm TEXT NOT NULL UNIQUE + CHECK VG 6 số
+        sql = db.scalar(conn, "SELECT sql FROM sqlite_master WHERE name='customer_accounts'")
+        assert "email_norm TEXT NOT NULL UNIQUE" in sql
+    finally:
+        conn.close()
+    db._initialized = False
+    db.init_db()
+    conn = db.connect()
+    try:
+        sql = db.scalar(conn, "SELECT sql FROM sqlite_master WHERE name='customer_accounts'")
+        assert "email_norm TEXT," in sql and "phone_verified_method" in sql
+        assert db.one(conn, "SELECT email_norm FROM customer_accounts WHERE id='kh_x'")["email_norm"] == "a@example.test"
+        assert db.scalar(conn, "SELECT value FROM meta WHERE key='schema_version'") == "6"
+        now = db.now_iso()
+        for i in (2, 3):  # email trùng / trống được phép
+            conn.execute("INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
+                         "password_hash, password_salt, consent_at, created_at, updated_at) "
+                         "VALUES(?,?,?,?, 'B','h','s',?,?,?)",
+                         (f"kh_{i}", f"cust:kh_{i}", f"+8490000000{i}",
+                          "a@example.test" if i == 2 else None, now, now, now))
+        conn.commit()
+    finally:
+        conn.close()

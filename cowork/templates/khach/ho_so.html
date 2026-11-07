@@ -6,7 +6,7 @@
 <dl class="kh-info">
   <dt>Mã khách hàng</dt><dd><b>{{ acc.portal_code or "—" }}</b></dd>
   <dt>Số điện thoại</dt><dd>{{ sdt_che }}</dd>
-  <dt>Email</dt><dd class="kh-break">{{ acc.email_norm }}</dd>
+  <dt>Email</dt><dd class="kh-break">{{ acc.email_norm or "—" }}</dd>
 </dl>
 <p><a class="kh-btn" href="/tai-khoan/vao-cong">Vào cổng khách hàng</a></p>
 <p><a class="kh-btn kh-btn-ghost" href="/tai-khoan/doi-mat-khau">Đổi mật khẩu</a></p>

@@ -2,7 +2,7 @@
 {% block content %}
 <p class="kh-eyebrow">Tạo tài khoản</p>
 <h1>Đăng ký cổng khách hàng</h1>
-<p class="kh-muted">Sau khi xác minh email, nhân viên VIP GROUP sẽ gọi điện xác minh số điện thoại rồi kích hoạt tài khoản và cấp mã khách hàng.</p>
+<p class="kh-muted">Sau khi đăng ký, nhân viên VIP GROUP sẽ duyệt và kích hoạt tài khoản, cấp mã khách hàng (VG…). Bạn đăng nhập bằng số điện thoại hoặc mã khách hàng.</p>
 {% include "khach/_loi.html" %}
 <form method="post" action="/tai-khoan/dang-ky" class="kh-form" autocomplete="on" novalidate>
   <input type="hidden" name="_csrf" value="{{ csrf }}">
@@ -10,14 +10,14 @@
     <input type="text" name="ho_ten" required maxlength="100" autocomplete="name" value="{{ form.ho_ten or '' }}"></label>
   <label class="kh-field"><span>Số điện thoại di động</span>
     <input type="tel" name="sdt" required maxlength="30" autocomplete="tel" inputmode="tel" placeholder="0901 234 567" value="{{ form.sdt or '' }}"></label>
-  <label class="kh-field"><span>Email</span>
-    <input type="email" name="email" required maxlength="254" autocomplete="email" value="{{ form.email or '' }}"></label>
+  <label class="kh-field"><span>Email (không bắt buộc)</span>
+    <input type="email" name="email" maxlength="254" autocomplete="email" value="{{ form.email or '' }}"></label>
   <label class="kh-field"><span>Mật khẩu (ít nhất 12 ký tự)</span>
     <input type="password" name="mat_khau" required minlength="12" maxlength="200" autocomplete="new-password"></label>
   <label class="kh-field"><span>Nhập lại mật khẩu</span>
     <input type="password" name="mat_khau_2" required minlength="12" maxlength="200" autocomplete="new-password"></label>
   <label class="kh-check"><input type="checkbox" name="dong_y" value="1" required>
-    <span>Tôi đồng ý để VIP GROUP xử lý thông tin cá nhân (họ tên, số điện thoại, email) nhằm cung cấp dịch vụ, theo chính sách bảo mật và điều khoản sử dụng.</span></label>
+    <span>Tôi đồng ý để VIP GROUP xử lý thông tin cá nhân (họ tên, số điện thoại, email nếu có) nhằm cung cấp dịch vụ, theo chính sách bảo mật và điều khoản sử dụng.</span></label>
   <button class="kh-btn" type="submit">Đăng ký</button>
 </form>
 <p class="kh-links">Đã có tài khoản? <a href="/tai-khoan/dang-nhap">Đăng nhập</a></p>

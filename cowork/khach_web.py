@@ -286,58 +286,11 @@ def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Respo
                        loi=e.message, form=form)
     finally:
         conn.close()
-    return RedirectResponse("/tai-khoan/da-gui-email", status_code=303)
+    return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)
 
 
-@khach_app.get("/tai-khoan/da-gui-email")
-def da_gui_email(request: Request):
-    return _render(request, "da_gui_email.html", page_title="Kiểm tra email")
-
-
-@khach_app.get("/tai-khoan/gui-lai-xac-minh")
-def gui_lai_form(request: Request):
-    return _render(request, "gui_lai.html", page_title="Gửi lại email xác minh")
-
-
-@khach_app.post("/tai-khoan/gui-lai-xac-minh")
-def gui_lai(request: Request, email: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
-    if not _kiem_csrf(request, csrf_form):
-        return _loi_csrf(request)
-    conn = db.connect()
-    try:
-        khach.gui_lai_xac_minh(conn, email[:254], _ip_khoa(request), request)
-    finally:
-        conn.close()
-    return RedirectResponse("/tai-khoan/da-gui-email", status_code=303)
-
-
-@khach_app.get("/tai-khoan/xac-minh-email")
-def xac_minh_email_form(request: Request, t: str = ""):
-    """GET KHÔNG tiêu token (trình quét email mở link trước) — chỉ hiện nút xác nhận."""
-    conn = db.connect()
-    try:
-        ok = khach.xem_token(conn, t, "kich_hoat_email") is not None
-    finally:
-        conn.close()
-    if not ok:
-        return _render(request, "xac_minh.html", 400, page_title="Xác minh email", ok=False)
-    return _render(request, "xac_minh.html", page_title="Xác minh email", xac_nhan=True,
-                   token=t)
-
-
-@khach_app.post("/tai-khoan/xac-minh-email")
-def xac_minh_email(request: Request, t: str = Form(""),
-                   csrf_form: str = Form("", alias="_csrf")):
-    if not _kiem_csrf(request, csrf_form):
-        return _loi_csrf(request)
-    conn = db.connect()
-    try:
-        acc = khach.xac_minh_email(conn, t[:200], request)
-    finally:
-        conn.close()
-    if not acc:
-        return _render(request, "xac_minh.html", 400, page_title="Xác minh email", ok=False)
-    return _render(request, "xac_minh.html", page_title="Xác minh email", ok=True)
+# Owner 07/11: bỏ xác minh email — /da-gui-email, /gui-lai-xac-minh, /xac-minh-email không còn
+# (404). Đăng ký xong chuyển thẳng tới trang "Đã nhận đăng ký, chờ VIP GROUP duyệt".
 
 
 @khach_app.get("/tai-khoan/cho-duyet")
@@ -394,7 +347,7 @@ async def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str =
 def _loi_dang_nhap(request: Request, e: "khach.KhachLoi", dinh_danh: str) -> Response:
     thu_thach = isinstance(e, khach.ThuThach)
     resp = _render(request, "dang_nhap.html", e.status, page_title="Đăng nhập", loi=e.message,
-                   dinh_danh=dinh_danh, chua_xac_minh=e.ma == "CHUA_XAC_MINH_EMAIL",
+                   dinh_danh=dinh_danh,
                    thu_thach=thu_thach, turnstile_site_key=config.KHACH_TURNSTILE_SITE_KEY,
                    turnstile_action=khach.TURNSTILE_ACTION)
     if thu_thach:
@@ -544,11 +497,15 @@ def dang_xuat(request: Request, csrf_form: str = Form("", alias="_csrf")):
 
 @khach_app.get("/tai-khoan/quen-mat-khau")
 def quen_form(request: Request):
-    return _render(request, "quen_mat_khau.html", page_title="Quên mật khẩu")
+    # Email tắt (mặc định): khôi phục do nhân viên hỗ trợ — trang chỉ hướng dẫn liên hệ.
+    return _render(request, "quen_mat_khau.html", page_title="Quên mật khẩu",
+                   email_bat=config.KHACH_EMAIL_ENABLED, hotline=config.KHACH_HOTLINE)
 
 
 @khach_app.post("/tai-khoan/quen-mat-khau")
 def quen(request: Request, dinh_danh: str = Form(""), csrf_form: str = Form("", alias="_csrf")):
+    if not config.KHACH_EMAIL_ENABLED:
+        raise StarletteHTTPException(status_code=404)
     if not _kiem_csrf(request, csrf_form):
         return _loi_csrf(request)
     conn = db.connect()
@@ -556,7 +513,8 @@ def quen(request: Request, dinh_danh: str = Form(""), csrf_form: str = Form("", 
         khach.yeu_cau_khoi_phuc(conn, dinh_danh[:254], _ip_khoa(request), request)
     finally:
         conn.close()
-    return _render(request, "quen_mat_khau.html", page_title="Quên mật khẩu", da_gui=True)
+    return _render(request, "quen_mat_khau.html", page_title="Quên mật khẩu", da_gui=True,
+                   email_bat=True, hotline=config.KHACH_HOTLINE)
 
 
 @khach_app.get("/tai-khoan/dat-lai")
@@ -658,6 +616,11 @@ async def api_ket_qua_duyet(request: Request):
 @khach_app.post("/api/internal/khach/tam-khoa")
 async def api_tam_khoa(request: Request):
     return await _noi_bo(request, khach.tam_khoa)
+
+
+@khach_app.post("/api/internal/khach/tao-link-dat-lai")
+async def api_tao_link_dat_lai(request: Request):
+    return await _noi_bo(request, khach.tao_link_dat_lai)
 
 
 @khach_app.post("/api/internal/khach/thu-hoi")

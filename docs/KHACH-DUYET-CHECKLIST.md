@@ -1,26 +1,29 @@
 # Checklist nhân viên — duyệt đăng ký cổng khách hàng
 
-Áp dụng cho màn "Duyệt đăng ký khách" (CRM). VIP ID chỉ kích hoạt tài khoản khi CRM gửi
-`ket-qua-duyet` với `phone_verified_by` là người đã gọi điện.
+Áp dụng cho màn "Duyệt đăng ký khách" (CRM). **Quyết định owner 07/11/2026:** bỏ cả bước xác
+minh email lẫn bước gọi điện xác minh SĐT. Khách đăng ký là có ngay một yêu cầu `cho_duyet`;
+**nhân viên duyệt là cổng kiểm soát duy nhất**. Khi duyệt, VIP ID ghi `phone_verified_at` = thời
+điểm duyệt, `phone_verified_by` = nhân viên duyệt (nếu CRM gửi), phương thức `duyet_crm`.
 
-## Trước khi gọi
-- Xem cờ **`phone_conflict`** / **`phone_conflict_count`** của đăng ký. Nếu > 0: đã có người
-  khác (email khác) thử đăng ký **cùng số điện thoại** — nghi giữ chỗ. Gọi đặc biệt cẩn thận.
-- Không gọi số khác ngoài số trong đăng ký; không gửi mã/link qua kênh khác.
-
-## Khi gọi số điện thoại trong đăng ký
-Hỏi người nghe máy, **không đọc trước thông tin cho họ**:
-1. **Họ và tên** — phải khớp tên trong đăng ký.
-2. **Địa chỉ email** đã dùng để đăng ký — phải khớp **đúng** email trong đăng ký.
-3. Xác nhận họ **chủ động** đăng ký cổng khách hàng VIP GROUP.
-
-Chỉ tích "đã gọi xác minh SĐT" và **duyệt** khi cả tên **và** email đều khớp với chủ số.
+## Trước khi duyệt
+- **Kiểm cờ `phone_conflict` / `phone_conflict_count`.** Nếu > 0: đã có người khác thử đăng ký
+  **cùng số điện thoại** với yêu cầu này — nghi giữ chỗ số của người khác. Khuyến nghị gọi điện
+  hoặc nhắn Zalo cho chủ số để xác nhận họ tên trước khi duyệt; không chắc ⇒ **từ chối**.
+- Đối chiếu họ tên, SĐT (và email nếu có) với hồ sơ khách sẵn có trong CRM; trùng khách cũ ⇒
+  chọn "liên kết hồ sơ có sẵn" (có audit), không tạo hồ sơ mới.
+- Không cần gọi điện cho mọi yêu cầu (owner đã bỏ bước này); vẫn có thể gọi khi nghi ngờ.
 
 ## Khi không khớp
-- Tên hoặc email không khớp, hoặc chủ số nói không đăng ký ⇒ **từ chối** (ghi lý do).
-  VIP ID sẽ giải phóng SĐT và email của đăng ký bị từ chối để chủ thật đăng ký lại.
-- Khuyên chủ số tự đăng ký lại bằng email của chính họ.
-- Không gọi được sau nhiều lần: để chờ, không duyệt.
+- Nghi sai chủ số ⇒ **từ chối** (ghi lý do). VIP ID giải phóng SĐT của đăng ký bị từ chối để chủ
+  thật đăng ký lại.
+
+## Khôi phục mật khẩu (do nhân viên hỗ trợ)
+Khách quên mật khẩu liên hệ hotline/Zalo (mặc định 0961 102 655):
+1. **Gọi lại đúng SĐT của tài khoản** và xác nhận danh tính (họ tên, mã khách VG…).
+2. Bấm "Cấp link đặt lại mật khẩu" trong CRM (CRM gọi `POST /api/internal/khach/tao-link-dat-lai`).
+3. Gửi link cho khách **qua Zalo của đúng SĐT đó**. Link dùng một lần, hết hạn sau 30 phút;
+   cấp link mới làm link cũ mất hiệu lực. Đặt lại xong, mọi phiên đăng nhập cũ bị đăng xuất.
+4. Không đọc link qua điện thoại cho người khác, không gửi tới số khác.
 
 ## Ghi nhận
-Mọi lần duyệt/từ chối đều ghi audit ở cả CRM và VIP ID (`tenant_id='khach'`).
+Mọi lần duyệt/từ chối/cấp link đều ghi audit ở cả CRM và VIP ID (`tenant_id='khach'`).

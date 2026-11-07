@@ -102,9 +102,10 @@ def kiem_cau_hinh() -> None:
     env = config.ENV.strip().lower()
     if env not in ENV_HOP_LE:
         loi.append(f"COWORK_ENV={config.ENV!r} không hợp lệ (cho phép: {sorted(ENV_HOP_LE)}).")
-    if la_production() and config.KHACH_MAIL_TRANSPORT not in KENH_EMAIL_THAT:
-        loi.append("A8: production chưa có kênh gửi email thật (COWORK_KHACH_MAIL_TRANSPORT="
-                   f"{config.KHACH_MAIL_TRANSPORT!r}) — không được bật realm khách.")
+    if (la_production() and config.KHACH_EMAIL_ENABLED
+            and config.KHACH_MAIL_TRANSPORT not in KENH_EMAIL_THAT):
+        loi.append("A8: production bật COWORK_KHACH_EMAIL_ENABLED=1 nhưng chưa có kênh gửi email "
+                   f"thật (COWORK_KHACH_MAIL_TRANSPORT={config.KHACH_MAIL_TRANSPORT!r}).")
     if not config.KHACH_HOSTS:
         loi.append("COWORK_KHACH_HOSTS rỗng.")
     if not host_nhan_vien():
@@ -472,9 +473,11 @@ def tai_khoan_theo_subject(conn, subject: str) -> dict | None:
 
 
 # ------------------------------------------------------------------ outbox email
-def gui_email(conn, account_id: str | None, to_email: str, kind: str, tieu_de: str,
-              noi_dung: str) -> int:
-    """Chỉ ghi outbox. Không có kênh gửi thật (A8)."""
+def gui_email(conn, account_id: str | None, to_email: str | None, kind: str, tieu_de: str,
+              noi_dung: str) -> int | None:
+    """Chỉ ghi outbox (không gửi thật). Email tắt (mặc định) hoặc khách không có email ⇒ bỏ qua."""
+    if not config.KHACH_EMAIL_ENABLED or not to_email:
+        return None
     cur = conn.execute(
         "INSERT INTO customer_outbox(account_id, kind, to_email, subject, body_text, created_at) "
         "VALUES(?,?,?,?,?,?)", (account_id, kind, to_email, tieu_de, noi_dung, db.now_iso()))
@@ -545,30 +548,25 @@ def tieu_token(conn, raw: str | None, purpose: str) -> str | None:
 
 
 # ------------------------------------------------------------------ đăng ký
-def _gui_link_kich_hoat(conn, acc: dict) -> None:
-    raw = tao_token(conn, acc["id"], "kich_hoat_email")
-    if not raw:
-        return
-    gui_email(conn, acc["id"], acc["email_norm"], "kich_hoat_email",
-              "VIP GROUP — Xác minh email đăng ký cổng khách hàng",
-              f"Chào {acc['display_name']},\n\nBấm liên kết sau để xác minh email (hiệu lực "
-              f"{config.KHACH_TOKEN_TTL_MIN} phút, dùng một lần):\n"
-              f"{_link('/tai-khoan/xac-minh-email?t=' + raw)}\n\nSau khi xác minh, nhân viên "
-              "VIP GROUP sẽ gọi điện xác minh số điện thoại rồi kích hoạt tài khoản." + _CHAN_THU)
-
-
 def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_2: str,
             dong_y: bool, ip: str, request=None) -> None:
-    """Ném KhachLoi khi dữ liệu SAI ĐỊNH DẠNG. Trùng SĐT/email ⇒ im lặng (không lộ tài khoản)."""
+    """Owner 07/11: ghi nhận đăng ký NGAY ở `cho_duyet` và gửi signup sang CRM; nhân viên duyệt là
+    cổng duy nhất. Email tuỳ chọn (kiểm định dạng nếu có, không unique).
+
+    Ném KhachLoi khi dữ liệu SAI ĐỊNH DẠNG. SĐT đã tồn tại ⇒ không tạo, phản hồi y hệt
+    (không lộ tài khoản), ghi audit và đánh dấu xung đột gửi CRM nếu tài khoản kia đang chờ duyệt.
+    """
     ten = chuan_hoa_ten(ho_ten)
     phone = chuan_hoa_sdt(sdt)
-    em = chuan_hoa_email(email)
+    em = None
+    if (email or "").strip():
+        em = chuan_hoa_email(email)
+        if not em:
+            raise KhachLoi("Địa chỉ email không hợp lệ (có thể để trống).")
     if not ten:
         raise KhachLoi("Họ tên cần từ 2 đến 100 ký tự.")
     if not phone:
         raise KhachLoi("Số điện thoại di động Việt Nam không hợp lệ (ví dụ 0901 234 567).")
-    if not em:
-        raise KhachLoi("Địa chỉ email không hợp lệ.")
     loi_mk = security.kiem_tra_do_manh(mat_khau or "", phone[3:], min_len=config.KHACH_PASSWORD_MIN)
     if loi_mk:
         raise KhachLoi(loi_mk)
@@ -582,21 +580,9 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
         raise KhachLoi("Bạn đã gửi quá nhiều yêu cầu đăng ký. Vui lòng thử lại sau.", 429,
                        "QUA_TAN_SUAT")
 
-    trung = db.q(conn, "SELECT * FROM customer_accounts WHERE phone_e164=? OR email_norm=?",
-                 (phone, em))
-    # Giải phóng đăng ký "giữ chỗ" chưa từng xác minh email và đã quá hạn.
-    han = _truoc(hours=config.KHACH_UNVERIFIED_TTL_HOURS)
-    con_lai = []
-    for acc in trung:
-        if acc["status"] == "cho_xac_minh_email" and acc["created_at"] < han:
-            conn.execute("DELETE FROM customer_accounts WHERE id=?", (acc["id"],))
-            conn.commit()
-            _ghi_audit(conn, "system", "khach.dang_ky.giai_phong_qua_han", target_id=acc["subject"],
-                       detail={"phone": che_sdt(acc["phone_e164"])}, request=request)
-        else:
-            con_lai.append(acc)
-    if con_lai:
-        _xu_ly_trung(conn, con_lai, phone, em, mat_khau, ip, request)
+    trung = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=?", (phone,))
+    if trung:
+        _xu_ly_trung(conn, trung, em, mat_khau, ip, request)
         return
 
     hash_b64, salt_b64, algo = bam_mk(mat_khau)
@@ -607,17 +593,17 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
             "INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
             "password_hash, password_salt, password_algo, status, consent_at, token_version, "
             "failed_attempts, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?, "
-            "'cho_xac_minh_email', ?, 1, 0, ?, ?)",
+            "'cho_duyet', ?, 1, 0, ?, ?)",
             (acc_id, "cust:" + acc_id, phone, em, ten, hash_b64, salt_b64, algo, now, now, now))
         conn.commit()
     except sqlite3.IntegrityError:
-        # Đua đăng ký cùng lúc: xử lý như trùng.
-        conn.rollback()
+        conn.rollback()  # đua đăng ký cùng SĐT: xử lý như trùng
         return
     acc = tai_khoan(conn, acc_id)
-    _gui_link_kich_hoat(conn, acc)
     _ghi_audit(conn, acc["subject"], "khach.dang_ky", target_id=acc["subject"],
-               detail={"phone": che_sdt(phone), "email": che_email(em)}, request=request)
+               detail={"phone": che_sdt(phone), "email": che_email(em) if em else None},
+               request=request)
+    _gui_signup(conn, acc)
 
 
 def _ngau_nhien_26() -> str:
@@ -625,82 +611,28 @@ def _ngau_nhien_26() -> str:
     return "".join(secrets.choice(chu) for _ in range(26))
 
 
-def _xu_ly_trung(conn, trung: list[dict], phone_moi: str, email_moi: str, mat_khau: str,
-                 ip: str, request) -> None:
+def _xu_ly_trung(conn, acc: dict, email_moi: str | None, mat_khau: str, ip: str,
+                 request) -> None:
+    """Trùng SĐT: không tạo, không thông báo ra ngoài. Tài khoản kia đang chờ duyệt ⇒ đánh dấu
+    xung đột và gửi lại signup cho CRM để nhân viên kiểm trước khi duyệt (chống giữ chỗ SĐT)."""
     bam_gia(mat_khau)  # cân bằng thời gian với nhánh tạo mới
-    for acc in trung:
-        _ghi_audit(conn, "khach:anon", "khach.dang_ky.trung", target_id=acc["subject"],
-                   request=request, lay_mau=f"{ip}:{acc['id']}")
-        # Chống "giữ chỗ SĐT": người khác (email khác) đăng ký cùng SĐT với tài khoản CHƯA được
-        # nhân viên xác minh SĐT ⇒ đánh dấu xung đột, báo CRM để nhân viên thấy khi gọi xác minh.
-        if (acc["phone_e164"] == phone_moi and acc["email_norm"] != email_moi
-                and acc["status"] in ("cho_xac_minh_email", "cho_duyet")):
-            conn.execute("UPDATE customer_accounts SET phone_conflict_count=phone_conflict_count+1, "
-                         "updated_at=? WHERE id=?", (db.now_iso(), acc["id"]))
-            conn.commit()
-            moi = tai_khoan(conn, acc["id"])
-            _ghi_audit(conn, "khach:anon", "khach.dang_ky.xung_dot_sdt", target_id=acc["subject"],
-                       detail={"lan": moi["phone_conflict_count"],
-                               "emailKhac": che_email(email_moi)}, request=request)
-            if moi["status"] == "cho_duyet":
-                _gui_signup(conn, moi)
-        # Mỗi tài khoản nhận tối đa 1 email loại này / giờ (chống dùng form để spam).
-        if vuot_tan_suat(conn, "thong_bao_trung", acc["id"], 1, 3600):
-            continue
-        if acc["status"] == "cho_xac_minh_email" and acc["email_norm"] == email_moi:
-            # Chính chủ đăng ký lại vì mất email: gửi lại link (tới email ĐÃ ĐĂNG KÝ).
-            _gui_link_kich_hoat(conn, acc)
-            continue
-        gui_email(conn, acc["id"], acc["email_norm"], "dang_ky_trung",
-                  "VIP GROUP — Có người vừa đăng ký bằng thông tin của bạn",
-                  "Có người vừa thử đăng ký cổng khách hàng VIP GROUP bằng số điện thoại hoặc "
-                  "email đã gắn với tài khoản của bạn. Tài khoản của bạn không bị thay đổi.\n\n"
-                  "Nếu bạn quên mật khẩu, hãy dùng chức năng Quên mật khẩu:\n"
-                  f"{_link('/tai-khoan/quen-mat-khau')}" + _CHAN_THU)
-
-
-def gui_lai_xac_minh(conn, email: str, ip: str, request=None) -> None:
-    """Luôn im lặng. Chỉ gửi khi email thuộc tài khoản đang chờ xác minh."""
-    em = chuan_hoa_email(email)
-    if vuot_tan_suat(conn, "gui_lai_ip", ip, config.KHACH_FORGOT_IP_PER_HOUR, 3600) or not em:
-        return
-    acc = db.one(conn, "SELECT * FROM customer_accounts WHERE email_norm=?", (em,))
-    if not acc or acc["status"] != "cho_xac_minh_email":
-        return
-    if vuot_tan_suat(conn, "gui_lai_acc_ip", f"{acc['id']}:{ip}",
-                     config.KHACH_RESET_ACC_IP_PER_HOUR, 3600):
-        return
-    _gui_link_kich_hoat(conn, acc)
-    _ghi_audit(conn, acc["subject"], "khach.gui_lai_xac_minh", target_id=acc["subject"],
+    _ghi_audit(conn, "khach:anon", "khach.dang_ky.trung", target_id=acc["subject"],
                request=request, lay_mau=f"{ip}:{acc['id']}")
-
-
-def xac_minh_email(conn, raw: str | None, request=None) -> dict | None:
-    """Tiêu token kích hoạt → `cho_duyet` + gửi signup sang CRM. Trả account hoặc None."""
-    acc_id = tieu_token(conn, raw, "kich_hoat_email")
-    if not acc_id:
-        _ghi_audit(conn, "khach:anon", "khach.xac_minh_email.token_sai", request=request,
-                   lay_mau=audit._ip(request) or "?")
-        return None
-    acc = tai_khoan(conn, acc_id)
-    if not acc:
-        return None
-    if acc["status"] == "cho_xac_minh_email":
-        now = db.now_iso()
-        conn.execute("UPDATE customer_accounts SET status='cho_duyet', email_verified_at=?, "
-                     "updated_at=? WHERE id=? AND status='cho_xac_minh_email'",
-                     (now, now, acc_id))
-        conn.commit()
-        acc = tai_khoan(conn, acc_id)
-        _ghi_audit(conn, acc["subject"], "khach.xac_minh_email", target_id=acc["subject"],
-                   request=request)
-        _gui_signup(conn, acc)
-    return acc
+    if acc["status"] not in ("cho_duyet", "cho_xac_minh_email"):
+        return
+    conn.execute("UPDATE customer_accounts SET phone_conflict_count=phone_conflict_count+1, "
+                 "updated_at=? WHERE id=?", (db.now_iso(), acc["id"]))
+    conn.commit()
+    moi = tai_khoan(conn, acc["id"])
+    _ghi_audit(conn, "khach:anon", "khach.dang_ky.xung_dot_sdt", target_id=acc["subject"],
+               detail={"lan": moi["phone_conflict_count"],
+                       "emailKhac": che_email(email_moi) if email_moi else None}, request=request)
+    _gui_signup(conn, moi)
 
 
 def _gui_signup(conn, acc: dict) -> None:
-    """Signup sang CRM. Mỗi lần số xung đột SĐT tăng ⇒ một bản cập nhật mới (CRM upsert theo
-    subject) để nhân viên thấy `phone_conflict` trước khi gọi xác minh."""
+    """Signup sang CRM (ngay khi đăng ký). Mỗi lần số xung đột SĐT tăng ⇒ một bản cập nhật mới
+    (CRM upsert theo subject) để nhân viên thấy `phone_conflict` trước khi duyệt. Email có thể null."""
     n = int(acc.get("phone_conflict_count") or 0)
     idem = "signup:" + acc["subject"] + (f":xung-dot-{n}" if n else "")
     xep_hang_crm(conn, "signup", idem, acc["subject"], PATH_SIGNUP, {
@@ -820,10 +752,7 @@ def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
         raise KhachLoi(THONG_BAO_SAI, 401, "SAI_THONG_TIN")
 
     # Mật khẩu đúng ⇒ có thể nói trạng thái cho chính chủ.
-    if acc["status"] == "cho_xac_minh_email":
-        raise KhachLoi("Bạn chưa xác minh email. Hãy mở liên kết trong email đăng ký "
-                       "hoặc yêu cầu gửi lại.", 403, "CHUA_XAC_MINH_EMAIL")
-    if acc["status"] == "cho_duyet" or (acc["status"] == "hoat_dong"
+    if acc["status"] in ("cho_duyet", "cho_xac_minh_email") or (acc["status"] == "hoat_dong"
                                         and not acc["phone_verified_at"]):
         raise ChoDuyet("Tài khoản đang chờ VIP GROUP duyệt.", 403, "CHO_DUYET")
     if acc["status"] != "hoat_dong" or not acc["phone_verified_at"] or not acc["crm_customer_id"]:
@@ -1072,11 +1001,13 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
         crm_id = str(data.get("crm_customer_id") or "").strip()
         code = chuan_hoa_portal_code(str(data.get("portal_code") or ""))
         cust_code = str(data.get("customer_code") or "").strip() or None
-        nguoi = str(data.get("phone_verified_by") or "").strip()
-        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", crm_id) or not code or not nguoi
+        # Owner 07/11: không gọi xác minh SĐT; duyệt của nhân viên = xác minh (phương thức
+        # 'duyet_crm'). Người duyệt tuỳ chọn (phone_verified_by hoặc approved_by).
+        nguoi = str(data.get("phone_verified_by") or data.get("approved_by") or "").strip() or "crm"
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", crm_id) or not code
                 or len(nguoi) > 120 or (cust_code and len(cust_code) > 40)):
             return 400, {"ma": "DU_LIEU_SAI",
-                         "thongBao": "Thiếu/sai crm_customer_id, portal_code hoặc phone_verified_by."}
+                         "thongBao": "Thiếu/sai crm_customer_id hoặc portal_code."}
         if acc["status"] in ("hoat_dong", "tam_khoa") and acc["crm_customer_id"]:
             if acc["crm_customer_id"] == crm_id and acc["portal_code"] == code:
                 return 200, {"subject": subject, "status": acc["status"], "idempotent": True}
@@ -1087,8 +1018,8 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
         try:
             conn.execute(
                 "UPDATE customer_accounts SET status='hoat_dong', phone_verified_at=?, "
-                "phone_verified_by=?, crm_customer_id=?, customer_code=?, portal_code=?, "
-                "updated_at=? WHERE id=? AND status='cho_duyet'",
+                "phone_verified_by=?, phone_verified_method='duyet_crm', crm_customer_id=?, "
+                "customer_code=?, portal_code=?, updated_at=? WHERE id=? AND status='cho_duyet'",
                 (now, nguoi, crm_id, cust_code, code, now, acc["id"]))
             conn.commit()
         except sqlite3.IntegrityError:
@@ -1096,7 +1027,7 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
             return 409, {"ma": "XUNG_DOT", "thongBao": "crm_customer_id hoặc portal_code đã dùng."}
         _ghi_audit(conn, "crm", "khach.duyet", target_id=subject,
                    detail={"crm_customer_id": crm_id, "portal_code": code,
-                           "phone_verified_by": nguoi}, request=request)
+                           "phone_verified_by": nguoi, "method": "duyet_crm"}, request=request)
         gui_email(conn, acc["id"], acc["email_norm"], "kich_hoat_xong",
                   "VIP GROUP — Tài khoản cổng khách hàng đã được kích hoạt",
                   f"Chào {acc['display_name']},\n\nTài khoản của bạn đã được kích hoạt.\n"
@@ -1110,15 +1041,14 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
             return 409, {"ma": "XUNG_DOT", "thongBao": f"Trạng thái {acc['status']} không từ chối được."}
         # Bị từ chối ⇒ GIẢI PHÓNG SĐT/email (chủ thật đăng ký lại được). Giữ dấu vết bằng
         # sha256 trong audit, không giữ giá trị gốc ở cột unique.
-        conn.execute("UPDATE customer_accounts SET status='tu_choi', phone_e164=?, email_norm=?, "
-                     "updated_at=? WHERE id=?",
-                     ("released:" + acc["id"], "released:" + acc["id"], db.now_iso(), acc["id"]))
+        conn.execute("UPDATE customer_accounts SET status='tu_choi', phone_e164=?, updated_at=? "
+                     "WHERE id=?", ("released:" + acc["id"], db.now_iso(), acc["id"]))
         conn.commit()
         thu_hoi_moi_phien(conn, acc["id"], "Bị từ chối")
         _ghi_audit(conn, "crm", "khach.tu_choi", target_id=subject,
                    detail={"reason": str(data.get("reason") or "")[:200],
                            "phoneSha256": security.sha256(acc["phone_e164"]),
-                           "emailSha256": security.sha256(acc["email_norm"]),
+                           "emailSha256": security.sha256(acc["email_norm"] or ""),
                            "phone": che_sdt(acc["phone_e164"])}, request=request)
         return 200, {"subject": subject, "status": "tu_choi"}
     return 400, {"ma": "DU_LIEU_SAI", "thongBao": "decision phải là approved hoặc rejected."}
@@ -1147,7 +1077,7 @@ def tam_khoa(conn, data: dict, request=None) -> tuple[int, dict]:
     if action == "mo_khoa":
         if acc["status"] == "tam_khoa":
             moi = ("hoat_dong" if acc["phone_verified_at"] and acc["crm_customer_id"]
-                   else ("cho_duyet" if acc["email_verified_at"] else "cho_xac_minh_email"))
+                   else "cho_duyet")
             conn.execute("UPDATE customer_accounts SET status=?, updated_at=? WHERE id=?",
                          (moi, now, acc["id"]))
             conn.commit()
@@ -1175,9 +1105,12 @@ def yeu_cau_khoi_phuc(conn, dinh_danh: str, ip: str, request=None) -> None:
         _ghi_audit(conn, "khach:anon", "khach.quen_mat_khau.qua_tan_suat", detail={"ip": ip},
                    request=request, lay_mau=ip)
         return
+    if not config.KHACH_EMAIL_ENABLED:
+        return
     em = chuan_hoa_email(dinh_danh)
-    if em:
-        acc = db.one(conn, "SELECT * FROM customer_accounts WHERE email_norm=?", (em,))
+    if em:  # email không unique: chỉ dùng khi đúng MỘT tài khoản mang email này
+        rows = db.q(conn, "SELECT * FROM customer_accounts WHERE email_norm=? LIMIT 2", (em,))
+        acc = rows[0] if len(rows) == 1 else None
     else:
         acc, _ = _tim_theo_dinh_danh(conn, dinh_danh)
     if not acc or acc["status"] not in ("hoat_dong", "cho_duyet"):
@@ -1195,6 +1128,32 @@ def yeu_cau_khoi_phuc(conn, dinh_danh: str, ip: str, request=None) -> None:
               f"{_link('/tai-khoan/dat-lai?t=' + raw)}" + _CHAN_THU)
     _ghi_audit(conn, acc["subject"], "khach.quen_mat_khau", target_id=acc["subject"],
                request=request, lay_mau=f"{ip}:{acc['id']}")
+
+
+def tao_link_dat_lai(conn, data: dict, request=None) -> tuple[int, dict]:
+    """CRM → VIP ID (HMAC): nhân viên đã xác nhận danh tính khách qua điện thoại, cấp link đặt lại
+    mật khẩu (một lần, chỉ lưu sha256, TTL 30 phút) để gửi khách qua Zalo. Link mới thay mọi link
+    đặt lại còn treo (chỉ nhân viên phát được nên không có nguy cơ kẻ lạ làm hỏng link của chủ)."""
+    subject = str(data.get("subject") or "")
+    nguoi = str(data.get("requested_by") or "").strip()
+    if not nguoi or len(nguoi) > 120:
+        return 400, {"ma": "DU_LIEU_SAI", "thongBao": "Thiếu/sai requested_by."}
+    acc = tai_khoan_theo_subject(conn, subject) if subject.startswith("cust:") else None
+    if not acc:
+        return 404, {"ma": "KHONG_TIM_THAY", "thongBao": "Không có tài khoản khách này."}
+    if acc["status"] not in ("hoat_dong", "cho_duyet"):
+        return 409, {"ma": "XUNG_DOT", "thongBao": f"Trạng thái {acc['status']} không cấp link được."}
+    now = _bay_gio()
+    conn.execute("UPDATE customer_tokens SET used_at=? WHERE account_id=? AND purpose='khoi_phuc' "
+                 "AND used_at IS NULL", (_iso(now), acc["id"]))
+    conn.commit()
+    raw = tao_token(conn, acc["id"], "khoi_phuc")
+    het = db.scalar(conn, "SELECT expires_at FROM customer_tokens WHERE token_hash=?",
+                    (security.sha256(raw),))
+    _ghi_audit(conn, "crm", "khach.tao_link_dat_lai", target_id=subject,
+               detail={"requested_by": nguoi, "tokenHash": security.sha256(raw)[:16],
+                       "expires_at": het}, request=request)
+    return 200, {"subject": subject, "url": _link("/tai-khoan/dat-lai?t=" + raw), "expires_at": het}
 
 
 def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,

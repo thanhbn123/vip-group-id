@@ -16,7 +16,6 @@
 <p class="kh-muted">Dùng số điện thoại đã xác minh hoặc mã khách hàng (ví dụ VG1001).</p>
 {% if request.query_params.get('da_thoat') %}<div class="kh-alert kh-alert-ok" role="status">Bạn đã đăng xuất.</div>{% endif %}
 {% include "khach/_loi.html" %}
-{% if chua_xac_minh %}<p><a href="/tai-khoan/gui-lai-xac-minh">Gửi lại email xác minh</a></p>{% endif %}
 <form method="post" action="/tai-khoan/dang-nhap" class="kh-form" autocomplete="on">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label class="kh-field"><span>Số điện thoại hoặc mã khách hàng</span>
