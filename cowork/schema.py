@@ -366,6 +366,7 @@ MODULES = [
     ("tools", "Công cụ", "Công cụ và quy trình được cấp", "/module/tools", "wrench", "workspace", 50, 1, 60),
     ("usage", "Sử dụng & chi phí", "Mức dùng AI và ngân sách", "/module/usage", "chart", "workspace", 60, 1, 40),
     ("approvals", "Phê duyệt", "Yêu cầu chờ người quyết định", "/module/approvals", "inbox", "workspace", 70, 1, 60),
+    ("crm", "CRM VIP GROUP", "Khách hàng, duyệt đăng ký, mã khách, kiện hàng, vận đơn", "/crm", "users", "workspace", 25, 0, 40),
     ("partner", "Cổng đối tác", "Không gian của đối tác theo hợp đồng", "/doi-tac", "handshake", "workspace", 80, 0, 20),
     ("accounts", "Tài khoản", "Tạo, khoá, đặt lại mật khẩu, thu hồi phiên", "/tai-khoan", "users", "admin", 110, 0, 80),
     ("departments", "Ban / Bộ phận", "Cơ cấu tổ chức và trưởng ban", "/ban", "building", "admin", 120, 0, 60),
@@ -382,6 +383,8 @@ PERMISSIONS = [
     ("dashboard", "view", "Xem bảng điều khiển"),
     ("brain", "view", "Thấy module VIP AI Brain"),
     ("brain", "use", "Mở và sử dụng VIP AI Brain"),
+    ("crm", "view", "Thấy module CRM"),
+    ("crm", "use", "Mở CRM nội bộ (SSO từ COWORK)"),
     ("tasks", "view", "Xem công việc"),
     ("tasks", "use", "Cập nhật công việc"),
     ("knowledge", "view", "Xem kho tri thức"),
@@ -418,7 +421,7 @@ PERMISSIONS = [
 
 ROLE_PERMISSIONS_MAC_DINH = {
     "admin": [
-        "dashboard.view", "brain.view", "brain.use",
+        "dashboard.view", "brain.view", "brain.use", "crm.view", "crm.use",
         "tasks.view", "tasks.use", "knowledge.view", "knowledge.use",
         "tools.view", "tools.use", "usage.view", "approvals.view", "approvals.use",
         "accounts.view", "accounts.create", "accounts.update", "accounts.suspend",

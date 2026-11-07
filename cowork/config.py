@@ -204,3 +204,16 @@ KHACH_DANGNHAP_URL = os.environ.get("COWORK_KHACH_DANGNHAP_URL", "").strip().rst
 #: Trống ⇒ mặc định CRM_PORTAL_PUBLIC_URL + "/portal".
 KHACH_TIEP_CHO_PHEP = [u.strip() for u in os.environ.get("COWORK_KHACH_TIEP_CHO_PHEP", "").split(",")
                        if u.strip()]
+
+# ═══════════ COWORK → CRM nội bộ (KIEN_TRUC_P1 §15.6 · branch feature/cowork-crm) ═══════════
+#: Người ghi: VIP ID Controller. Bí mật KHÔNG tự sinh — xem cowork/crm_launch.py.
+CRM_ENABLED = os.environ.get("COWORK_CRM_ENABLED", "1").strip() != "0"
+CRM_PUBLIC_URL = os.environ.get("COWORK_CRM_PUBLIC_URL", "https://crm.vipgroup.com.vn").strip()
+CRM_LAUNCH_PATH = "/api/auth/cowork/launch"
+CRM_LAUNCH_TTL = int(os.environ.get("COWORK_CRM_LAUNCH_TTL", "60"))
+CRM_LAUNCH_SECRET_FILE = _path("COWORK_CRM_LAUNCH_SECRET_FILE", DATA_DIR / "crm_launch_secret.key")
+#: "cowork_tenant=CRM_CODE,..." — tenant không có trong map thì không mở được CRM.
+CRM_TENANT_MAP = dict(
+    (a.strip(), b.strip()) for a, _, b in (
+        x.partition("=") for x in os.environ.get("COWORK_CRM_TENANT_MAP", "vip-group=VIP").split(","))
+    if a.strip() and b.strip())
