@@ -20,6 +20,7 @@ import logging
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta
@@ -37,6 +38,7 @@ PATH_SIGNUP = "/api/internal/portal/signups"
 PATH_THU_HOI = "/api/internal/portal/thu-hoi"
 COOKIE_PHIEN = "vg_khach"
 COOKIE_CSRF = "vg_khach_csrf"
+COOKIE_THIET_BI = "vg_khach_tb"
 COOKIE_PATH = "/tai-khoan"
 PORTAL_CODE_RE = re.compile(r"^VG\d{6}$")
 EMAIL_RE = re.compile(r"^[^@\s<>\"'(),;:\\]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -85,19 +87,33 @@ def _host_cua_url(url: str) -> str:
         return ""
 
 
+ENV_HOP_LE = {"local", "dev", "development", "test", "staging", "prod", "production"}
+
+
+def la_production() -> bool:
+    return config.ENV.strip().lower() in ("prod", "production")
+
+
 def kiem_cau_hinh() -> None:
     """Gọi lúc khởi động. Realm bật mà cấu hình không an toàn ⇒ RuntimeError (từ chối chạy)."""
     if not config.KHACH_ENABLED:
         return
     loi: list[str] = []
-    if config.ENV == "production" and config.KHACH_MAIL_TRANSPORT not in KENH_EMAIL_THAT:
+    env = config.ENV.strip().lower()
+    if env not in ENV_HOP_LE:
+        loi.append(f"COWORK_ENV={config.ENV!r} không hợp lệ (cho phép: {sorted(ENV_HOP_LE)}).")
+    if la_production() and config.KHACH_MAIL_TRANSPORT not in KENH_EMAIL_THAT:
         loi.append("A8: production chưa có kênh gửi email thật (COWORK_KHACH_MAIL_TRANSPORT="
                    f"{config.KHACH_MAIL_TRANSPORT!r}) — không được bật realm khách.")
     if not config.KHACH_HOSTS:
         loi.append("COWORK_KHACH_HOSTS rỗng.")
-    host_nv = {_host_cua_url(config.PUBLIC_URL), _host_cua_url(config.INTERNAL_URL)}
-    if any(h in host_nv for h in config.KHACH_HOSTS):
-        loi.append("COWORK_KHACH_HOSTS trùng host nhân viên (PUBLIC_URL/INTERNAL_URL).")
+    if not host_nhan_vien():
+        loi.append("Không xác định được host nhân viên (COWORK_STAFF_HOSTS).")
+    # So TÊN host (bỏ cổng): cookie không tách theo cổng.
+    ten_kh = {_ten_host(h) for h in host_khach()}
+    ten_nv = {_ten_host(h) for h in host_nhan_vien()}
+    if ten_kh & ten_nv:
+        loi.append("COWORK_KHACH_HOSTS trùng tên host nhân viên: " + ", ".join(sorted(ten_kh & ten_nv)))
     bi_mat = portal_secret()
     if len(bi_mat.encode("utf-8")) < 32:
         loi.append("VIPID_PORTAL_SECRET phải dài ít nhất 32 byte.")
@@ -106,7 +122,7 @@ def kiem_cau_hinh() -> None:
             os.environ.get("VIPID_SHARED_SECRET", ""), os.environ.get("COWORK_SHARED_SECRET", "")]
     if any(k and hmac.compare_digest(k, bi_mat) for k in khac):
         loi.append("VIPID_PORTAL_SECRET phải KHÁC mọi bí mật khác (Brain, phiên, hạ tầng).")
-    if config.ENV == "production":
+    if la_production():
         for ten, url in (("CRM_PORTAL_PUBLIC_URL", config.CRM_PORTAL_PUBLIC_URL),
                          ("COWORK_KHACH_PUBLIC_URL", config.KHACH_PUBLIC_URL)):
             if not url.startswith("https://"):
@@ -115,17 +131,149 @@ def kiem_cau_hinh() -> None:
         raise RuntimeError("Realm khách bị chặn: " + " | ".join(loi))
 
 
-def la_host_khach(host: str | None) -> bool:
+_HOST_RE = re.compile(r"^(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:\d{1,5})?$")
+
+
+def chuan_hoa_host(host: str | None) -> str | None:
+    """Chữ thường, bỏ dấu chấm cuối tên, cổng bỏ số 0 đầu. Sai cú pháp ⇒ None."""
     h = (host or "").strip().lower()
+    m = _HOST_RE.match(h)
+    if not m:
+        return None
+    ten = m.group(1)
+    if not ten.startswith("["):
+        ten = ten.rstrip(".")
+        if not ten or ".." in ten:
+            return None
+    cong = m.group(2)
+    if cong:
+        n = int(cong[1:])
+        if not 0 < n < 65536:
+            return None
+        return f"{ten}:{n}"
+    return ten
+
+
+_CO_CONG = re.compile(r"(^[^:\[]+|\]):\d+$")
+
+
+def _ten_host(h: str) -> str:
+    return h.rsplit(":", 1)[0] if _CO_CONG.search(h) else h
+
+
+def host_khach() -> list[str]:
+    return [x for x in (chuan_hoa_host(h) for h in config.KHACH_HOSTS) if x]
+
+
+def host_nhan_vien() -> list[str]:
+    ds = config.STAFF_HOSTS or [_host_cua_url(config.PUBLIC_URL), _host_cua_url(config.INTERNAL_URL)]
+    return [x for x in (chuan_hoa_host(h) for h in ds) if x]
+
+
+def _khop(h: str, ds: list[str]) -> bool:
+    # Mục có cổng ⇒ khớp đúng host:cổng; mục không cổng ⇒ khớp tên host với mọi cổng.
+    return any(h == e or (not _CO_CONG.search(e) and _ten_host(h) == e) for e in ds)
+
+
+def chon_realm(host: str | None) -> str | None:
+    """'khach' | 'staff' | None (Host lạ/thiếu/sai ⇒ không phục vụ)."""
+    h = chuan_hoa_host(host)
     if not h:
+        return None
+    if _khop(h, host_khach()):
+        return "khach"
+    if _khop(h, host_nhan_vien()):
+        return "staff"
+    return None
+
+
+def la_host_khach(host: str | None) -> bool:
+    return chon_realm(host) == "khach"
+
+
+# ------------------------------------------------------------------ scrypt realm khách
+_scrypt_sem = threading.BoundedSemaphore(max(1, config.KHACH_SCRYPT_DONG_THOI))
+_SALT_GIA_KHACH = b"vipid-khach-gia1"
+
+
+def _algo_moi() -> str:
+    return f"scrypt:n={2 ** config.KHACH_SCRYPT_LOG2_N},r=8,p=1"
+
+
+def _tham_so(algo: str | None) -> tuple[int, int, int]:
+    m = re.fullmatch(r"scrypt:n=(\d+),r=(\d+),p=(\d+)", algo or "")
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return 2 ** 14, 8, 1  # 'scrypt' cũ = tham số của security.bam_mat_khau
+
+
+def _scrypt(mat_khau: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    with _scrypt_sem:
+        return hashlib.scrypt(mat_khau.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32,
+                              maxmem=256 * 1024 * 1024)
+
+
+def bam_mk(mat_khau: str) -> tuple[str, str, str]:
+    algo = _algo_moi()
+    n, r, p = _tham_so(algo)
+    salt = secrets.token_bytes(16)
+    return (base64.b64encode(_scrypt(mat_khau, salt, n, r, p)).decode("ascii"),
+            base64.b64encode(salt).decode("ascii"), algo)
+
+
+def bam_gia(mat_khau: str) -> None:
+    n, r, p = _tham_so(_algo_moi())
+    _scrypt(mat_khau or "", _SALT_GIA_KHACH, n, r, p)
+
+
+def kiem_mk(mat_khau: str, acc: dict | None) -> bool:
+    if not acc or not acc.get("password_hash") or not acc.get("password_salt"):
+        bam_gia(mat_khau)
         return False
-    ten = h
-    if not h.startswith("[") and h.count(":") == 1:
-        ten = h.split(":", 1)[0]
-    for e in config.KHACH_HOSTS:
-        if h == e or (":" not in e and ten == e):
-            return True
-    return False
+    try:
+        n, r, p = _tham_so(acc.get("password_algo"))
+        d = _scrypt(mat_khau, base64.b64decode(acc["password_salt"]), n, r, p)
+        return hmac.compare_digest(base64.b64encode(d).decode("ascii"), acc["password_hash"])
+    except (ValueError, TypeError):
+        return False
+
+
+# ------------------------------------------------------------------ CSRF ký + thiết bị tin cậy
+def _ky(muc_dich: str, du_lieu: str) -> str:
+    return hmac.new(config.SECRET_KEY.encode("utf-8"), f"{muc_dich}.{du_lieu}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:40]
+
+
+def tao_csrf() -> str:
+    ng = security.token_moi(18)
+    return f"{ng}.{_ky('khach-csrf', ng)}"
+
+
+def csrf_hop_le(tok: str | None) -> bool:
+    if not tok or len(tok) > 120 or tok.count(".") != 1:
+        return False
+    ng, sig = tok.split(".")
+    return bool(ng) and hmac.compare_digest(_ky("khach-csrf", ng), sig)
+
+
+def tao_thiet_bi(account_id: str) -> str:
+    du = f"{account_id}.{int(time.time())}.{security.token_moi(9)}"
+    return f"{du}.{_ky('khach-thiet-bi', du)}"
+
+
+def thiet_bi_hop_le(raw: str | None, account_id: str) -> bool:
+    if not raw or len(raw) > 200:
+        return False
+    phan = raw.split(".")
+    if len(phan) != 4:
+        return False
+    du, sig = ".".join(phan[:3]), phan[3]
+    if not hmac.compare_digest(_ky("khach-thiet-bi", du), sig) or phan[0] != account_id:
+        return False
+    try:
+        return time.time() - int(phan[1]) <= config.KHACH_THIET_BI_NGAY * 86400
+    except ValueError:
+        return False
 
 
 # ------------------------------------------------------------------ tiện ích
@@ -199,7 +347,14 @@ def chuan_hoa_portal_code(raw: str | None) -> str | None:
 
 
 def _ghi_audit(conn, actor: str, action: str, *, target_id: str | None = None,
-               detail: dict | None = None, request=None) -> None:
+               detail: dict | None = None, request=None, lay_mau: str | None = None) -> None:
+    """`lay_mau`=khoá (vd IP): sự kiện thất bại/vô danh chỉ ghi tối đa 1 dòng/khoá/phút."""
+    if lay_mau is not None:
+        try:
+            if vuot_tan_suat(conn, "audit:" + action, lay_mau, 1, 60):
+                return
+        except Exception:  # noqa: BLE001
+            return
     try:
         audit.ghi(conn, actor or "khach:anon", action, target_type="customer",
                   target_id=target_id, detail=detail, request=request, tenant_id=TENANT)
@@ -249,12 +404,22 @@ _CHAN_THU = ("\n\n—\nCÔNG TY TNHH VIP GROUP\nEmail tự động, vui lòng kh
 
 
 # ------------------------------------------------------------------ token một lần
-def tao_token(conn, account_id: str, purpose: str) -> str:
+def so_token_con_hieu_luc(conn, account_id: str, purpose: str) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM customer_tokens WHERE account_id=? AND purpose=? AND used_at IS NULL "
+        "AND expires_at>?", (account_id, purpose, _iso(_bay_gio()))).fetchone()[0])
+
+
+def tao_token(conn, account_id: str, purpose: str) -> str | None:
+    """Phát token mới KHÔNG thu hồi token cũ (kẻ lạ yêu cầu hộ không làm hỏng link của chủ).
+
+    Đã có đủ KHACH_TOKEN_TOI_DA token còn hiệu lực ⇒ không phát thêm (trả None): mọi token
+    đều nằm trong hộp thư của chủ tài khoản nên chủ vẫn dùng được link đã nhận.
+    """
+    if so_token_con_hieu_luc(conn, account_id, purpose) >= config.KHACH_TOKEN_TOI_DA:
+        return None
     raw = security.token_moi(32)
     now = _bay_gio()
-    # Token mới vô hiệu mọi token cùng mục đích còn treo.
-    conn.execute("UPDATE customer_tokens SET used_at=? WHERE account_id=? AND purpose=? "
-                 "AND used_at IS NULL", (_iso(now), account_id, purpose))
     conn.execute(
         "INSERT INTO customer_tokens(id, token_hash, account_id, purpose, expires_at, created_at) "
         "VALUES(?,?,?,?,?,?)",
@@ -284,12 +449,19 @@ def tieu_token(conn, raw: str | None, purpose: str) -> str | None:
     conn.commit()
     if cur.rowcount != 1:
         return None
-    return db.scalar(conn, "SELECT account_id FROM customer_tokens WHERE token_hash=?", (h,))
+    acc_id = db.scalar(conn, "SELECT account_id FROM customer_tokens WHERE token_hash=?", (h,))
+    # Dùng thành công ⇒ vô hiệu mọi token cùng mục đích còn lại.
+    conn.execute("UPDATE customer_tokens SET used_at=? WHERE account_id=? AND purpose=? "
+                 "AND used_at IS NULL", (_iso(_bay_gio()), acc_id, purpose))
+    conn.commit()
+    return acc_id
 
 
 # ------------------------------------------------------------------ đăng ký
 def _gui_link_kich_hoat(conn, acc: dict) -> None:
     raw = tao_token(conn, acc["id"], "kich_hoat_email")
+    if not raw:
+        return
     gui_email(conn, acc["id"], acc["email_norm"], "kich_hoat_email",
               "VIP GROUP — Xác minh email đăng ký cổng khách hàng",
               f"Chào {acc['display_name']},\n\nBấm liên kết sau để xác minh email (hiệu lực "
@@ -319,7 +491,7 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
         raise KhachLoi("Bạn cần đồng ý với chính sách bảo mật và điều khoản sử dụng.")
     if vuot_tan_suat(conn, "dang_ky_ip", ip, config.KHACH_SIGNUP_IP_PER_HOUR, 3600):
         _ghi_audit(conn, "khach:anon", "khach.dang_ky.qua_tan_suat", detail={"ip": ip},
-                   request=request)
+                   request=request, lay_mau=ip)
         raise KhachLoi("Bạn đã gửi quá nhiều yêu cầu đăng ký. Vui lòng thử lại sau.", 429,
                        "QUA_TAN_SUAT")
 
@@ -337,19 +509,19 @@ def dang_ky(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_
         else:
             con_lai.append(acc)
     if con_lai:
-        _xu_ly_trung(conn, con_lai, em, mat_khau, request)
+        _xu_ly_trung(conn, con_lai, phone, em, mat_khau, ip, request)
         return
 
-    hash_b64, salt_b64 = security.bam_mat_khau(mat_khau)
+    hash_b64, salt_b64, algo = bam_mk(mat_khau)
     acc_id = "kh_" + _ngau_nhien_26()
     now = db.now_iso()
     try:
         conn.execute(
             "INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
             "password_hash, password_salt, password_algo, status, consent_at, token_version, "
-            "failed_attempts, created_at, updated_at) VALUES(?,?,?,?,?,?,?, 'scrypt', "
+            "failed_attempts, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?, "
             "'cho_xac_minh_email', ?, 1, 0, ?, ?)",
-            (acc_id, "cust:" + acc_id, phone, em, ten, hash_b64, salt_b64, now, now, now))
+            (acc_id, "cust:" + acc_id, phone, em, ten, hash_b64, salt_b64, algo, now, now, now))
         conn.commit()
     except sqlite3.IntegrityError:
         # Đua đăng ký cùng lúc: xử lý như trùng.
@@ -366,11 +538,25 @@ def _ngau_nhien_26() -> str:
     return "".join(secrets.choice(chu) for _ in range(26))
 
 
-def _xu_ly_trung(conn, trung: list[dict], email_moi: str, mat_khau: str, request) -> None:
-    security.bam_gia(mat_khau)  # cân bằng thời gian với nhánh tạo mới
+def _xu_ly_trung(conn, trung: list[dict], phone_moi: str, email_moi: str, mat_khau: str,
+                 ip: str, request) -> None:
+    bam_gia(mat_khau)  # cân bằng thời gian với nhánh tạo mới
     for acc in trung:
         _ghi_audit(conn, "khach:anon", "khach.dang_ky.trung", target_id=acc["subject"],
-                   request=request)
+                   request=request, lay_mau=f"{ip}:{acc['id']}")
+        # Chống "giữ chỗ SĐT": người khác (email khác) đăng ký cùng SĐT với tài khoản CHƯA được
+        # nhân viên xác minh SĐT ⇒ đánh dấu xung đột, báo CRM để nhân viên thấy khi gọi xác minh.
+        if (acc["phone_e164"] == phone_moi and acc["email_norm"] != email_moi
+                and acc["status"] in ("cho_xac_minh_email", "cho_duyet")):
+            conn.execute("UPDATE customer_accounts SET phone_conflict_count=phone_conflict_count+1, "
+                         "updated_at=? WHERE id=?", (db.now_iso(), acc["id"]))
+            conn.commit()
+            moi = tai_khoan(conn, acc["id"])
+            _ghi_audit(conn, "khach:anon", "khach.dang_ky.xung_dot_sdt", target_id=acc["subject"],
+                       detail={"lan": moi["phone_conflict_count"],
+                               "emailKhac": che_email(email_moi)}, request=request)
+            if moi["status"] == "cho_duyet":
+                _gui_signup(conn, moi)
         # Mỗi tài khoản nhận tối đa 1 email loại này / giờ (chống dùng form để spam).
         if vuot_tan_suat(conn, "thong_bao_trung", acc["id"], 1, 3600):
             continue
@@ -394,18 +580,20 @@ def gui_lai_xac_minh(conn, email: str, ip: str, request=None) -> None:
     acc = db.one(conn, "SELECT * FROM customer_accounts WHERE email_norm=?", (em,))
     if not acc or acc["status"] != "cho_xac_minh_email":
         return
-    if vuot_tan_suat(conn, "gui_lai_acc", acc["id"], 3, 3600):
+    if vuot_tan_suat(conn, "gui_lai_acc_ip", f"{acc['id']}:{ip}",
+                     config.KHACH_RESET_ACC_IP_PER_HOUR, 3600):
         return
     _gui_link_kich_hoat(conn, acc)
     _ghi_audit(conn, acc["subject"], "khach.gui_lai_xac_minh", target_id=acc["subject"],
-               request=request)
+               request=request, lay_mau=f"{ip}:{acc['id']}")
 
 
 def xac_minh_email(conn, raw: str | None, request=None) -> dict | None:
     """Tiêu token kích hoạt → `cho_duyet` + gửi signup sang CRM. Trả account hoặc None."""
     acc_id = tieu_token(conn, raw, "kich_hoat_email")
     if not acc_id:
-        _ghi_audit(conn, "khach:anon", "khach.xac_minh_email.token_sai", request=request)
+        _ghi_audit(conn, "khach:anon", "khach.xac_minh_email.token_sai", request=request,
+                   lay_mau=audit._ip(request) or "?")
         return None
     acc = tai_khoan(conn, acc_id)
     if not acc:
@@ -419,11 +607,20 @@ def xac_minh_email(conn, raw: str | None, request=None) -> dict | None:
         acc = tai_khoan(conn, acc_id)
         _ghi_audit(conn, acc["subject"], "khach.xac_minh_email", target_id=acc["subject"],
                    request=request)
-        xep_hang_crm(conn, "signup", "signup:" + acc["subject"], acc["subject"], PATH_SIGNUP, {
-            "subject": acc["subject"], "display_name": acc["display_name"],
-            "phone_e164": acc["phone_e164"], "email": acc["email_norm"],
-        })
+        _gui_signup(conn, acc)
     return acc
+
+
+def _gui_signup(conn, acc: dict) -> None:
+    """Signup sang CRM. Mỗi lần số xung đột SĐT tăng ⇒ một bản cập nhật mới (CRM upsert theo
+    subject) để nhân viên thấy `phone_conflict` trước khi gọi xác minh."""
+    n = int(acc.get("phone_conflict_count") or 0)
+    idem = "signup:" + acc["subject"] + (f":xung-dot-{n}" if n else "")
+    xep_hang_crm(conn, "signup", idem, acc["subject"], PATH_SIGNUP, {
+        "subject": acc["subject"], "display_name": acc["display_name"],
+        "phone_e164": acc["phone_e164"], "email": acc["email_norm"],
+        "phone_conflict": n > 0, "phone_conflict_count": n,
+    })
 
 
 # ------------------------------------------------------------------ đăng nhập
@@ -470,34 +667,36 @@ def thoi_gian_cho_lam_cham(conn, key: str) -> int:
     return max(0, int(cho - da_qua))
 
 
-def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None) -> dict:
-    """Trả account khi được phép đăng nhập. Ném KhachLoi/ChoDuyet nếu không."""
+def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None,
+              thiet_bi: str | None = None) -> dict:
+    """Trả account khi được phép đăng nhập. Ném KhachLoi/ChoDuyet nếu không.
+
+    Thứ tự (chống khoá ác ý, §11.6):
+      1. Khoá tạm theo cặp (tài khoản, IP) — trước khi kiểm mật khẩu.
+      2. Giới hạn theo IP — trước khi kiểm mật khẩu; MIỄN cho thiết bị tin cậy của đúng
+         tài khoản (cookie ký `vg_khach_tb`), để kẻ lạ chung NAT không chặn được chủ.
+      3. Kiểm mật khẩu.
+      4. Trên mọi IP cộng lại: CHỈ áp lên lượt SAI (429 + cảnh báo), không bao giờ chặn một
+         lượt đúng mật khẩu — kẻ lạ xoay IP không thể làm chủ tài khoản đăng nhập thất bại.
+    """
     w = config.KHACH_LOGIN_WINDOW_MIN
     mat_khau = mat_khau or ""
     acc, key = _tim_theo_dinh_danh(conn, dinh_danh)
     actor = acc["subject"] if acc else "khach:anon"
-    # 1) Giới hạn theo IP (mọi tài khoản).
-    if _dem_sai(conn, "ip=?", (ip,), w) >= config.KHACH_LOGIN_IP_MAX_FAIL:
-        security.bam_gia(mat_khau)
-        _ghi_audit(conn, actor, "khach.dang_nhap.chan_ip", detail={"ip": ip}, request=request)
+    tin_cay = bool(acc) and thiet_bi_hop_le(thiet_bi, acc["id"])
+    if _dem_sai(conn, "account_key=? AND ip=?", (key, ip), w) >= config.KHACH_LOGIN_MAX_FAIL:
+        bam_gia(mat_khau)
+        _ghi_audit(conn, actor, "khach.dang_nhap.khoa_cap_ip", detail={"ip": ip}, request=request,
+                   lay_mau=f"{ip}:{key}")
+        raise KhachLoi(THONG_BAO_TAM_KHOA.format(phut=config.KHACH_LOCK_MIN), 429, "TAM_KHOA")
+    if not tin_cay and _dem_sai(conn, "ip=?", (ip,), w) >= config.KHACH_LOGIN_IP_MAX_FAIL:
+        bam_gia(mat_khau)
+        _ghi_audit(conn, actor, "khach.dang_nhap.chan_ip", detail={"ip": ip}, request=request,
+                   lay_mau=ip)
         raise KhachLoi("Quá nhiều lần đăng nhập sai từ mạng của bạn. Vui lòng thử lại sau "
                        f"{w} phút.", 429, "QUA_TAN_SUAT")
-    # 2) Khoá tạm theo cặp (tài khoản, IP) — kẻ lạ ở IP khác không khoá được chủ tài khoản.
-    if _dem_sai(conn, "account_key=? AND ip=?", (key, ip), w) >= config.KHACH_LOGIN_MAX_FAIL:
-        security.bam_gia(mat_khau)
-        _ghi_audit(conn, actor, "khach.dang_nhap.khoa_cap_ip", detail={"ip": ip}, request=request)
-        raise KhachLoi(THONG_BAO_TAM_KHOA.format(phut=config.KHACH_LOCK_MIN), 429, "TAM_KHOA")
-    # 3) Mọi IP cộng lại: chỉ làm chậm dần (tối đa LAM_CHAM_TOI_DA_GIAY giây).
-    cho = thoi_gian_cho_lam_cham(conn, key)
-    if cho > 0:
-        security.bam_gia(mat_khau)
-        raise KhachLoi(f"Vui lòng đợi {cho} giây rồi thử lại.", 429, "LAM_CHAM")
 
-    hop_le = False
-    if acc:
-        hop_le = security.kiem_mat_khau(mat_khau, acc["password_hash"], acc["password_salt"])
-    else:
-        security.bam_gia(mat_khau)
+    hop_le = kiem_mk(mat_khau, acc)
     if not hop_le:
         _ghi_lan(conn, key, ip, False)
         if acc:
@@ -506,13 +705,17 @@ def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None) -> dic
             conn.commit()
         n_tk = _dem_sai(conn, "account_key=?", (key,), w)
         _ghi_audit(conn, actor, "khach.dang_nhap.sai", detail={"ip": ip, "lan": n_tk},
-                   request=request)
+                   request=request, lay_mau=f"{ip}:{key}")
         if n_tk == LAM_CHAM_SAU:
             # Sự kiện để cảnh báo: tài khoản bị dò từ nhiều nơi.
             _ghi_audit(conn, actor, "khach.canh_bao.do_mat_khau", detail={"lan": n_tk},
                        request=request)
             log.warning("CANH_BAO khach: tài khoản %s bị dò mật khẩu (%s lần/%s phút)",
                         actor, n_tk, w)
+        cho = thoi_gian_cho_lam_cham(conn, key)
+        if cho > 0:
+            raise KhachLoi(f"Thông tin đăng nhập không đúng. Vui lòng đợi {cho} giây rồi thử lại.",
+                           429, "LAM_CHAM")
         raise KhachLoi(THONG_BAO_SAI, 401, "SAI_THONG_TIN")
 
     # Mật khẩu đúng ⇒ có thể nói trạng thái cho chính chủ.
@@ -530,6 +733,10 @@ def dang_nhap(conn, dinh_danh: str, mat_khau: str, ip: str, request=None) -> dic
     conn.execute("DELETE FROM customer_login_attempts WHERE account_key=? AND ip=? AND success=0",
                  (key, ip))
     _ghi_lan(conn, key, ip, True)
+    if acc.get("password_algo") != _algo_moi():  # nâng tham số băm khi đăng nhập đúng
+        h, sa, al = bam_mk(mat_khau)
+        conn.execute("UPDATE customer_accounts SET password_hash=?, password_salt=?, "
+                     "password_algo=? WHERE id=?", (h, sa, al, acc["id"]))
     now = db.now_iso()
     conn.execute("UPDATE customer_accounts SET last_login_at=?, failed_attempts=0, "
                  "locked_until=NULL, updated_at=? WHERE id=?", (now, now, acc["id"]))
@@ -645,22 +852,35 @@ def url_launch(token: str) -> str:
 
 
 # ------------------------------------------------------------------ HMAC VIP ID ⇄ CRM
-def ky_portal(direction: str, body: bytes, ts: int | None = None) -> dict[str, str]:
+def chuoi_ky(direction: str, method: str, path: str, ts: str, body: bytes) -> bytes:
+    """Chuỗi ký chuẩn: "<direction>.<METHOD>.<path>.<ts>." + body (gắn chữ ký với đúng
+    phương thức và đường dẫn — chữ ký cho /thu-hoi không dùng được ở /tam-khoa)."""
+    return f"{direction}.{method.upper()}.{path}.{ts}.".encode("utf-8") + body
+
+
+def ky_portal(direction: str, method: str, path: str, body: bytes,
+              ts: int | None = None) -> dict[str, str]:
     t = str(int(time.time()) if ts is None else ts)
-    sig = hmac.new(portal_secret().encode("utf-8"), security._canonical(direction, t, body),
+    sig = hmac.new(portal_secret().encode("utf-8"), chuoi_ky(direction, method, path, t, body),
                    hashlib.sha256).hexdigest()
     return {"X-Portal-Ts": t, "X-Portal-Sig": sig}
 
 
-def xac_thuc_vao(conn, ts: str | None, sig: str | None, body: bytes) -> str:
+def xac_thuc_vao(conn, method: str, path: str, ts: str | None, sig: str | None,
+                 body: bytes) -> str:
     """HMAC chiều CRM → VIP ID, lệch ±300 giây, mỗi chữ ký chỉ dùng MỘT lần.
 
     Trả 'ok' | 'sai' (chữ ký sai/thiếu/hết hạn) | 'phat_lai' (đúng nhưng đã dùng).
     """
     sig = (sig or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", sig):
+    ts = (ts or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", sig) or not re.fullmatch(r"\d{1,12}", ts):
         return "sai"
-    if not security.xac_thuc_hmac(HUONG_VAO, ts, sig, body, secret=portal_secret(), cua_so=300):
+    if abs(time.time() - int(ts)) > 300:
+        return "sai"
+    mong = hmac.new(portal_secret().encode("utf-8"), chuoi_ky(HUONG_VAO, method, path, ts, body),
+                    hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mong, sig):
         return "sai"
     conn.execute("DELETE FROM customer_hmac_seen WHERE ts<?", (int(time.time()) - 900,))
     try:
@@ -669,7 +889,7 @@ def xac_thuc_vao(conn, ts: str | None, sig: str | None, body: bytes) -> str:
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
-        _ghi_audit(conn, "crm", "khach.hmac.phat_lai", detail={"sig": sig[:16]})
+        _ghi_audit(conn, "crm", "khach.hmac.phat_lai", detail={"sig": sig[:16]}, lay_mau="crm")
         return "phat_lai"
     return "ok"
 
@@ -702,7 +922,7 @@ def thu_gui(conn, row_id: int) -> bool:
         return bool(row)
     body = row["body"].encode("utf-8")
     headers = {"Content-Type": "application/json", "Idempotency-Key": row["idem_key"],
-               **ky_portal(HUONG_RA, body)}
+               **ky_portal(HUONG_RA, "POST", row["path"], body)}
     try:
         status, mo_ta = _http_post(config.CRM_PORTAL_INTERNAL_URL + row["path"], body, headers)
         ok = 200 <= status < 300 or status == 409  # 409 = CRM đã có (idempotent)
@@ -787,12 +1007,18 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
             return 200, {"subject": subject, "status": "tu_choi", "idempotent": True}
         if acc["status"] != "cho_duyet":
             return 409, {"ma": "XUNG_DOT", "thongBao": f"Trạng thái {acc['status']} không từ chối được."}
-        conn.execute("UPDATE customer_accounts SET status='tu_choi', updated_at=? WHERE id=?",
-                     (db.now_iso(), acc["id"]))
+        # Bị từ chối ⇒ GIẢI PHÓNG SĐT/email (chủ thật đăng ký lại được). Giữ dấu vết bằng
+        # sha256 trong audit, không giữ giá trị gốc ở cột unique.
+        conn.execute("UPDATE customer_accounts SET status='tu_choi', phone_e164=?, email_norm=?, "
+                     "updated_at=? WHERE id=?",
+                     ("released:" + acc["id"], "released:" + acc["id"], db.now_iso(), acc["id"]))
         conn.commit()
         thu_hoi_moi_phien(conn, acc["id"], "Bị từ chối")
         _ghi_audit(conn, "crm", "khach.tu_choi", target_id=subject,
-                   detail={"reason": str(data.get("reason") or "")[:200]}, request=request)
+                   detail={"reason": str(data.get("reason") or "")[:200],
+                           "phoneSha256": security.sha256(acc["phone_e164"]),
+                           "emailSha256": security.sha256(acc["email_norm"]),
+                           "phone": che_sdt(acc["phone_e164"])}, request=request)
         return 200, {"subject": subject, "status": "tu_choi"}
     return 400, {"ma": "DU_LIEU_SAI", "thongBao": "decision phải là approved hoặc rejected."}
 
@@ -806,6 +1032,8 @@ def tam_khoa(conn, data: dict, request=None) -> tuple[int, dict]:
     if not acc:
         return 404, {"ma": "KHONG_TIM_THAY", "thongBao": "Không có tài khoản khách này."}
     now = db.now_iso()
+    if acc["status"] == "tu_choi":
+        return 409, {"ma": "XUNG_DOT", "thongBao": "Tài khoản đã bị từ chối."}
     if action == "khoa":
         if acc["status"] != "tam_khoa":
             conn.execute("UPDATE customer_accounts SET status='tam_khoa', "
@@ -844,7 +1072,7 @@ def yeu_cau_khoi_phuc(conn, dinh_danh: str, ip: str, request=None) -> None:
     """Luôn im lặng. Nhận email, SĐT hoặc mã khách."""
     if vuot_tan_suat(conn, "quen_ip", ip, config.KHACH_FORGOT_IP_PER_HOUR, 3600):
         _ghi_audit(conn, "khach:anon", "khach.quen_mat_khau.qua_tan_suat", detail={"ip": ip},
-                   request=request)
+                   request=request, lay_mau=ip)
         return
     em = chuan_hoa_email(dinh_danh)
     if em:
@@ -853,16 +1081,19 @@ def yeu_cau_khoi_phuc(conn, dinh_danh: str, ip: str, request=None) -> None:
         acc, _ = _tim_theo_dinh_danh(conn, dinh_danh)
     if not acc or acc["status"] not in ("hoat_dong", "cho_duyet"):
         return
-    if vuot_tan_suat(conn, "quen_acc", acc["id"], 3, 3600):
+    if vuot_tan_suat(conn, "quen_acc_ip", f"{acc['id']}:{ip}",
+                     config.KHACH_RESET_ACC_IP_PER_HOUR, 3600):
         return
     raw = tao_token(conn, acc["id"], "khoi_phuc")
+    if not raw:
+        return
     gui_email(conn, acc["id"], acc["email_norm"], "khoi_phuc",
               "VIP GROUP — Đặt lại mật khẩu cổng khách hàng",
               f"Chào {acc['display_name']},\n\nBấm liên kết sau để đặt mật khẩu mới (hiệu lực "
               f"{config.KHACH_TOKEN_TTL_MIN} phút, dùng một lần):\n"
               f"{_link('/tai-khoan/dat-lai?t=' + raw)}" + _CHAN_THU)
     _ghi_audit(conn, acc["subject"], "khach.quen_mat_khau", target_id=acc["subject"],
-               request=request)
+               request=request, lay_mau=f"{ip}:{acc['id']}")
 
 
 def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
@@ -872,6 +1103,9 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
         raise KhachLoi("Liên kết đặt lại mật khẩu không hợp lệ, đã dùng hoặc đã hết hạn.", 400,
                        "TOKEN_SAI")
     acc = tai_khoan(conn, tk["account_id"])
+    if not acc or acc["status"] not in ("hoat_dong", "cho_duyet"):
+        raise KhachLoi("Tài khoản hiện không thể đặt lại mật khẩu. Vui lòng liên hệ VIP GROUP.",
+                       403, "KHONG_DUOC_PHEP")
     loi = security.kiem_tra_do_manh(mat_khau or "", (acc or {}).get("phone_e164", "")[3:],
                                     min_len=config.KHACH_PASSWORD_MIN)
     if loi:
@@ -882,11 +1116,11 @@ def dat_lai_mat_khau(conn, raw: str | None, mat_khau: str, mat_khau_2: str,
     if not acc_id or acc_id != tk["account_id"]:
         raise KhachLoi("Liên kết đặt lại mật khẩu không hợp lệ, đã dùng hoặc đã hết hạn.", 400,
                        "TOKEN_SAI")
-    hash_b64, salt_b64 = security.bam_mat_khau(mat_khau)
+    hash_b64, salt_b64, algo = bam_mk(mat_khau)
     now = db.now_iso()
-    conn.execute("UPDATE customer_accounts SET password_hash=?, password_salt=?, "
+    conn.execute("UPDATE customer_accounts SET password_hash=?, password_salt=?, password_algo=?, "
                  "token_version=token_version+1, failed_attempts=0, locked_until=NULL, "
-                 "updated_at=? WHERE id=?", (hash_b64, salt_b64, now, acc_id))
+                 "updated_at=? WHERE id=?", (hash_b64, salt_b64, algo, now, acc_id))
     conn.execute("UPDATE customer_tokens SET used_at=? WHERE account_id=? AND purpose='khoi_phuc' "
                  "AND used_at IS NULL", (now, acc_id))
     # Đặt lại thành công ⇒ xoá bộ đếm sai của tài khoản (mọi IP).

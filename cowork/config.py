@@ -67,7 +67,7 @@ BRAIN_LAUNCH_PATH = "/cowork/vao"
 BRAIN_REVOKE_PATH = "/api/cowork/thu-hoi"
 BRAIN_HEALTH_INTERNAL_PATH = "/api/cowork/suc-khoe"
 
-ENV = os.environ.get("COWORK_ENV", "local").strip() or "local"
+ENV = os.environ.get("COWORK_ENV", "local").strip().lower() or "local"
 
 #: Tin header proxy (X-Real-IP/X-Forwarded-For) — CHỈ bật khi chạy sau Caddy đã GHI ĐÈ.
 TIN_PROXY = os.environ.get("COWORK_TIN_PROXY", "0").strip() == "1"
@@ -78,17 +78,23 @@ def _secret(path: Path, env_name: str, size: int = 48) -> str:
     value = os.environ.get(env_name, "").strip()
     if value:
         return value
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_file():
         value = path.read_text(encoding="utf-8").strip()
         if value:
             return value
     value = secrets.token_urlsafe(size)
-    path.write_text(value + "\n", encoding="utf-8")
+    # Tạo NGUYÊN TỬ với quyền 0600 (không có khoảnh khắc tệp đọc được bởi người khác).
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Tiến trình khác vừa tạo: dùng giá trị của nó.
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+        fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(value + "\n")
     return value
 
 
@@ -112,8 +118,15 @@ def ensure_dirs() -> None:
 KHACH_ENABLED = os.environ.get("COWORK_KHACH_ENABLED", "0").strip() == "1"
 #: Host (có thể kèm cổng) phục vụ realm khách. Request tới host này CHỈ thấy /tai-khoan/*
 #: của khách và /api/internal/khach/*; mọi route nhân viên trả 404. Host khác thì ngược lại.
+#: Tên host khách và host nhân viên PHẢI khác nhau (không chỉ khác cổng): cookie không tách
+#: theo cổng. Mặc định dev: khach.localhost:8898.
 KHACH_HOSTS = [h.strip().lower() for h in os.environ.get(
-    "COWORK_KHACH_HOSTS", "khach.localhost:8898,127.0.0.1:8898").split(",") if h.strip()]
+    "COWORK_KHACH_HOSTS", "khach.localhost:8898").split(",") if h.strip()]
+#: Danh sách TRẮNG host nhân viên. Khi realm khách bật, Host không thuộc hai danh sách ⇒ 421
+#: (không bao giờ rơi về realm nhân viên). Bỏ trống ⇒ lấy host của PUBLIC_URL, INTERNAL_URL.
+#: Realm khách tắt và biến này không đặt ⇒ không kiểm Host (giữ hành vi cũ).
+STAFF_HOSTS_RAW = os.environ.get("COWORK_STAFF_HOSTS", "").strip()
+STAFF_HOSTS = [h.strip().lower() for h in STAFF_HOSTS_RAW.split(",") if h.strip()]
 #: URL công khai của realm khách — dùng để dựng link trong email.
 KHACH_PUBLIC_URL = os.environ.get("COWORK_KHACH_PUBLIC_URL",
                                   "http://khach.localhost:8898").rstrip("/")
@@ -142,3 +155,11 @@ KHACH_FORGOT_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_FORGOT_IP_PER_HOUR",
 #: Đăng ký chưa xác minh email quá hạn này thì bị giải phóng khi có người đăng ký trùng
 #: (chống "giữ chỗ" SĐT/email của người khác bằng tài khoản không bao giờ xác minh).
 KHACH_UNVERIFIED_TTL_HOURS = int(os.environ.get("COWORK_KHACH_UNVERIFIED_TTL_HOURS", "48"))
+#: scrypt riêng cho realm khách (mạnh hơn nhân viên). Tham số lưu trong password_algo nên
+#: hash cũ vẫn xác minh được. Giới hạn số lượt băm đồng thời để chặn DoS bộ nhớ (128 MiB/lượt).
+KHACH_SCRYPT_LOG2_N = int(os.environ.get("COWORK_KHACH_SCRYPT_LOG2_N", "17"))
+KHACH_SCRYPT_DONG_THOI = int(os.environ.get("COWORK_KHACH_SCRYPT_DONG_THOI", "2"))
+#: Cookie thiết bị tin cậy (đặt sau lần đăng nhập đúng), số ngày hiệu lực.
+KHACH_THIET_BI_NGAY = int(os.environ.get("COWORK_KHACH_THIET_BI_NGAY", "180"))
+KHACH_RESET_ACC_IP_PER_HOUR = int(os.environ.get("COWORK_KHACH_RESET_ACC_IP_PER_HOUR", "3"))
+KHACH_TOKEN_TOI_DA = 3

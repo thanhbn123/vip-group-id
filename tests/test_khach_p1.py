@@ -52,6 +52,7 @@ def crm(monkeypatch):
 def bat(monkeypatch):
     monkeypatch.setattr(config, "KHACH_ENABLED", True)
     monkeypatch.setattr(config, "KHACH_HOSTS", ["khach.localhost:8898", "khach.localhost"])
+    monkeypatch.setattr(config, "STAFF_HOSTS", ["testserver"])
     monkeypatch.setattr(config, "CRM_PORTAL_PUBLIC_URL", "http://crm.localhost:8897")
     monkeypatch.setattr(config, "CRM_PORTAL_INTERNAL_URL", "http://127.0.0.1:8897")
     monkeypatch.setattr(config, "KHACH_PUBLIC_URL", HOST_KHACH)
@@ -123,18 +124,18 @@ def acc_theo_sdt(phone: str) -> dict | None:
 _lech = [0]
 
 
-def ky_vao(body: bytes, ts: int | None = None) -> dict:
+def ky_vao(path: str, body: bytes, ts: int | None = None, method: str = "POST") -> dict:
     # Mỗi lần ký một ts khác (CRM thật cũng ký lại mỗi lần gửi); cùng (ts, body) = phát lại.
     if ts is None:
         _lech[0] = (_lech[0] + 1) % 250
         ts = int(time.time()) - _lech[0]
-    h = khach.ky_portal(khach.HUONG_VAO, body, ts)
+    h = khach.ky_portal(khach.HUONG_VAO, method, path, body, ts)
     return {**h, "Content-Type": "application/json"}
 
 
 def goi_noi_bo(c: TestClient, path: str, payload: dict, ts: int | None = None, headers=None):
     body = json.dumps(payload).encode()
-    return c.post(path, content=body, headers=headers or ky_vao(body, ts))
+    return c.post(path, content=body, headers=headers or ky_vao(path, body, ts))
 
 
 def duyet(c: TestClient, subject: str, n: int = 1, **extra):
@@ -230,7 +231,7 @@ def test_csp_chat_va_khong_inline_script(kh):
     csp = r.headers["content-security-policy"]
     assert "script-src 'none'" in csp and "unsafe-inline" not in csp
     assert "form-action 'self' http://crm.localhost:8897" in csp
-    assert r.headers["referrer-policy"] == "no-referrer"
+    assert r.headers["referrer-policy"] == "same-origin"
     assert "<script" not in r.text and "style=" not in r.text
 
 
@@ -332,12 +333,14 @@ def test_token_email_mot_lan_va_het_han(kh, crm):
     goi = crm.goi[-1]
     assert goi["url"] == "http://127.0.0.1:8897/api/internal/portal/signups"
     assert goi["body"] == {"subject": acc["subject"], "display_name": "Khách Thử 1",
-                           "phone_e164": "+84900000001", "email": "khach1@example.test"}
+                           "phone_e164": "+84900000001", "email": "khach1@example.test",
+                           "phone_conflict": False, "phone_conflict_count": 0}
     assert goi["headers"]["Idempotency-Key"] == "signup:" + acc["subject"]
-    from cowork import security
-    assert security.xac_thuc_hmac("vipid->crm", goi["headers"]["X-Portal-Ts"],
-                                  goi["headers"]["X-Portal-Sig"], goi["raw"],
-                                  secret=khach.portal_secret())
+    ts = goi["headers"]["X-Portal-Ts"]
+    mong = hmac.new(khach.portal_secret().encode(),
+                    f"vipid->crm.POST./api/internal/portal/signups.{ts}.".encode() + goi["raw"],
+                    hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(mong, goi["headers"]["X-Portal-Sig"])
     # Dùng lại ⇒ không hợp lệ (cả GET lẫn POST).
     assert kh.get(f"/tai-khoan/xac-minh-email?t={t}").status_code == 400
     csrf = _csrf(kh, "/tai-khoan/dang-nhap")
@@ -419,8 +422,9 @@ def test_tu_choi_va_tam_khoa_khong_dang_nhap(kh):
                     {"subject": acc["subject"], "decision": "rejected"})
     assert r2.status_code == 200 and r2.json()["data"]["idempotent"] is True
     assert duyet(kh, acc["subject"]).status_code == 409
+    # Bị từ chối ⇒ SĐT đã được giải phóng: đăng nhập chỉ nhận thông báo chung.
     r = dang_nhap(kh, "0900000001")
-    assert r.status_code == 403 and "launch" not in r.headers.get("location", "")
+    assert r.status_code == 401 and "launch" not in r.headers.get("location", "")
 
     acc2 = tao_khach_hoat_dong(kh, 2)
     assert token_launch(dang_nhap(kh, "VG000002"))
@@ -503,15 +507,15 @@ def test_ke_la_nhieu_ip_khong_khoa_duoc_chu_tai_khoan(kh, monkeypatch):
     conn = db.connect()
     try:
         cho = khach.thoi_gian_cho_lam_cham(conn, acc_theo_sdt("+84900000001")["id"])
-        assert 0 < cho <= khach.LAM_CHAM_TOI_DA_GIAY  # chỉ làm chậm, không khoá dài
+        assert 0 < cho <= khach.LAM_CHAM_TOI_DA_GIAY  # chỉ làm chậm lượt SAI, không khoá dài
         assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE tenant_id='khach' "
                          "AND action='khach.canh_bao.do_mat_khau'") == 1
-        # Giả lập đã qua thời gian làm chậm.
-        conn.execute("UPDATE customer_login_attempts SET created_at=? WHERE success=0",
-                     (khach._truoc(seconds=khach.LAM_CHAM_TOI_DA_GIAY + 1),))
-        conn.commit()
     finally:
         conn.close()
+    # Lượt sai tiếp theo bị làm chậm (429) ...
+    r = dang_nhap(kh, "0900000001", "Sai!Passw0rd-12", headers={"x-real-ip": "203.0.113.77"})
+    assert r.status_code == 429
+    # ... nhưng chủ tài khoản đúng mật khẩu đăng nhập được NGAY, không phải chờ.
     token_launch(dang_nhap(kh, "0900000001", MK, headers={"x-real-ip": "198.51.100.7"}))
 
 
@@ -528,9 +532,8 @@ def test_gioi_han_theo_ip(kh, monkeypatch):
 
 def test_bam_gia_khi_khong_co_tai_khoan(kh, monkeypatch):
     goi = []
-    from cowork import security
-    orig = security.bam_gia
-    monkeypatch.setattr(security, "bam_gia", lambda mk: (goi.append(1), orig(mk)))
+    orig = khach.bam_gia
+    monkeypatch.setattr(khach, "bam_gia", lambda mk: (goi.append(1), orig(mk)))
     r = dang_nhap(kh, "0900000008", "Sai!Passw0rd-12")
     assert r.status_code == 401 and khach.THONG_BAO_SAI in r.text and goi
 
@@ -542,14 +545,17 @@ def test_hmac_tu_choi_chu_ky_sai_cu_va_phat_lai(kh):
     body = json.dumps({"subject": acc["subject"], "action": "khoa"}).encode()
     # Thiếu chữ ký / chữ ký sai / sai chiều.
     assert kh.post(path, content=body).status_code == 401
-    h = ky_vao(body)
+    h = ky_vao(path, body)
     assert kh.post(path, content=body, headers={**h, "X-Portal-Sig": "0" * 64}).status_code == 401
-    sai_chieu = khach.ky_portal(khach.HUONG_RA, body)
+    sai_chieu = khach.ky_portal(khach.HUONG_RA, "POST", path, body)
     assert kh.post(path, content=body, headers=sai_chieu).status_code == 401
     # Sửa body sau khi ký.
     assert kh.post(path, content=body.replace(b"khoa", b"mo_khoa"), headers=h).status_code == 401
     # Cũ quá 300 giây.
-    assert kh.post(path, content=body, headers=ky_vao(body, int(time.time()) - 301)).status_code == 401
+    assert kh.post(path, content=body, headers=ky_vao(path, body, int(time.time()) - 301)).status_code == 401
+    # ts không phải số thuần ("+N") ⇒ từ chối.
+    hp = ky_vao(path, body)
+    assert kh.post(path, content=body, headers={**hp, "X-Portal-Ts": "+" + hp["X-Portal-Ts"]}).status_code == 401
     assert acc_theo_sdt("+84900000001")["status"] == "hoat_dong"
     # Hợp lệ một lần, phát lại bị chặn.
     assert kh.post(path, content=body, headers=h).status_code == 200
@@ -778,8 +784,8 @@ def test_kiem_cau_hinh(monkeypatch, bat):
     with pytest.raises(RuntimeError, match="32 byte"):
         khach.kiem_cau_hinh()
     monkeypatch.setattr(khach, "_bi_mat_cache", None)
-    monkeypatch.setattr(config, "KHACH_HOSTS", ["127.0.0.1:8899"])
-    with pytest.raises(RuntimeError, match="trùng host nhân viên"):
+    monkeypatch.setattr(config, "KHACH_HOSTS", ["testserver:8898"])  # khác cổng vẫn là trùng
+    with pytest.raises(RuntimeError, match="trùng tên host"):
         khach.kiem_cau_hinh()
     monkeypatch.setattr(config, "KHACH_ENABLED", False)
     monkeypatch.setattr(config, "ENV", "production")
@@ -877,3 +883,303 @@ def test_ten_danh_rieng_khach_tren_host_nhan_vien(client, bat, crm, owner):
         assert db.scalar(conn, "SELECT COUNT(*) FROM users WHERE id='dang-nhap'") == 0
     finally:
         conn.close()
+
+
+# ================================================================== rà soát bảo mật (vòng 2)
+def _doi_thoi_gian(giay: int) -> None:
+    from datetime import datetime, timedelta
+    conn = db.connect()
+    try:
+        for r in conn.execute("SELECT id, created_at FROM customer_login_attempts").fetchall():
+            conn.execute("UPDATE customer_login_attempts SET created_at=? WHERE id=?",
+                         ((datetime.fromisoformat(r[1]) - timedelta(seconds=giay)).isoformat(), r[0]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("co_thiet_bi", [False, True])
+def test_p1_1_ke_xoay_ip_khong_lam_chu_dang_nhap_that_bai(kh, monkeypatch, co_thiet_bi):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    chu = TestClient(app, base_url=HOST_KHACH)
+    if co_thiet_bi:
+        token_launch(dang_nhap(chu, "0900000001", MK, headers={"x-real-ip": "1.2.3.4"}))
+        assert chu.cookies.get("vg_khach_tb")
+    ke = TestClient(app, base_url=HOST_KHACH)
+    for i in range(10):
+        dang_nhap(ke, "0900000001", "Sai!Passw0rd-xx", headers={"x-real-ip": f"10.0.0.{i}"})
+    for chu_ky in range(12):  # kẻ tấn công luôn bắn trước chủ trong mỗi chu kỳ
+        _doi_thoi_gian(31)
+        dang_nhap(ke, "0900000001", "Sai!Passw0rd-xx", headers={"x-real-ip": f"10.1.{chu_ky}.1"})
+        token_launch(dang_nhap(chu, "0900000001", MK, headers={"x-real-ip": "1.2.3.4"}))
+
+
+def test_p1_1_cookie_thiet_bi_mien_gioi_han_ip_nhung_khong_mien_khoa_cap(kh, monkeypatch):
+    _ip(monkeypatch)
+    monkeypatch.setattr(config, "KHACH_LOGIN_IP_MAX_FAIL", 4)
+    acc = tao_khach_hoat_dong(kh, 1)
+    tao_khach_hoat_dong(kh, 2)
+    nat = {"x-real-ip": "203.0.113.200"}  # chủ và kẻ lạ dùng chung NAT
+    token_launch(dang_nhap(kh, "0900000001", MK, headers=nat))
+    tb = kh.cookies.get("vg_khach_tb")
+    assert khach.thiet_bi_hop_le(tb, acc["id"])
+    ke = TestClient(app, base_url=HOST_KHACH)
+    for n in range(4):  # rải mật khẩu nhiều tài khoản từ cùng NAT ⇒ IP bị chặn
+        dang_nhap(ke, f"090000002{n}", "Sai!Passw0rd-xx", headers=nat)
+    assert dang_nhap(ke, "0900000002", MK, headers=nat).status_code == 429
+    # Chủ có cookie thiết bị của ĐÚNG tài khoản ⇒ vẫn vào được.
+    token_launch(dang_nhap(kh, "0900000001", MK, headers=nat))
+    # Cookie thiết bị của tài khoản 1 không miễn cho tài khoản 2; cookie giả cũng không.
+    lạ = TestClient(app, base_url=HOST_KHACH)
+    lạ.cookies.set("vg_khach_tb", tb, domain="khach.localhost", path="/tai-khoan")
+    assert dang_nhap(lạ, "0900000002", MK, headers=nat).status_code == 429
+    gia = tb.rsplit(".", 1)[0] + "." + "0" * 40
+    assert not khach.thiet_bi_hop_le(gia, acc["id"])
+    # Khoá theo cặp (tài khoản, IP) vẫn áp cho thiết bị tin cậy.
+    monkeypatch.setattr(config, "KHACH_LOGIN_IP_MAX_FAIL", 1000)
+    for _ in range(config.KHACH_LOGIN_MAX_FAIL):
+        dang_nhap(kh, "0900000001", "Sai!Passw0rd-xx", headers={"x-real-ip": "198.51.100.1"})
+    assert dang_nhap(kh, "0900000001", MK, headers={"x-real-ip": "198.51.100.1"}).status_code == 429
+
+
+def _quen(c, dd, ip):
+    return c.post("/tai-khoan/quen-mat-khau", data={"dinh_danh": dd,
+                  "_csrf": _csrf(c, "/tai-khoan/quen-mat-khau")}, headers={"x-real-ip": ip})
+
+
+def test_p1_2_ke_la_khong_chan_duoc_khoi_phuc(kh, monkeypatch):
+    _ip(monkeypatch)
+    tao_khach_hoat_dong(kh, 1)
+    _quen(kh, "0900000001", "1.2.3.4")  # chủ yêu cầu
+    t_chu = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    for i in range(8):  # kẻ lạ yêu cầu hộ từ nhiều IP
+        _quen(kh, ["0900000001", "VG000001", "khach1@example.test"][i % 3], f"10.9.9.{i}")
+    mails = outbox("khoi_phuc")
+    assert len(mails) == config.KHACH_TOKEN_TOI_DA  # tối đa 3 link còn hiệu lực cùng lúc
+    assert all(m["to_email"] == "khach1@example.test" for m in mails)
+    # Link của chủ vẫn dùng được.
+    assert kh.get(f"/tai-khoan/dat-lai?t={t_chu}").status_code == 200
+    csrf = _csrf(kh, f"/tai-khoan/dat-lai?t={t_chu}")
+    r = kh.post("/tai-khoan/dat-lai", data={"t": t_chu, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI,
+                                           "_csrf": csrf})
+    assert r.status_code == 200
+    # Dùng một link ⇒ mọi link khác vô hiệu.
+    for m in mails[1:]:
+        assert kh.get(f"/tai-khoan/dat-lai?t={token_tu(m['body_text'], '/tai-khoan/dat-lai')}"
+                      ).status_code == 400
+    # Giới hạn theo (tài khoản, IP): cùng IP chỉ 3 lần/giờ.
+    conn = db.connect()
+    try:
+        n = db.scalar(conn, "SELECT COUNT(*) FROM customer_rate_events WHERE bucket='quen_acc_ip'")
+        assert n >= 3
+    finally:
+        conn.close()
+
+
+def test_p1_2_gui_lai_xac_minh_khong_thu_hoi_link_cu(kh, monkeypatch):
+    _ip(monkeypatch)
+    dang_ky(kh, 1)
+    t_dau = token_tu(outbox("kich_hoat_email")[-1]["body_text"], "/tai-khoan/xac-minh-email")
+    for i in range(6):
+        kh.post("/tai-khoan/gui-lai-xac-minh", data={"email": "khach1@example.test",
+                "_csrf": _csrf(kh, "/tai-khoan/gui-lai-xac-minh")}, headers={"x-real-ip": f"10.8.0.{i}"})
+    assert len(outbox("kich_hoat_email")) == config.KHACH_TOKEN_TOI_DA
+    assert xac_minh(kh, t_dau).status_code == 200
+    assert acc_theo_sdt("+84900000001")["status"] == "cho_duyet"
+
+
+def test_p1_3_xung_dot_sdt_bao_crm_va_tu_choi_giai_phong(kh, crm):
+    # Kẻ giữ chỗ đăng ký SĐT của nạn nhân bằng email của mình và xác minh email.
+    dang_ky(kh, 5, email="ke-gia@example.test")
+    xac_minh(kh, token_tu(outbox("kich_hoat_email", "ke-gia@example.test")[-1]["body_text"],
+                          "/tai-khoan/xac-minh-email"))
+    ke = acc_theo_sdt("+84900000005")
+    assert crm.goi[-1]["body"]["phone_conflict"] is False
+    # Chủ thật đăng ký cùng SĐT.
+    chu = TestClient(app, base_url=HOST_KHACH)
+    assert dang_ky(chu, 5, email="chu-that@example.test").status_code == 303
+    goi = crm.goi[-1]
+    assert goi["body"]["subject"] == ke["subject"]
+    assert goi["body"]["phone_conflict"] is True and goi["body"]["phone_conflict_count"] == 1
+    assert goi["headers"]["Idempotency-Key"] == f"signup:{ke['subject']}:xung-dot-1"
+    conn = db.connect()
+    try:
+        assert db.scalar(conn, "SELECT COUNT(*) FROM audit_log WHERE "
+                         "action='khach.dang_ky.xung_dot_sdt' AND target_id=?", (ke["subject"],)) == 1
+    finally:
+        conn.close()
+    # Nhân viên gọi điện, phát hiện sai ⇒ từ chối ⇒ SĐT/email được giải phóng.
+    r = goi_noi_bo(kh, "/api/internal/khach/ket-qua-duyet",
+                   {"subject": ke["subject"], "decision": "rejected", "reason": "sai chủ"})
+    assert r.status_code == 200
+    assert acc_theo_sdt("+84900000005") is None
+    conn = db.connect()
+    try:
+        a = db.one(conn, "SELECT * FROM customer_accounts WHERE id=?", (ke["id"],))
+        assert a["status"] == "tu_choi" and a["phone_e164"].startswith("released:")
+        det = db.scalar(conn, "SELECT detail FROM audit_log WHERE action='khach.tu_choi'")
+        assert hashlib.sha256(b"+84900000005").hexdigest() in det
+    finally:
+        conn.close()
+    chu2 = TestClient(app, base_url=HOST_KHACH)
+    assert dang_ky(chu2, 5, email="chu-that@example.test").status_code == 303
+    moi = acc_theo_sdt("+84900000005")
+    assert moi and moi["email_norm"] == "chu-that@example.test" and moi["id"] != ke["id"]
+    # Kẻ giữ chỗ cũng đăng ký lại được bằng email của mình (email đã giải phóng) — không lỗi.
+    assert dang_ky(chu2, 6, email="ke-gia@example.test").status_code == 303
+
+
+def test_p1_4_host_la_khong_roi_ve_nhan_vien(client, bat, crm):
+    for h, mong in [("KHACH.LOCALHOST:8898", "khach"), ("khach.localhost.:8898", "khach"),
+                    ("khach.localhost:08898", "khach"), ("khach.localhost", "khach"),
+                    ("TESTSERVER", "staff"), ("testserver.", "staff"),
+                    ("evil.example", None), ("localhost:8898", None), ("", None),
+                    ("khach.localhost:8898 x", None), ("a..b", None), ("khach.localhost:70000", None)]:
+        assert khach.chon_realm(h) == mong, h
+    for h in ("evil.example", "127.0.0.1:8899", "localhost"):
+        r = client.get("/dang-nhap", headers={"host": h})
+        assert r.status_code == 421 and "COWORK" not in r.text, h
+    assert client.get("/dang-nhap", headers={"host": "khach.localhost.:8898"}).status_code == 404
+    assert client.get("/dang-nhap").status_code == 200  # host nhân viên hợp lệ
+    # Thiếu Host (HTTP/1.0) ⇒ 421.
+    import asyncio
+    sent = []
+
+    async def _recv():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _send(m):
+        sent.append(m)
+    scope = {"type": "http", "method": "GET", "path": "/dang-nhap", "raw_path": b"/dang-nhap",
+             "query_string": b"", "headers": [], "http_version": "1.0", "scheme": "http",
+             "server": ("127.0.0.1", 8899), "client": ("127.0.0.1", 1), "root_path": ""}
+    asyncio.run(app(scope, _recv, _send))
+    assert sent[0]["status"] == 421
+
+
+def test_p1_4_tat_realm_khong_kiem_host(client):
+    assert config.KHACH_ENABLED is False and not config.STAFF_HOSTS
+    assert client.get("/dang-nhap", headers={"host": "bat-ky.example"}).status_code == 200
+
+
+def test_p2_6_env_chuan_hoa(monkeypatch, bat):
+    monkeypatch.setattr(config, "ENV", "PROD ")
+    assert khach.la_production()
+    with pytest.raises(RuntimeError, match="A8"):
+        khach.kiem_cau_hinh()
+    monkeypatch.setattr(config, "ENV", "prodution")
+    with pytest.raises(RuntimeError, match="không hợp lệ"):
+        khach.kiem_cau_hinh()
+
+
+def test_p2_7_chu_ky_gan_phuong_thuc_va_duong_dan(kh):
+    acc = tao_khach_hoat_dong(kh, 1)
+    body = json.dumps({"subject": acc["subject"], "action": "khoa", "reason": "x"}).encode()
+    h = ky_vao("/api/internal/khach/thu-hoi", body)
+    assert kh.post("/api/internal/khach/tam-khoa", content=body, headers=h).status_code == 401
+    h = ky_vao("/api/internal/khach/tam-khoa", body, method="PUT")
+    assert kh.post("/api/internal/khach/tam-khoa", content=body, headers=h).status_code == 401
+    assert acc_theo_sdt("+84900000001")["status"] == "hoat_dong"
+    h = ky_vao("/api/internal/khach/tam-khoa", body)
+    assert kh.post("/api/internal/khach/tam-khoa", content=body, headers=h).status_code == 200
+
+
+def test_p2_8_audit_chu_ky_sai_lay_mau(kh):
+    conn = db.connect()
+    try:
+        n0 = db.scalar(conn, "SELECT COUNT(*) FROM audit_log")
+    finally:
+        conn.close()
+    for _ in range(20):
+        kh.post("/api/internal/khach/tam-khoa", content=b"{}",
+                headers={"X-Portal-Ts": "1", "X-Portal-Sig": "0" * 64})
+        dang_nhap(kh, "0900000009", "Sai!Passw0rd-xx")
+    conn = db.connect()
+    try:
+        dem = dict(conn.execute("SELECT action, COUNT(*) FROM audit_log WHERE id>? "
+                                "GROUP BY action", (n0,)).fetchall())
+    finally:
+        conn.close()
+    # 40 lượt thất bại (20 chữ ký sai, 20 đăng nhập sai rồi bị khoá cặp) ⇒ 1 dòng mỗi loại.
+    assert dem == {"khach.hmac.sai": 1, "khach.dang_nhap.sai": 1,
+                   "khach.dang_nhap.khoa_cap_ip": 1}
+
+
+def test_p2_9_gioi_han_body_truoc_khi_doc(kh):
+    path = "/api/internal/khach/tam-khoa"
+    lon = b"{" + b" " * 20_000 + b"}"
+    r = kh.post(path, content=lon, headers=ky_vao(path, lon))
+    assert r.status_code == 413
+    r = kh.post(path, content=b"{}", headers={"content-length": "999999", **ky_vao(path, b"{}")})
+    assert r.status_code == 413
+
+    def _gen():
+        yield b"{}"
+    r = kh.post(path, content=_gen(), headers=ky_vao(path, b"{}"))  # chunked, không có CL
+    assert r.status_code == 413
+
+
+def test_p2_10_csrf_phai_co_chu_ky_may_chu(kh):
+    kh.cookies.set("vg_khach_csrf", "A" * 32, domain="khach.localhost", path="/tai-khoan")
+    r = kh.post("/tai-khoan/gui-lai-xac-minh", data={"email": "x@example.test", "_csrf": "A" * 32})
+    assert r.status_code == 403
+    tok = khach.tao_csrf()
+    assert khach.csrf_hop_le(tok) and not khach.csrf_hop_le(tok[:-1] + "0")
+    kh.cookies.set("vg_khach_csrf", tok, domain="khach.localhost", path="/tai-khoan")
+    r = kh.post("/tai-khoan/gui-lai-xac-minh", data={"email": "x@example.test", "_csrf": tok},
+                follow_redirects=False)
+    assert r.status_code == 303
+    for origin in ("null", "https://evil.example"):
+        r = kh.post("/tai-khoan/gui-lai-xac-minh", data={"email": "x@example.test", "_csrf": tok},
+                    headers={"origin": origin})
+        assert r.status_code == 403, origin
+
+
+def test_p2_11_dat_lai_khi_bi_khoa_bi_tu_choi(kh):
+    acc = tao_khach_hoat_dong(kh, 1)
+    _quen(kh, "0900000001", "1.1.1.1")
+    t = token_tu(outbox("khoi_phuc")[-1]["body_text"], "/tai-khoan/dat-lai")
+    assert goi_noi_bo(kh, "/api/internal/khach/tam-khoa",
+                      {"subject": acc["subject"], "action": "khoa"}).status_code == 200
+    csrf = _csrf(kh, "/tai-khoan/dang-nhap")
+    r = kh.post("/tai-khoan/dat-lai", data={"t": t, "mat_khau": MK_MOI, "mat_khau_2": MK_MOI,
+                                           "_csrf": csrf})
+    assert r.status_code == 403
+    assert acc_theo_sdt("+84900000001")["password_hash"] == acc["password_hash"]
+
+
+def test_p2_12_cookie_secure_production_va_bi_mat_0600(kh, monkeypatch, tmp_path):
+    tao_khach_hoat_dong(kh, 1)
+    monkeypatch.setattr(config, "ENV", "production")
+    r = dang_nhap(kh, "0900000001")
+    cks = r.headers.get_list("set-cookie")
+    assert cks and all("secure" in c.lower() for c in cks)
+    import os
+    import stat
+    p = tmp_path / "bi-mat" / "x.key"
+    monkeypatch.delenv("X_TEST_SECRET", raising=False)
+    old = os.umask(0)
+    try:
+        v = config._secret(p, "X_TEST_SECRET")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and p.read_text().strip() == v
+    assert config._secret(p, "X_TEST_SECRET") == v
+
+
+def test_p2_12_scrypt_manh_va_nang_cap_hash_cu(kh):
+    acc = tao_khach_hoat_dong(kh, 1)
+    assert acc["password_algo"] == f"scrypt:n={2 ** 17},r=8,p=1"
+    from cowork import security
+    h, sa = security.bam_mat_khau(MK)  # hash kiểu cũ N=2^14, algo 'scrypt'
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_accounts SET password_hash=?, password_salt=?, "
+                     "password_algo='scrypt' WHERE id=?", (h, sa, acc["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    token_launch(dang_nhap(kh, "0900000001"))
+    assert acc_theo_sdt("+84900000001")["password_algo"] == f"scrypt:n={2 ** 17},r=8,p=1"
+    token_launch(dang_nhap(kh, "0900000001"))

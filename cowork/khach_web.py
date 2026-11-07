@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -30,11 +30,28 @@ class KhachHostDispatch:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket") and config.KHACH_ENABLED:
-            if khach.la_host_khach(Headers(scope=scope).get("host")):
-                await khach_app(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if not config.KHACH_ENABLED and not config.STAFF_HOSTS:
+            await self.app(scope, receive, send)  # hành vi cũ: không kiểm Host
+            return
+        realm = khach.chon_realm(Headers(scope=scope).get("host"))
+        if realm == "khach" and config.KHACH_ENABLED:
+            await khach_app(scope, receive, send)
+        elif realm == "staff":
+            await self.app(scope, receive, send)
+        else:
+            # Host thiếu/lạ/sai cú pháp: KHÔNG BAO GIỜ rơi về realm nhân viên.
+            await _sai_host(scope, receive, send)
+
+
+async def _sai_host(scope, receive, send):
+    if scope["type"] != "http":
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    await PlainTextResponse("421 Misdirected Request", status_code=421,
+                            headers={"Cache-Control": "no-store"})(scope, receive, send)
 
 
 def _crm_origin() -> str:
@@ -53,8 +70,9 @@ class KhachHeaders(BaseHTTPMiddleware):
         h = response.headers
         h["X-Content-Type-Options"] = "nosniff"
         h["X-Frame-Options"] = "DENY"
-        # URL chứa token một lần (?t=) ⇒ không bao giờ gửi Referer.
-        h["Referrer-Policy"] = "no-referrer"
+        # URL chứa token một lần (?t=) ⇒ không gửi Referer ra ngoài origin; trong cùng origin
+        # trình duyệt vẫn gửi Origin thật để kiểm CSRF.
+        h["Referrer-Policy"] = "same-origin"
         h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         crm = _crm_origin()
         h["Content-Security-Policy"] = (
@@ -75,12 +93,12 @@ khach_app.mount("/tai-khoan/static", StaticFiles(directory=str(_static)), name="
 
 # ------------------------------------------------------------------ tiện ích
 def _secure(request: Request) -> bool:
-    return config.COOKIE_SECURE or auth.la_https(request)
+    return config.COOKIE_SECURE or khach.la_production() or auth.la_https(request)
 
 
 def _csrf_moi(request: Request) -> str:
     tk = request.cookies.get(khach.COOKIE_CSRF)
-    return tk if tk and 20 <= len(tk) <= 100 else security.token_moi(24)
+    return tk if khach.csrf_hop_le(tk) else khach.tao_csrf()
 
 
 def _render(request: Request, ten: str, status: int = 200, **ctx) -> Response:
@@ -97,11 +115,17 @@ def _render(request: Request, ten: str, status: int = 200, **ctx) -> Response:
 
 
 def _kiem_csrf(request: Request, gui: str | None, mong: str | None = None) -> bool:
-    mong = mong or request.cookies.get(khach.COOKIE_CSRF)
+    """Token phiên (DB) hoặc double-submit có CHỮ KÝ máy chủ; Origin (nếu có) phải cùng host."""
+    if mong is None:
+        mong = request.cookies.get(khach.COOKIE_CSRF)
+        if not khach.csrf_hop_le(mong):
+            return False
     if not mong or not gui or not security.hmac.compare_digest(str(mong), str(gui)):
         return False
     origin = request.headers.get("origin")
-    if origin and origin != "null":
+    if origin == "null":
+        return False
+    if origin:
         try:
             if urlsplit(origin).netloc.lower() != (request.headers.get("host") or "").lower():
                 return False
@@ -241,7 +265,7 @@ def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(
                 return _loi_csrf(request)
         try:
             acc = khach.dang_nhap(conn, dinh_danh[:40], mat_khau[:200], web.ip_cua(request),
-                                  request)
+                                  request, thiet_bi=request.cookies.get(khach.COOKIE_THIET_BI))
         except khach.ChoDuyet:
             return RedirectResponse("/tai-khoan/cho-duyet", status_code=303)
         except khach.KhachLoi as e:
@@ -256,6 +280,10 @@ def dang_nhap(request: Request, dinh_danh: str = Form(""), mat_khau: str = Form(
                     path=khach.COOKIE_PATH, httponly=True, samesite="lax",
                     secure=_secure(request))
     resp.delete_cookie(khach.COOKIE_CSRF, path=khach.COOKIE_PATH)
+    # Thiết bị tin cậy: miễn giới hạn theo IP cho đúng tài khoản này (vẫn chịu khoá theo cặp).
+    resp.set_cookie(khach.COOKIE_THIET_BI, khach.tao_thiet_bi(acc["id"]),
+                    max_age=config.KHACH_THIET_BI_NGAY * 86400, path=khach.COOKIE_PATH,
+                    httponly=True, samesite="lax", secure=_secure(request))
     return resp
 
 
@@ -359,19 +387,39 @@ def _jloi(status: int, ma: str, thong_bao: str) -> JSONResponse:
                         content={"ok": False, "loi": {"ma": ma, "thongBao": thong_bao}})
 
 
+GIOI_HAN_BODY = 10_000
+
+
+async def _doc_body(request: Request) -> bytes | None:
+    """Kiểm Content-Length TRƯỚC khi đọc; đọc dạng luồng và cắt ở giới hạn."""
+    try:
+        cl = int(request.headers.get("content-length", ""))
+    except ValueError:
+        return None
+    if cl < 0 or cl > GIOI_HAN_BODY:
+        return None
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > GIOI_HAN_BODY:
+            return None
+    return bytes(buf)
+
+
 async def _noi_bo(request: Request, xu_ly) -> JSONResponse:
-    raw = await request.body()
-    if len(raw) > 10_000:
-        return _jloi(413, "QUA_LON", "Yêu cầu quá lớn.")
+    raw = await _doc_body(request)
+    if raw is None:
+        return _jloi(413, "QUA_LON", "Thiếu Content-Length hoặc yêu cầu quá lớn (tối đa 10 KB).")
     conn = db.connect()
     try:
-        kq_ky = khach.xac_thuc_vao(conn, request.headers.get("x-portal-ts"),
+        kq_ky = khach.xac_thuc_vao(conn, request.method, request.url.path,
+                                   request.headers.get("x-portal-ts"),
                                    request.headers.get("x-portal-sig"), raw)
         if kq_ky == "phat_lai":
             return _jloi(409, "PHAT_LAI", "Chữ ký này đã được dùng; ký lại với X-Portal-Ts mới.")
         if kq_ky != "ok":
             khach._ghi_audit(conn, "crm", "khach.hmac.sai", detail={"path": request.url.path},
-                             request=request)
+                             request=request, lay_mau=web.ip_cua(request))
             return _jloi(401, "CHU_KY_SAI", "Chữ ký nội bộ không hợp lệ hoặc đã hết hạn.")
         try:
             data = json.loads(raw.decode("utf-8"))
