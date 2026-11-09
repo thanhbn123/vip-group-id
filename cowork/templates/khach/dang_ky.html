@@ -2,10 +2,15 @@
 {% block content %}
 <p class="kh-eyebrow">Tạo tài khoản</p>
 <h1>Đăng ký cổng khách hàng</h1>
+{% if tu_dong %}
+<p class="kh-muted">Tài khoản được kích hoạt ngay sau khi đăng ký, kèm mã khách hàng (VG…). Bạn đăng nhập bằng số điện thoại hoặc mã khách hàng.</p>
+{% else %}
 <p class="kh-muted">Sau khi đăng ký, nhân viên VIP GROUP sẽ duyệt và kích hoạt tài khoản, cấp mã khách hàng (VG…). Bạn đăng nhập bằng số điện thoại hoặc mã khách hàng.</p>
+{% endif %}
 {% include "khach/_loi.html" %}
 <form method="post" action="/tai-khoan/dang-ky" class="kh-form" autocomplete="on" novalidate>
   <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {% if sub_ky %}<input type="hidden" name="_sub" value="{{ sub_ky }}">{% endif %}
   <label class="kh-field"><span>Họ và tên</span>
     <input type="text" name="ho_ten" required maxlength="100" autocomplete="name" value="{{ form.ho_ten or '' }}"></label>
   <label class="kh-field"><span>Số điện thoại di động</span>

@@ -45,6 +45,9 @@ export COWORK_KHACH_PUBLIC_URL="${COWORK_KHACH_PUBLIC_URL:-http://khach.localhos
 export CRM_PORTAL_INTERNAL_URL="${CRM_PORTAL_INTERNAL_URL:-http://127.0.0.1:8897}"
 export CRM_PORTAL_PUBLIC_URL="${CRM_PORTAL_PUBLIC_URL:-http://127.0.0.1:8897}"
 export COWORK_KHACH_TIEP_CHO_PHEP="${COWORK_KHACH_TIEP_CHO_PHEP:-$CRM_PORTAL_PUBLIC_URL/portal}"
+# §16: COWORK_KHACH_TU_DONG=1 ./scripts/khach-dev.sh --mock-crm ⇒ đăng ký tự kích hoạt qua CRM giả
+# (SĐT đuôi 7 ⇒ hồ sơ cũ, đuôi 6 ⇒ CRM bận).
+export COWORK_KHACH_TU_DONG="${COWORK_KHACH_TU_DONG:-0}"
 export VIPID_PORTAL_SECRET_FILE="${VIPID_PORTAL_SECRET_FILE:-$PWD/data/khach-dev/portal_secret.key}"
 # Bí mật dev sinh tự động (0600) ở lần chạy đầu; CRM dev đọc cùng tệp này.
 

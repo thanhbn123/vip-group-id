@@ -346,6 +346,16 @@ CREATE TABLE IF NOT EXISTS customer_hmac_seen(
     created_at TEXT NOT NULL
 );
 
+-- §16: token chuyển phiên dangky → dangnhap sau đăng ký tự kích hoạt. Một lần, ≤ 60 giây, gắn
+-- tài khoản; chỉ lưu sha256 của nonce.
+CREATE TABLE IF NOT EXISTS customer_handoff(
+    nonce_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- Bộ đếm tần suất chung (đăng ký, quên mật khẩu, thông báo trùng...).
 CREATE TABLE IF NOT EXISTS customer_rate_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,

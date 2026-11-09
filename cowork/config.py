@@ -139,6 +139,8 @@ CRM_PORTAL_INTERNAL_URL = os.environ.get("CRM_PORTAL_INTERNAL_URL",
 CRM_PORTAL_PUBLIC_URL = os.environ.get("CRM_PORTAL_PUBLIC_URL",
                                        "http://127.0.0.1:8897").rstrip("/")
 CRM_PORTAL_TIMEOUT = float(os.environ.get("CRM_PORTAL_TIMEOUT", "3"))
+#: CRM_PORTAL_INTERNAL_URL có được đặt TƯỜNG MINH không (production + tự kích hoạt bắt buộc).
+CRM_PORTAL_INTERNAL_URL_DAT = bool(os.environ.get("CRM_PORTAL_INTERNAL_URL", "").strip())
 #: Bí mật HMAC/launch token VIP ID ⇄ CRM portal. Nạp LƯỜI (chỉ khi realm bật) qua
 #: `khach.portal_secret()`: env VIPID_PORTAL_SECRET → tệp 0600 → sinh mới (chỉ dev).
 PORTAL_SECRET_FILE = _path("VIPID_PORTAL_SECRET_FILE", DATA_DIR / "portal_secret.key")
@@ -179,7 +181,8 @@ KHACH_EMAIL_ENABLED = os.environ.get("COWORK_KHACH_EMAIL_ENABLED", "0").strip() 
 KHACH_HOTLINE = os.environ.get("COWORK_KHACH_HOTLINE", "0961 102 655").strip() or "0961 102 655"
 #: Trần đăng ký toàn hệ thống mỗi giờ (chống đăng ký ồ ạt / giữ chỗ SĐT hàng loạt).
 KHACH_SIGNUP_GLOBAL_PER_HOUR = int(os.environ.get("COWORK_KHACH_SIGNUP_GLOBAL_PER_HOUR", "200"))
-#: Chu kỳ (giây) của vòng nền gửi hàng đợi sang CRM. Request KHÔNG BAO GIỜ gọi CRM trực tiếp.
+#: Chu kỳ (giây) của vòng nền gửi hàng đợi sang CRM. Request không gọi CRM trực tiếp — trừ đăng ký
+#: tự kích hoạt §16 (COWORK_KHACH_TU_DONG=1), gọi đồng bộ trong executor riêng, hạn chót ≤ 5 s.
 KHACH_SYNC_GIAY = float(os.environ.get("COWORK_KHACH_SYNC_GIAY", "5"))
 #: PILOT có kiểm soát (owner duyệt): chỉ SĐT trong danh sách trắng mới đăng ký/đăng nhập/khôi phục.
 #: Production BẮT BUỘC đặt tường minh COWORK_KHACH_PILOT=0 hoặc 1 (thiếu ⇒ từ chối khởi động).
@@ -217,3 +220,13 @@ CRM_TENANT_MAP = dict(
     (a.strip(), b.strip()) for a, _, b in (
         x.partition("=") for x in os.environ.get("COWORK_CRM_TENANT_MAP", "vip-group=VIP").split(","))
     if a.strip() and b.strip())
+
+# ═══════════ §16 — ĐĂNG KÝ TỰ KÍCH HOẠT (owner chốt 09/11/2026, DE_XUAT_TU_DONG_DUYET §5–6) ═══════════
+#: 1 ⇒ đăng ký gọi CRM ĐỒNG BỘ (`/api/internal/portal/dang-ky-tu-dong`); CRM trả `kich_hoat` thì tạo
+#: tài khoản `hoat_dong` ngay (không chờ nhân viên duyệt). 0 (mặc định) ⇒ luồng chờ duyệt cũ, không
+#: đổi gì. Tắt cờ là rollback, không đổi dữ liệu (tài khoản đã kích hoạt vẫn đăng nhập bình thường).
+KHACH_TU_DONG = os.environ.get("COWORK_KHACH_TU_DONG", "0").strip() == "1"
+#: Hạn chót TỔNG cho một lời gọi CRM tự kích hoạt (giây), kẹp trong (0, 5] theo hợp đồng §16.
+KHACH_TU_DONG_TIMEOUT = min(5.0, max(0.5, float(os.environ.get("COWORK_KHACH_TU_DONG_TIMEOUT", "5"))))
+#: Token chuyển phiên dangky → dangnhap sau khi tạo tài khoản: một lần, ≤ 60 giây.
+KHACH_HANDOFF_TTL = min(60, max(10, int(os.environ.get("COWORK_KHACH_HANDOFF_TTL", "60"))))

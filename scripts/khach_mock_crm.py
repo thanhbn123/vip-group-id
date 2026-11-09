@@ -2,6 +2,13 @@
 
 - POST /api/internal/portal/signups, /api/internal/portal/thu-hoi: kiểm HMAC "vipid->crm";
   thu-hoi bắt buộc `revoked_at_ms` (+ `revoked_at` giây) và chặn launch có iat_ms < revoked_at_ms.
+- POST /api/internal/portal/dang-ky-tu-dong (§16): HMAC như trên; hành vi TẤT ĐỊNH cho dev/test:
+    * SĐT kết thúc 7 ⇒ {trang_thai:'trung', loai:'ho_so_cu'} (hồ sơ cũ chưa có tài khoản cổng);
+    * SĐT kết thúc 6 ⇒ 503 AUTO_APPROVE_OFF (mô phỏng CRM tắt cờ/bận);
+    * SĐT đã được cấp tài khoản cổng (trong bộ nhớ) ⇒ {trang_thai:'trung', loai:'tai_khoan_cong'};
+    * còn lại ⇒ {trang_thai:'kich_hoat', crm_customer_id, portal_code: VG1001, VG1002…};
+    * idempotent theo subject (gọi lại trả đúng kết quả cũ); khoá chung ⇒ đồng thời cùng SĐT chỉ
+      một kich_hoat. Env MOCK_AUTO_APPROVE=0 ⇒ mọi lời gọi 503 AUTO_APPROVE_OFF.
 - GET  /portal/auth/launch?token=: kiểm launch token HS256 (ver/aud/exp/nonce một lần) và
   hiển thị claims.
 Bí mật đọc từ env VIPID_PORTAL_SECRET hoặc tệp VIPID_PORTAL_SECRET_FILE (không in ra).
@@ -15,6 +22,7 @@ import html
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +40,37 @@ NONCES: set[str] = set()
 #: subject -> revoked_at_ms (mili-giây unix) nhận qua /thu-hoi; launch có iat_ms < revoked_at_ms
 #: bị từ chối (so theo mili-giây — đăng xuất cùng giây với launch vẫn thu hồi đúng).
 THU_HOI: dict[str, int] = {}
+#: §16 — trạng thái trong bộ nhớ của "đăng ký tự động".
+TU_DONG_KHOA = threading.Lock()
+TU_DONG_THEO_SUBJECT: dict[str, dict] = {}
+TU_DONG_THEO_SDT: dict[str, str] = {}
+TU_DONG_MA = [1000]
+#: Header Host của các lời gọi nhận được (test kiểm VIP ID không gửi Host của portal).
+HOST_NHAN: list[str] = []
+
+
+def dang_ky_tu_dong(b: dict) -> tuple[int, dict]:
+    if os.environ.get("MOCK_AUTO_APPROVE", "1") == "0":
+        return 503, {"ok": False, "error": {"code": "AUTO_APPROVE_OFF"}}
+    sub, ph = b.get("subject"), b.get("phone_e164")
+    if not isinstance(sub, str) or not sub.startswith("cust:") or not isinstance(ph, str):
+        return 422, {"ok": False, "error": {"code": "INVALID"}}
+    if ph.endswith("6"):
+        return 503, {"ok": False, "error": {"code": "AUTO_APPROVE_OFF"}}
+    with TU_DONG_KHOA:
+        if sub in TU_DONG_THEO_SUBJECT:
+            return 200, {"ok": True, "data": TU_DONG_THEO_SUBJECT[sub]}
+        if ph.endswith("7"):
+            kq = {"trang_thai": "trung", "loai": "ho_so_cu"}
+        elif ph in TU_DONG_THEO_SDT:
+            kq = {"trang_thai": "trung", "loai": "tai_khoan_cong"}
+        else:
+            TU_DONG_MA[0] += 1
+            kq = {"trang_thai": "kich_hoat", "crm_customer_id": f"mock-{TU_DONG_MA[0]}",
+                  "portal_code": f"VG{TU_DONG_MA[0]}"}
+            TU_DONG_THEO_SDT[ph] = sub
+        TU_DONG_THEO_SUBJECT[sub] = kq
+    return 200, {"ok": True, "data": kq}
 
 
 def _b64d(s: str) -> bytes:
@@ -78,6 +117,10 @@ class H(BaseHTTPRequestHandler):
         if not ts.isdigit() or abs(time.time() - int(ts)) > 300 or not hmac.compare_digest(mong, sig):
             return self._tra(401, '{"ok":false}')
         print(f"[mock-crm] {self.path} {raw.decode()}", file=sys.stderr)
+        HOST_NHAN.append(self.headers.get("host", ""))
+        if urlsplit(self.path).path == "/api/internal/portal/dang-ky-tu-dong":
+            code, kq = dang_ky_tu_dong(json.loads(raw))
+            return self._tra(code, json.dumps(kq, ensure_ascii=False))
         if urlsplit(self.path).path == "/api/internal/portal/thu-hoi":
             b = json.loads(raw)
             if not isinstance(b.get("revoked_at_ms"), int) or not isinstance(b.get("revoked_at"), int):
