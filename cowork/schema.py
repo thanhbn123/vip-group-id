@@ -356,6 +356,23 @@ CREATE TABLE IF NOT EXISTS customer_handoff(
     created_at TEXT NOT NULL
 );
 
+-- §16: đăng ký chờ phía server theo SĐT — giữ subject để thử lại (mọi trình duyệt) dùng lại, CRM
+-- idempotent theo subject ⇒ không mồ côi/không khoá khách. acc_id_cu = subject trước khi hết hạn.
+CREATE TABLE IF NOT EXISTS customer_tu_dong_cho(
+    phone_e164 TEXT PRIMARY KEY,
+    acc_id TEXT NOT NULL UNIQUE,
+    acc_id_cu TEXT,
+    display_name TEXT NOT NULL,
+    email_norm TEXT,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    password_algo TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    last_attempt TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
 -- Bộ đếm tần suất chung (đăng ký, quên mật khẩu, thông báo trùng...).
 CREATE TABLE IF NOT EXISTS customer_rate_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,

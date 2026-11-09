@@ -344,27 +344,34 @@ def _nem(exc):
     return f
 
 
-@pytest.mark.parametrize("che_do", [
-    _tra(503, b'{"ok":false,"error":{"code":"AUTO_APPROVE_OFF"}}'),
-    _tra(401, b'{"ok":false,"error":{"code":"SIGNATURE_INVALID"}}'),
-    _tra(409, b'{"ok":false,"error":{"code":"PHAT_LAI"}}'),
-    _tra(200, b"<html>khong phai json"),
-    _tra(200, b'{"ok":true}'),
-    _tra(200, b'[1,2]'),
-    _tra(200, b'{"ok":true,"data":{"trang_thai":"la"}}'),
-    _tra(200, b'{"ok":true,"data":{"trang_thai":"trung","loai":"khac"}}'),
-    _tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"x1"}}'),
-    _tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"x1",'
-              b'"portal_code":"VG999"}}'),
-    _tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"a b",'
-              b'"portal_code":"VG1001"}}'),
-    _tra(200, b'{"ok":"true","data":{"trang_thai":"kich_hoat","crm_customer_id":"x1",'
-              b'"portal_code":"VG1001"}}'),
-    _nem(TimeoutError("read timeout")),
-    _nem(ConnectionError("refused")),
-], ids=["503", "401-chu-ky", "409", "html", "thieu-data", "mang", "trang-thai-la", "loai-la",
-        "thieu-ma", "ma-sai", "crm-id-sai", "ok-chuoi", "timeout", "mang-loi"])
-def test_crm_loi_khong_tao_tai_khoan(td, crm_td, che_do):
+CL, MC = "khach.dang_ky.tu_dong.crm_loi", "khach.dang_ky.tu_dong.co_the_mo_coi"
+
+
+@pytest.mark.parametrize("che_do,su_kien", [
+    (_tra(503, b'{"ok":false,"error":{"code":"AUTO_APPROVE_OFF"}}'), CL),
+    (_tra(401, b'{"ok":false,"error":{"code":"SIGNATURE_INVALID"}}'), CL),
+    (_tra(409, b'{"ok":false,"error":{"code":"PHAT_LAI"}}'), CL),
+    (_tra(502, b"bad gateway"), MC),
+    (_tra(200, b"<html>khong phai json"), MC),
+    (_tra(200, b'{"ok":true}'), MC),
+    (_tra(200, b'[1,2]'), MC),
+    (_tra(200, b'{"ok":true,"data":{"trang_thai":"la"}}'), MC),
+    (_tra(200, b'{"ok":true,"data":{"trang_thai":"trung","loai":"khac"}}'), MC),
+    (_tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"x1"}}'), MC),
+    (_tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"x1",'
+               b'"portal_code":"VG999"}}'), MC),
+    (_tra(200, b'{"ok":true,"data":{"trang_thai":"kich_hoat","crm_customer_id":"a b",'
+               b'"portal_code":"VG1001"}}'), MC),
+    (_tra(200, b'{"ok":"true","data":{"trang_thai":"kich_hoat","crm_customer_id":"x1",'
+               b'"portal_code":"VG1001"}}'), MC),
+    (_nem(TimeoutError("read timeout")), MC),
+    (_nem(ConnectionError("reset")), MC),
+    (_nem(__import__("httpx").ConnectError("refused")), CL),
+    (_nem(__import__("httpx").ConnectTimeout("connect")), CL),
+], ids=["503", "401-chu-ky", "409", "502", "html", "thieu-data", "mang", "trang-thai-la",
+        "loai-la", "thieu-ma", "ma-sai", "crm-id-sai", "ok-chuoi", "timeout", "reset",
+        "connect-loi", "connect-timeout"])
+def test_crm_loi_khong_tao_tai_khoan(td, crm_td, che_do, su_kien):
     dkc, _ = td
     crm_td.che_do = che_do
     r = dk(dkc, 1)
@@ -375,9 +382,16 @@ def test_crm_loi_khong_tao_tai_khoan(td, crm_td, che_do):
     conn = db.connect()
     try:
         assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending") == 0  # không xếp hàng
+        # Đăng ký chờ giữ subject cho lần thử lại.
+        cho = db.one(conn, "SELECT * FROM customer_tu_dong_cho WHERE phone_e164='+84900000001'")
+        assert cho and "cust:" + cho["acc_id"] == crm_td.goi[0]["body"]["subject"]
     finally:
         conn.close()
-    assert _audit("khach.dang_ky.tu_dong.crm_loi")
+    khac = MC if su_kien == CL else CL
+    assert len(_audit(su_kien)) == 1 and _audit(khac) == []
+    if su_kien == MC:  # không lấy mẫu, đủ dữ liệu đối soát
+        d = json.loads(_audit(MC)[0]["detail"])
+        assert d["phoneSha256"] == hashlib.sha256(b"+84900000001").hexdigest()
 
 
 def test_crm_cham_qua_han_chot(td, crm_td, monkeypatch):
@@ -387,29 +401,228 @@ def test_crm_cham_qua_han_chot(td, crm_td, monkeypatch):
     t0 = time.monotonic()
     r = dk(dkc, 1)
     assert r.status_code == 503 and time.monotonic() - t0 < 2.2  # không chờ hết 2,5 s của CRM
+    from cowork import khach_web
+    assert khach_web._crm_dk_dang_goi == 1  # luồng treo vẫn được đếm (trần chống tích tụ)
     time.sleep(2.2)  # lời gọi treo kết thúc trong executor: vẫn KHÔNG tạo tài khoản
-    assert _so_tk() == 0
+    assert _so_tk() == 0 and khach_web._crm_dk_dang_goi == 0
+    assert _audit("khach.dang_ky.tu_dong.co_the_mo_coi")
 
 
-def test_thu_lai_sau_ban_dung_lai_subject(td, crm_td, monkeypatch):
+class CrmThat:
+    """CRM giả có TRẠNG THÁI như CRM thật: idempotent theo subject, khoá theo SĐT (đã có tài khoản
+    cổng ⇒ trung/tai_khoan_cong). `tre_sau_commit` giây: GHI xong rồi mới trả lời (mô phỏng trả lời
+    sau hạn chót của VIP ID)."""
+
+    def __init__(self):
+        self.theo_sub: dict[str, dict] = {}
+        self.theo_sdt: dict[str, str] = {}
+        self.ma = 1000
+        self.tre_sau_commit = 0.0
+        self.khoa = threading.Lock()
+
+    def __call__(self, b):
+        with self.khoa:
+            if b["subject"] in self.theo_sub:
+                kq = self.theo_sub[b["subject"]]
+            elif b["phone_e164"] in self.theo_sdt:
+                kq = {"trang_thai": "trung", "loai": "tai_khoan_cong"}
+            else:
+                self.ma += 1
+                kq = {"trang_thai": "kich_hoat", "crm_customer_id": f"crm-that-{self.ma}",
+                      "portal_code": f"VG{self.ma}"}
+                self.theo_sdt[b["phone_e164"]] = b["subject"]
+                self.theo_sub[b["subject"]] = kq
+        if self.tre_sau_commit:
+            time.sleep(self.tre_sau_commit)
+        return 200, json.dumps({"ok": True, "data": kq}).encode()
+
+
+def _cho(phone="+84900000001") -> dict | None:
+    conn = db.connect()
+    try:
+        return db.one(conn, "SELECT * FROM customer_tu_dong_cho WHERE phone_e164=?", (phone,))
+    finally:
+        conn.close()
+
+
+def test_verifier_crm_ghi_roi_tra_loi_sau_han_chot_thu_lai_trinh_duyet_khac(td, crm_td,
+                                                                            monkeypatch):
+    """P1 vòng 10: CRM commit nhưng trả lời sau 5 s ⇒ VIP ID báo bận; khách thử lại từ TRÌNH DUYỆT
+    KHÁC ⇒ dùng lại subject đã lưu ⇒ CRM trả kich_hoat cũ ⇒ kích hoạt, không bị khoá ngoài."""
+    dkc, dnc = td
+    monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.5)
+    crm = CrmThat()
+    crm.tre_sau_commit = 1.0
+    crm_td.che_do = crm
+    assert dk(dkc, 1).status_code == 503 and _so_tk() == 0
+    s1 = crm_td.goi[0]["body"]["subject"]
+    assert s1 in crm.theo_sub  # CRM đã tạo khách
+    assert json.loads(_audit("khach.dang_ky.tu_dong.co_the_mo_coi")[0]["detail"])
+    time.sleep(0.7)
+    crm.tre_sau_commit = 0.0
+    moi = KC(DK)  # trình duyệt khác, mật khẩu khác (ý định hiện tại)
+    r = moi.post("/tai-khoan/dang-ky", data=_form(moi, 1, mat_khau="Moi!Passw0rd-777",
+                                                  mat_khau_2="Moi!Passw0rd-777"),
+                 follow_redirects=False)
+    assert r.status_code == 201 and "VG1001" in r.text
+    assert crm_td.goi[-1]["body"]["subject"] == s1
+    acc = acc_theo_sdt("+84900000001")
+    assert acc["subject"] == s1 and acc["crm_customer_id"] == "crm-that-1001"
+    assert _cho() is None  # thành công ⇒ xoá đăng ký chờ
+    token_launch(dang_nhap(dnc, "0900000001", "Moi!Passw0rd-777"))  # mật khẩu của lần thành công
+
+
+def test_dang_ky_cho_het_han_subject_moi_va_du_phong_subject_cu(td, crm_td, monkeypatch):
+    dkc, _ = td
     monkeypatch.setattr(config, "KHACH_SIGNUP_IP_PER_HOUR", 50)
+    monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.5)
+    crm = CrmThat()
+    crm.tre_sau_commit = 1.0
+    crm_td.che_do = crm
+    assert dk(dkc, 1).status_code == 503
+    s1 = crm_td.goi[0]["body"]["subject"]
+    time.sleep(0.7)
+    crm.tre_sau_commit = 0.0
+    # Còn hạn: thử lại (kể cả khi CRM lại bận) vẫn subject cũ, TTL trượt.
+    het_cu = _cho()["expires_at"]
+    crm_td.che_do = _tra(503, b"{}")
+    time.sleep(1.1)
+    assert dk(KC(DK), 1).status_code == 503 and crm_td.goi[-1]["body"]["subject"] == s1
+    assert _cho()["expires_at"] > het_cu and _cho()["attempts"] == 2
+    # Hết hạn ⇒ subject MỚI; CRM báo SĐT thuộc tài khoản cổng (của s1) ⇒ thử lại một lần bằng s1
+    # ⇒ kich_hoat cũ ⇒ kích hoạt, không khoá ngoài.
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_tu_dong_cho SET expires_at='2000-01-01T00:00:00+07:00'")
+        conn.commit()
+    finally:
+        conn.close()
+    crm_td.che_do = crm
+    r = dk(KC(DK), 1)
+    s2, s3 = (g["body"]["subject"] for g in crm_td.goi[-2:])
+    assert s2 != s1 and s3 == s1
+    assert r.status_code == 201 and acc_theo_sdt("+84900000001")["subject"] == s1
+    au = json.loads(_audit("khach.dang_ky.tu_dong")[0]["detail"])
+    assert au["subject_cu"] is True
+
+
+def test_dang_ky_cho_het_han_khong_co_khach_crm_thi_dung_subject_moi(td, crm_td):
     dkc, _ = td
     crm_td.che_do = _tra(503, b"{}")
-    r = dk(dkc, 1)
-    sub = _sub(r.text)
+    dk(dkc, 1)
+    s1 = crm_td.goi[0]["body"]["subject"]
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_tu_dong_cho SET expires_at='2000-01-01T00:00:00+07:00'")
+        conn.commit()
+    finally:
+        conn.close()
     crm_td.che_do = "kich_hoat"
-    assert dk(dkc, 1, _sub=sub).status_code == 201
-    s1, s2 = (g["body"]["subject"] for g in crm_td.goi)
-    assert s1 == s2 and acc_theo_sdt("+84900000001")["subject"] == s1
-    # Subject ký gắn SĐT + trình duyệt: số khác hoặc trình duyệt khác ⇒ subject mới.
+    assert dk(KC(DK), 1).status_code == 201
+    assert len(crm_td.goi) == 2 and crm_td.goi[1]["body"]["subject"] != s1
+    assert acc_theo_sdt("+84900000001")["subject"] == crm_td.goi[1]["body"]["subject"]
+
+
+def test_trung_dut_khoat_xoa_dang_ky_cho(td, crm_td):
+    dkc, _ = td
     crm_td.che_do = _tra(503, b"{}")
-    sub3 = _sub(dk(dkc, 3).text)
-    assert dk(dkc, 4, _sub=sub3).status_code == 503
-    assert crm_td.goi[-1]["body"]["subject"] != crm_td.goi[-2]["body"]["subject"]
-    assert dk(KC(DK), 3, _sub=sub3).status_code == 503
-    assert crm_td.goi[-1]["body"]["subject"] != crm_td.goi[-3]["body"]["subject"]
-    assert dk(dkc, 3, _sub=sub3[:-2] + "00").status_code == 503  # chữ ký sai ⇒ subject mới
-    assert crm_td.goi[-1]["body"]["subject"] != crm_td.goi[-4]["body"]["subject"]
+    dk(dkc, 7)
+    assert _cho("+84900000007")
+    crm_td.che_do = "ho_so_cu"
+    assert dk(dkc, 7).status_code == 409 and _cho("+84900000007") is None
+
+
+# ------------------------------------------------------------------ CLI đối soát
+def _cli(*a) -> tuple[int, str]:
+    import contextlib
+    import io
+    from cowork import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["khach-doi-soat", *a])
+    return rc, buf.getvalue()
+
+
+def test_cli_doi_soat_theo_sdt_tao_tai_khoan_mat_khau_cua_khach(td, crm_td, monkeypatch):
+    dkc, dnc = td
+    monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.5)
+    crm = CrmThat()
+    crm.tre_sau_commit = 1.0
+    crm_td.che_do = crm
+    assert dk(dkc, 1).status_code == 503
+    time.sleep(0.7)
+    crm.tre_sau_commit = 0.0
+    assert _cli("0900000009")[0] == 1  # không có đăng ký chờ
+    rc, out = _cli("0900000001")
+    assert rc == 0 and "VG1001" in out and "crm-that-1001" in out
+    acc = acc_theo_sdt("+84900000001")
+    assert acc["status"] == "hoat_dong" and acc["phone_verified_method"] == "tu_dong"
+    assert acc["phone_verified_by"].startswith("cli:")
+    assert _audit("khach.ops.doi_soat_tu_dong")
+    token_launch(dang_nhap(dnc, "0900000001"))  # mật khẩu khách đã đặt khi đăng ký
+    rc, out = _cli(acc["subject"])
+    assert rc == 0 and "Đã liên kết" in out  # chạy lại: idempotent
+
+
+def test_cli_doi_soat_theo_subject_khong_con_dang_ky_cho(td, crm_td):
+    dkc, dnc = td
+    crm = CrmThat()
+    crm_td.che_do = crm
+    sub = "cust:kh_" + "a" * 26
+    crm({"subject": sub, "phone_e164": "+84900000002"})  # CRM đã có khách cho subject này
+    assert _cli(sub)[0] == 2  # thiếu --sdt/--ten
+    assert _cli("cust:sai")[0] == 2
+    rc, out = _cli(sub, "--sdt", "0900000002", "--ten", "Khách Đối Soát")
+    assert rc == 0 and "Mật khẩu ngẫu nhiên" in out
+    acc = acc_theo_sdt("+84900000002")
+    assert acc["subject"] == sub and acc["portal_code"] == "VG1001"
+    assert dang_nhap(dnc, "0900000002").status_code == 401  # không ai biết mật khẩu
+    # Subject khác cho SĐT đã có tài khoản ⇒ không đổi gì.
+    rc, out = _cli("cust:kh_" + "b" * 26, "--sdt", "0900000002", "--ten", "X Y")
+    assert rc == 1 and "tài khoản VIP ID khác" in out
+
+
+def test_cli_doi_soat_crm_bao_trung_hoac_ban(td, crm_td):
+    dkc, _ = td
+    crm_td.che_do = _tra(503, b"{}")
+    dk(dkc, 1)
+    assert _cli("0900000001")[0] == 3 and _so_tk() == 0
+    crm_td.che_do = "tai_khoan_cong"
+    rc, out = _cli("0900000001")
+    assert rc == 1 and "trùng" in out and _so_tk() == 0
+
+
+# ------------------------------------------------------------------ hạn chót tổng của HTTP
+def test_http_han_chot_tong_chan_crm_nho_giot(monkeypatch):
+    """CRM gửi header rồi nhỏ giọt thân (mỗi byte < read timeout) ⇒ vẫn dừng ở hạn chót tổng."""
+    from http.server import BaseHTTPRequestHandler
+
+    class Nho(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("content-length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            for _ in range(40):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+        def log_message(self, *a):
+            pass
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Nho)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.6)
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _HTTP_THAT(f"http://127.0.0.1:{srv.server_port}/x", b"{}", {})
+        assert time.monotonic() - t0 < 1.5
+    finally:
+        srv.shutdown()
 
 
 def test_luu_cuc_bo_loi_ghi_mo_coi(td, crm_td):
@@ -444,8 +657,11 @@ def test_dong_thoi_cung_sdt_chi_mot_tai_khoan(td, crm_td, monkeypatch):
         t.join()
     assert sorted(kq).count(201) == 1 and all(k in (201, 409) for k in kq), kq
     assert _so_tk() == 1
-    # Mỗi lượt thua đã qua CRM đều được ghi audit mồ côi để đối soát.
-    assert len(_audit("khach.dang_ky.tu_dong.mo_coi")) == len(crm_td.goi) - 1
+    # Lượt cùng lúc dùng CHUNG subject đã lưu ⇒ lượt thua không phải mồ côi; chỉ lượt đến sau khi
+    # lượt thắng đã xoá đăng ký chờ (subject mới) mới có thể bị ghi mồ côi.
+    sub_thang = acc_theo_sdt("+84900000001")["subject"]
+    so_khac = sum(1 for g in crm_td.goi if g["body"]["subject"] != sub_thang)
+    assert len(_audit("khach.dang_ky.tu_dong.mo_coi")) == so_khac
 
 
 # ------------------------------------------------------------------ luồng chờ duyệt cũ vẫn chạy

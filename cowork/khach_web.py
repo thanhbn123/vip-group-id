@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
@@ -437,8 +438,7 @@ def dang_ky_form(request: Request):
 async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
                   email: str = Form(""), mat_khau: str = Form(""), mat_khau_2: str = Form(""),
                   dong_y: str = Form(""), csrf_form: str = Form("", alias="_csrf"),
-                  cf_token: str = Form("", alias="cf-turnstile-response"),
-                  sub_ky: str = Form("", alias="_sub")):
+                  cf_token: str = Form("", alias="cf-turnstile-response")):
     if not _kiem_csrf(request, csrf_form):
         return _loi_csrf(request)
     # Turnstile cấu hình ⇒ BẮT BUỘC cho mọi lượt đăng ký (chống đăng ký/giữ chỗ hàng loạt);
@@ -454,45 +454,51 @@ async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
             return _form_dang_ky(request, 400, form=form,
                                  loi="Vui lòng xác nhận bạn không phải máy rồi gửi lại.")
     if khach.tu_dong_bat():
-        return await _dang_ky_tu_dong(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y,
-                                      sub_ky[:120])
+        return await _dang_ky_tu_dong(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y)
     return await _chay_kdf(request, _dang_ky, request, ho_ten, sdt, email, mat_khau,
                            mat_khau_2, dong_y)
 
 
 # ------------------------------------------------------------------ §16 tự kích hoạt
 # Lời gọi CRM đồng bộ chạy trong executor RIÊNG (không chiếm luồng băm mật khẩu hay threadpool
-# mặc định); số lời gọi đang chờ có trần ⇒ vượt thì báo bận ngay, không xếp hàng.
+# mặc định). Bộ đếm là số LUỒNG thật đang chạy/chờ (giảm khi luồng xong, kể cả sau khi request đã
+# hết hạn chờ) ⇒ luồng treo không tích tụ quá trần; vượt trần ⇒ báo bận ngay, không xếp hàng.
 _crm_dk_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="khach-crm-dk")
 CRM_DK_DONG_THOI_TOI_DA = 16
 _crm_dk_dang_goi = 0
+_crm_dk_khoa = threading.Lock()
+
+
+def _crm_dk_xong(_fut) -> None:
+    global _crm_dk_dang_goi
+    with _crm_dk_khoa:
+        _crm_dk_dang_goi -= 1
 
 
 async def _goi_crm_dang_ky(pb: dict) -> dict:
     global _crm_dk_dang_goi
-    if _crm_dk_dang_goi >= CRM_DK_DONG_THOI_TOI_DA:
-        return {"kq": "ban", "ly_do": "quá nhiều lời gọi CRM đồng thời"}
-    _crm_dk_dang_goi += 1
+    with _crm_dk_khoa:
+        if _crm_dk_dang_goi >= CRM_DK_DONG_THOI_TOI_DA:
+            return {"kq": "ban", "ly_do": "quá nhiều lời gọi CRM đồng thời", "co_the": False}
+        _crm_dk_dang_goi += 1
+    fut = _crm_dk_pool.submit(khach.goi_crm_tu_dong, pb)
+    fut.add_done_callback(_crm_dk_xong)
     try:
-        loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(loop.run_in_executor(_crm_dk_pool, khach.goi_crm_tu_dong, pb),
-                                      config.KHACH_TU_DONG_TIMEOUT)
+        return await asyncio.wait_for(asyncio.wrap_future(fut), config.KHACH_TU_DONG_TIMEOUT)
     except asyncio.TimeoutError:
-        return {"kq": "ban", "ly_do": f"quá hạn {config.KHACH_TU_DONG_TIMEOUT}s"}
+        # Yêu cầu có thể đã tới CRM và được xử lý ⇒ "có thể mồ côi" (đăng ký chờ giữ subject).
+        return {"kq": "ban", "ly_do": f"quá hạn {config.KHACH_TU_DONG_TIMEOUT}s", "co_the": True}
     except Exception as exc:  # noqa: BLE001
-        return {"kq": "ban", "ly_do": type(exc).__name__}
-    finally:
-        _crm_dk_dang_goi -= 1
+        return {"kq": "ban", "ly_do": type(exc).__name__, "co_the": True}
 
 
-def _tu_dong_chuan_bi(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y, sub_ky):
+def _tu_dong_chuan_bi(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y):
     form = {"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]}
     conn = db.connect()
     try:
         return khach.tu_dong_chuan_bi(conn, ho_ten=ho_ten, sdt=sdt, email=email,
                                       mat_khau=mat_khau[:200], mat_khau_2=mat_khau_2[:200],
-                                      dong_y=dong_y == "1", ip=_ip_khoa(request), request=request,
-                                      sub_ky=sub_ky or None, ps=_ps(request))
+                                      dong_y=dong_y == "1", ip=_ip_khoa(request), request=request)
     except khach.KhachPilot:
         return _trang_pilot(request)
     except khach.KhachLoi as e:
@@ -515,24 +521,32 @@ def _trang_trung(request: Request, loai: str) -> Response:
                    loai=loai, hotline=config.KHACH_HOTLINE)
 
 
-async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y,
-                           sub_ky) -> Response:
+async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_khau_2,
+                           dong_y) -> Response:
     """§16: kiểm trùng tại VIP ID → gọi CRM đồng bộ → chỉ `kich_hoat` mới tạo tài khoản."""
     pb = await _chay_kdf(request, _tu_dong_chuan_bi, request, ho_ten, sdt, email, mat_khau,
-                         mat_khau_2, dong_y, sub_ky)
+                         mat_khau_2, dong_y)
     if isinstance(pb, Response):
         return pb
     if pb["kq"] == "trung_noi_bo":
         return _trang_trung(request, "tai_khoan_cong")
     crm = await _goi_crm_dang_ky(pb)
+    if crm["kq"] == "tai_khoan_cong":
+        # Đăng ký chờ cũ (đã hết hạn) có subject khác ⇒ CRM có thể đã tạo khách cho subject đó:
+        # thử lại MỘT lần bằng subject cũ (CRM idempotent ⇒ trả lại đúng kich_hoat cũ).
+        pb2 = khach.pb_subject_cu(pb)
+        if pb2:
+            crm2 = await _goi_crm_dang_ky(pb2)
+            if crm2["kq"] == "kich_hoat":
+                pb, crm = pb2, crm2
     ket = await asyncio.to_thread(_tu_dong_luu, request, pb, crm)
     if ket["kq"] in ("tai_khoan_cong", "ho_so_cu"):
         return _trang_trung(request, ket["kq"])
     if ket["kq"] != "kich_hoat":
-        # Không tạo gì; giữ subject đã ký trong form ⇒ thử lại dùng lại subject (CRM idempotent).
+        # Không tạo gì; đăng ký chờ (server, theo SĐT) giữ subject ⇒ thử lại từ BẤT KỲ trình duyệt
+        # nào cũng dùng lại subject đó (CRM idempotent).
         return _form_dang_ky(request, 503, loi=khach.THONG_BAO_BAN,
-                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]},
-                             sub_ky=khach.ky_subject_cho(pb["acc_id"], pb["phone"], _ps(request)))
+                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
     acc = ket["acc"]
     resp = _render(request, "tu_dong_thanh_cong.html", 201, page_title="Tạo tài khoản thành công",
                    acc=acc, handoff=ket["handoff"],

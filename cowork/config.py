@@ -230,3 +230,5 @@ KHACH_TU_DONG = os.environ.get("COWORK_KHACH_TU_DONG", "0").strip() == "1"
 KHACH_TU_DONG_TIMEOUT = min(5.0, max(0.5, float(os.environ.get("COWORK_KHACH_TU_DONG_TIMEOUT", "5"))))
 #: Token chuyển phiên dangky → dangnhap sau khi tạo tài khoản: một lần, ≤ 60 giây.
 KHACH_HANDOFF_TTL = min(60, max(10, int(os.environ.get("COWORK_KHACH_HANDOFF_TTL", "60"))))
+#: Đăng ký chờ phía server (theo SĐT) giữ subject để mọi lần thử lại dùng lại — TTL trượt, giờ.
+KHACH_TU_DONG_CHO_GIO = max(1, int(os.environ.get("COWORK_KHACH_TU_DONG_CHO_GIO", "24")))

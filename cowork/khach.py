@@ -952,40 +952,66 @@ def _gui_signup(conn, acc: dict) -> None:
 # ------------------------------------------------------------------ §16 đăng ký tự kích hoạt
 PATH_TU_DONG = "/api/internal/portal/dang-ky-tu-dong"
 THONG_BAO_BAN = "Hệ thống đang bận, vui lòng thử lại sau ít phút."
-#: Subject đã ký (giữ trong form khi CRM bận) sống tối đa ngần này giây: thử lại trong khoảng này
-#: dùng LẠI subject cũ ⇒ CRM (idempotent theo subject) không tạo khách thứ hai.
-SUB_KY_TTL = 1800
 _CRM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _ACC_ID_RE = re.compile(r"kh_[a-z0-9]{26}")
+#: Dòng đăng ký chờ (customer_tu_dong_cho) quá ngần này lần TTL ⇒ dọn hẳn (audit vẫn giữ subject).
+CHO_DON_SAU_TTL = 30
 
 
 def tu_dong_bat() -> bool:
     return config.KHACH_TU_DONG
 
 
-def ky_subject_cho(acc_id: str, phone: str, ps: str | None) -> str:
-    """Subject dùng lại khi thử lại sau 'bận': gắn SĐT + tiền-phiên trình duyệt, hạn 30 phút."""
-    exp = int(time.time()) + SUB_KY_TTL
-    sig = _ky("khach-tu-dong-sub", f"{acc_id}.{phone}.{exp}.{ps or '-'}")
-    return f"{acc_id}.{exp}.{sig}"
+def _giu_dang_ky_cho(conn, phone: str, ten: str, em: str | None, hash_b64: str, salt_b64: str,
+                     algo: str) -> dict:
+    """Đăng ký chờ phía server, khoá theo SĐT đã chuẩn hoá (một giao dịch ghi).
+
+    - Còn hạn (TTL trượt theo lần thử gần nhất) ⇒ DÙNG LẠI subject (mọi trình duyệt, mọi lần thử):
+      CRM idempotent theo subject ⇒ lần trước CRM đã tạo khách mà VIP ID quá hạn chờ thì lần này
+      nhận lại đúng `kich_hoat` cũ — không mồ côi, không khoá khách ra ngoài.
+    - Hết hạn ⇒ subject MỚI, subject cũ chuyển sang `subject_cu` (dự phòng khi CRM báo trùng).
+    - Lưu họ tên/email/băm mật khẩu của LẦN THỬ MỚI NHẤT (ý định hiện tại của khách; lệnh đối soát
+      dùng để tạo tài khoản với đúng mật khẩu khách đã đặt). Xoá khi thành công/trùng dứt khoát."""
+    now = _bay_gio()
+    het = _iso(now + timedelta(hours=config.KHACH_TU_DONG_CHO_GIO))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM customer_tu_dong_cho WHERE last_attempt<?",
+                     (_truoc(hours=config.KHACH_TU_DONG_CHO_GIO * CHO_DON_SAU_TTL),))
+        row = db.one(conn, "SELECT * FROM customer_tu_dong_cho WHERE phone_e164=?", (phone,))
+        if row and row["expires_at"] > _iso(now):
+            acc_id, cu = row["acc_id"], row["acc_id_cu"]
+            conn.execute("UPDATE customer_tu_dong_cho SET display_name=?, email_norm=?, "
+                         "password_hash=?, password_salt=?, password_algo=?, last_attempt=?, "
+                         "attempts=attempts+1, expires_at=? WHERE phone_e164=?",
+                         (ten, em, hash_b64, salt_b64, algo, _iso(now), het, phone))
+        else:
+            acc_id, cu = "kh_" + _ngau_nhien_26(), (row["acc_id"] if row else None)
+            conn.execute("INSERT OR REPLACE INTO customer_tu_dong_cho(phone_e164, acc_id, "
+                         "acc_id_cu, display_name, email_norm, password_hash, password_salt, "
+                         "password_algo, attempts, created_at, last_attempt, expires_at) "
+                         "VALUES(?,?,?,?,?,?,?,?,1,?,?,?)",
+                         (phone, acc_id, cu, ten, em, hash_b64, salt_b64, algo, _iso(now),
+                          _iso(now), het))
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    return {"acc_id": acc_id, "acc_id_cu": cu}
 
 
-def _doc_subject_cho(raw: str | None, phone: str, ps: str | None) -> str | None:
-    if not raw or len(raw) > 120 or raw.count(".") != 2:
-        return None
-    acc_id, exp, sig = raw.split(".")
-    if not _ACC_ID_RE.fullmatch(acc_id) or not exp.isdigit():
-        return None
-    mong = _ky("khach-tu-dong-sub", f"{acc_id}.{phone}.{exp}.{ps or '-'}")
-    if not hmac.compare_digest(mong, sig) or int(exp) < time.time():
-        return None
-    return acc_id
+def _xoa_dang_ky_cho(conn, phone: str, acc_id: str) -> None:
+    """Chỉ xoá khi dòng còn trỏ đúng subject vừa có kết quả dứt khoát (không xoá dòng mới hơn)."""
+    conn.execute("DELETE FROM customer_tu_dong_cho WHERE phone_e164=? AND (acc_id=? OR acc_id_cu=?)",
+                 (phone, acc_id, acc_id))
+    conn.commit()
 
 
 def tu_dong_chuan_bi(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, mat_khau_2: str,
-                     dong_y: bool, ip: str, request=None, sub_ky: str | None = None,
-                     ps: str | None = None) -> dict:
-    """Bước 1 (luồng KDF): kiểm đầu vào + giới hạn, kiểm trùng SĐT TẠI VIP ID, băm mật khẩu.
+                     dong_y: bool, ip: str, request=None) -> dict:
+    """Bước 1 (luồng KDF): kiểm đầu vào + giới hạn, kiểm trùng SĐT TẠI VIP ID, băm mật khẩu, giữ
+    đăng ký chờ theo SĐT (chọn subject).
 
     Trả {'kq': 'trung_noi_bo'} (SĐT đã có tài khoản ở mọi trạng thái chưa giải phóng — KHÔNG gọi CRM)
     hoặc {'kq': 'goi_crm', ...dữ liệu để gọi CRM và lưu}. Băm TRƯỚC khi gọi CRM: CRM đã tạo khách
@@ -999,50 +1025,83 @@ def tu_dong_chuan_bi(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, 
         # chờ duyệt ⇒ vẫn đánh dấu xung đột (hàng đợi signup cũ) cho nhân viên/lệnh backlog Q4.
         _xu_ly_trung(conn, trung, em, mat_khau, ip, request, can_bang=False)
         return {"kq": "trung_noi_bo", "phone": phone}
-    acc_id = _doc_subject_cho(sub_ky, phone, ps) or "kh_" + _ngau_nhien_26()
     hash_b64, salt_b64, algo = bam_mk(mat_khau)
-    return {"kq": "goi_crm", "acc_id": acc_id, "subject": "cust:" + acc_id, "phone": phone,
-            "ten": ten, "email": em, "hash": hash_b64, "salt": salt_b64, "algo": algo}
+    cho = _giu_dang_ky_cho(conn, phone, ten, em, hash_b64, salt_b64, algo)
+    return {"kq": "goi_crm", "acc_id": cho["acc_id"], "subject": "cust:" + cho["acc_id"],
+            "acc_id_cu": cho["acc_id_cu"], "phone": phone, "ten": ten, "email": em,
+            "hash": hash_b64, "salt": salt_b64, "algo": algo}
+
+
+def pb_subject_cu(pb: dict) -> dict | None:
+    """CRM báo `trung/tai_khoan_cong` cho subject hiện tại nhưng VIP ID còn giữ subject CŨ của SĐT
+    này (đăng ký chờ đã hết hạn) ⇒ bản pb để thử lại MỘT lần bằng subject cũ."""
+    cu = pb.get("acc_id_cu")
+    if not cu or cu == pb["acc_id"] or pb.get("da_thu_cu"):
+        return None
+    return {**pb, "acc_id": cu, "subject": "cust:" + cu, "da_thu_cu": True}
+
+
+class _QuaHanChot(TimeoutError):
+    pass
 
 
 def _http_post_tu_dong(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
     """Điểm gửi HTTP duy nhất của §16 (test thay thế). Host = host của CRM_PORTAL_INTERNAL_URL
     (httpx tự đặt, như mọi lời gọi VIP ID → CRM khác); không proxy từ env, không theo chuyển hướng,
-    không chuyển tiếp header nào của trình duyệt."""
+    không chuyển tiếp header nào của trình duyệt.
+
+    Mỗi pha (connect/write/read/pool) ≤ KHACH_TU_DONG_TIMEOUT (≤ 5 s) VÀ hạn chót TỔNG: thân phản hồi
+    đọc dạng luồng, quá hạn tổng hoặc quá 16 KB ⇒ dừng ngay (CRM nhỏ giọt không giữ được luồng)."""
     import httpx
     t = config.KHACH_TU_DONG_TIMEOUT
+    han = time.monotonic() + t
     with httpx.Client(timeout=httpx.Timeout(t), follow_redirects=False, trust_env=False) as c:
-        r = c.post(url, content=body, headers=headers)
-        return r.status_code, r.content[:16_384]
+        with c.stream("POST", url, content=body, headers=headers) as r:
+            buf = bytearray()
+            for chunk in r.iter_raw():
+                buf += chunk
+                if time.monotonic() > han:
+                    raise _QuaHanChot(f"quá hạn chót tổng {t}s")
+                if len(buf) > 16_384:
+                    break
+            if time.monotonic() > han:
+                raise _QuaHanChot(f"quá hạn chót tổng {t}s")
+            return r.status_code, bytes(buf[:16_384])
 
 
 def _phan_tich_crm(status: int, raw: bytes) -> dict:
-    """Kiểm CHẶT hình dạng phản hồi §16. Sai bất kỳ điều gì ⇒ {'kq': 'ban', 'ly_do': …}."""
+    """Kiểm CHẶT hình dạng phản hồi §16. Sai bất kỳ điều gì ⇒ {'kq': 'ban', 'ly_do': …}.
+
+    `co_the`: CRM CÓ THỂ đã tạo khách (không phải từ chối dứt khoát) — 4xx và 503 (CRM tắt cờ/bảo
+    trì, trả trước khi xử lý) là dứt khoát; 5xx khác và 200 sai hình dạng thì không chắc."""
     if status != 200:
-        return {"kq": "ban", "ly_do": f"HTTP {status}"}
+        return {"kq": "ban", "ly_do": f"HTTP {status}",
+                "co_the": status >= 500 and status != 503}
     try:
         d = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        return {"kq": "ban", "ly_do": "JSON sai"}
+        return {"kq": "ban", "ly_do": "JSON sai", "co_the": True}
     data = d.get("data") if isinstance(d, dict) else None
     if not isinstance(d, dict) or d.get("ok") is not True or not isinstance(data, dict):
-        return {"kq": "ban", "ly_do": "hình dạng sai"}
+        return {"kq": "ban", "ly_do": "hình dạng sai", "co_the": True}
     tt = data.get("trang_thai")
     if tt == "kich_hoat":
         crm_id = data.get("crm_customer_id")
         code = chuan_hoa_portal_code(data.get("portal_code")) \
             if isinstance(data.get("portal_code"), str) else None
         if not isinstance(crm_id, str) or not _CRM_ID_RE.fullmatch(crm_id) or not code:
-            return {"kq": "ban", "ly_do": "kich_hoat thiếu/sai crm_customer_id hoặc portal_code"}
+            return {"kq": "ban", "ly_do": "kich_hoat thiếu/sai crm_customer_id hoặc portal_code",
+                    "co_the": True}
         return {"kq": "kich_hoat", "crm_customer_id": crm_id, "portal_code": code}
     if tt == "trung" and data.get("loai") in ("tai_khoan_cong", "ho_so_cu"):
         return {"kq": data["loai"]}
-    return {"kq": "ban", "ly_do": "trang_thai lạ"}
+    return {"kq": "ban", "ly_do": "trang_thai lạ", "co_the": True}
 
 
 def goi_crm_tu_dong(pb: dict) -> dict:
     """Bước 2 (executor riêng, ngoài event loop): gọi CRM đồng bộ, ký HMAC vipid->crm như mọi lời
     gọi ra (method + path + ts + body). Không bao giờ ném lỗi: mọi sự cố ⇒ {'kq': 'ban'}."""
+    import httpx
     body = json.dumps({"subject": pb["subject"], "display_name": pb["ten"],
                        "phone_e164": pb["phone"], "email": pb["email"]},
                       ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1052,7 +1111,11 @@ def goi_crm_tu_dong(pb: dict) -> dict:
         status, raw = _http_post_tu_dong(config.CRM_PORTAL_INTERNAL_URL + PATH_TU_DONG, body,
                                          headers)
     except Exception as exc:  # noqa: BLE001 - timeout/mạng/… ⇒ bận
-        kq = {"kq": "ban", "ly_do": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        # Chưa kết nối được ⇒ chắc chắn CRM chưa nhận; mọi lỗi khác (quá hạn đọc, đứt giữa chừng…)
+        # ⇒ CRM có thể đã tạo khách.
+        chua_gui = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError))
+        kq = {"kq": "ban", "ly_do": f"{type(exc).__name__}: {str(exc)[:120]}",
+              "co_the": not chua_gui}
     else:
         kq = _phan_tich_crm(status, raw)
     if kq["kq"] == "ban":
@@ -1063,25 +1126,38 @@ def goi_crm_tu_dong(pb: dict) -> dict:
 
 def tu_dong_luu(conn, pb: dict, crm: dict, request=None) -> dict:
     """Bước 3: xử lý kết quả CRM. Trả {'kq': 'kich_hoat', 'acc', 'handoff'} | {'kq':
-    'tai_khoan_cong'|'ho_so_cu'|'ban'}. Chỉ `kich_hoat` mới tạo tài khoản (hoat_dong)."""
+    'tai_khoan_cong'|'ho_so_cu'|'ban'}. Chỉ `kich_hoat` mới tạo tài khoản (hoat_dong).
+
+    Khi lưu: họ tên/email/mật khẩu là của LẦN GỌI THÀNH CÔNG này (ý định hiện tại của khách). CRM
+    idempotent theo subject có thể đang giữ họ tên/email của lần gọi đầu — lệch này được chấp nhận
+    (hồ sơ CRM là nguồn đúng về họ tên; nhân viên sửa ở CRM)."""
     subject = pb["subject"]
     if crm["kq"] == "ban":
-        _ghi_audit(conn, "system", "khach.dang_ky.tu_dong.crm_loi", target_id=subject,
-                   detail={"ly_do": str(crm.get("ly_do"))[:200], "phone": che_sdt(pb["phone"])},
-                   request=request, lay_mau="crm")
+        if crm.get("co_the"):
+            # Không lấy mẫu: mỗi dòng là một subject có thể đã có khách ở CRM (đối soát được bằng
+            # `cowork.cli khach-doi-soat <SĐT|subject>`; đăng ký chờ giữ subject để thử lại).
+            _ghi_audit(conn, "system", "khach.dang_ky.tu_dong.co_the_mo_coi", target_id=subject,
+                       detail={"ly_do": str(crm.get("ly_do"))[:200], "phone": che_sdt(pb["phone"]),
+                               "phoneSha256": security.sha256(pb["phone"])}, request=request)
+        else:
+            _ghi_audit(conn, "system", "khach.dang_ky.tu_dong.crm_loi", target_id=subject,
+                       detail={"ly_do": str(crm.get("ly_do"))[:200], "phone": che_sdt(pb["phone"])},
+                       request=request, lay_mau="crm")
         return {"kq": "ban"}
     if crm["kq"] in ("tai_khoan_cong", "ho_so_cu"):
         _ghi_audit(conn, "khach:anon", "khach.dang_ky.tu_dong.trung", target_id=subject,
                    detail={"loai": crm["kq"], "phone": che_sdt(pb["phone"])}, request=request)
+        _xoa_dang_ky_cho(conn, pb["phone"], pb["acc_id"])  # trùng dứt khoát
         return {"kq": crm["kq"]}
     now = db.now_iso()
     sql = ("INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
            "password_hash, password_salt, password_algo, status, consent_at, phone_verified_at, "
            "phone_verified_by, phone_verified_method, crm_customer_id, portal_code, token_version, "
            "failed_attempts, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,'hoat_dong',?,?,"
-           "'tu_dong','tu_dong',?,?,1,0,?,?)")
+           "?,'tu_dong',?,?,1,0,?,?)")
     args = (pb["acc_id"], subject, pb["phone"], pb["email"], pb["ten"], pb["hash"], pb["salt"],
-            pb["algo"], now, now, crm["crm_customer_id"], crm["portal_code"], now, now)
+            pb["algo"], now, now, pb.get("nguoi", "tu_dong"), crm["crm_customer_id"],
+            crm["portal_code"], now, now)
     loi = None
     for lan in range(2):  # thử lại MỘT lần khi DB bận tạm thời (khoá ghi)
         try:
@@ -1100,9 +1176,13 @@ def tu_dong_luu(conn, pb: dict, crm: dict, request=None) -> dict:
             if lan == 0:
                 time.sleep(0.2)
     if loi is not None:
-        # CRM ĐÃ tạo khách cho subject này nhưng VIP ID không lưu được ⇒ hồ sơ CRM mồ côi (gắn
-        # subject chưa dùng). Ghi audit để vận hành đối soát; khách thấy trang trùng hoặc bận.
-        trung = db.one(conn, "SELECT id FROM customer_accounts WHERE phone_e164=?", (pb["phone"],))
+        trung = db.one(conn, "SELECT id, subject FROM customer_accounts WHERE phone_e164=?",
+                       (pb["phone"],))
+        if trung and trung["subject"] == subject:
+            # Lượt song song cùng SĐT (cùng subject nhờ đăng ký chờ) đã lưu trước: không mồ côi.
+            return {"kq": "tai_khoan_cong"}
+        # CRM ĐÃ tạo khách cho subject này nhưng VIP ID không lưu được ⇒ hồ sơ CRM mồ côi. Ghi audit
+        # để vận hành đối soát; khách thấy trang trùng hoặc bận (đăng ký chờ còn giữ subject).
         _ghi_audit(conn, "system", "khach.dang_ky.tu_dong.mo_coi", target_id=subject,
                    detail={"crm_customer_id": crm["crm_customer_id"],
                            "portal_code": crm["portal_code"], "phone": che_sdt(pb["phone"]),
@@ -1110,13 +1190,89 @@ def tu_dong_luu(conn, pb: dict, crm: dict, request=None) -> dict:
         log.error("CANH_BAO khach: CRM đã kích hoạt %s (%s, %s) nhưng VIP ID không lưu được: %s",
                   subject, crm["crm_customer_id"], crm["portal_code"], loi)
         return {"kq": "tai_khoan_cong"} if trung else {"kq": "ban"}
+    _xoa_dang_ky_cho(conn, pb["phone"], pb["acc_id"])
     acc = tai_khoan(conn, pb["acc_id"])
     _ghi_audit(conn, subject, "khach.dang_ky.tu_dong", target_id=subject,
                detail={"phone": che_sdt(pb["phone"]),
                        "email": che_email(pb["email"]) if pb["email"] else None,
                        "crm_customer_id": crm["crm_customer_id"], "portal_code": crm["portal_code"],
-                       "method": "tu_dong"}, request=request)
+                       "method": "tu_dong", "subject_cu": bool(pb.get("da_thu_cu")),
+                       "boi": pb.get("nguoi", "tu_dong")}, request=request)
     return {"kq": "kich_hoat", "acc": acc, "handoff": tao_handoff(conn, acc)}
+
+
+def tu_dong_thuc_hien_dong_bo(conn, pb: dict, request=None) -> dict:
+    """Gọi CRM (+ thử lại một lần bằng subject cũ khi CRM báo tai_khoan_cong) rồi lưu. Dùng cho CLI
+    đối soát (đồng bộ); web dùng bản async tương đương trong khach_web."""
+    crm = goi_crm_tu_dong(pb)
+    if crm["kq"] == "tai_khoan_cong":
+        pb2 = pb_subject_cu(pb)
+        if pb2:
+            crm2 = goi_crm_tu_dong(pb2)
+            if crm2["kq"] == "kich_hoat":
+                pb, crm = pb2, crm2
+    return tu_dong_luu(conn, pb, crm, request)
+
+
+def doi_soat_tu_dong(conn, ai: str, *, sdt: str | None = None, ten: str | None = None,
+                     email: str | None = None, actor: str = "ops") -> tuple[int, str]:
+    """Ops: hỏi lại CRM (cùng endpoint, subject đã lưu) và tạo/liên kết tài khoản VIP ID nếu CRM báo
+    `kich_hoat` cho subject đó. `ai` = SĐT (dùng đăng ký chờ đã lưu, kể cả đã hết hạn) hoặc subject
+    `cust:kh_…` (từ audit `co_the_mo_coi`; không còn đăng ký chờ thì cần --sdt và --ten, tài khoản tạo
+    với mật khẩu ngẫu nhiên — khách nhận link đặt lại qua nhân viên). Trả (mã thoát, thông báo)."""
+    raw = (ai or "").strip()
+    if raw.startswith("cust:"):
+        acc_id = raw[5:]
+        if not _ACC_ID_RE.fullmatch(acc_id):
+            return 2, "Subject không hợp lệ."
+        co = tai_khoan_theo_subject(conn, raw)
+        if co:
+            return 0, f"Đã liên kết: {co['subject']} · {co['portal_code']} · {co['status']}."
+        row = db.one(conn, "SELECT * FROM customer_tu_dong_cho WHERE acc_id=? OR acc_id_cu=?",
+                     (acc_id, acc_id))
+    else:
+        ph = chuan_hoa_sdt(raw)
+        if not ph:
+            return 2, "SĐT hoặc subject không hợp lệ."
+        row = db.one(conn, "SELECT * FROM customer_tu_dong_cho WHERE phone_e164=?", (ph,))
+        if not row:
+            return 1, ("Không có đăng ký chờ cho SĐT này. Tìm subject trong audit "
+                       "khach.dang_ky.tu_dong.co_the_mo_coi rồi chạy lại với subject.")
+        acc_id = row["acc_id"]
+    tam = False
+    if row:
+        pb = {"acc_id": acc_id, "subject": "cust:" + acc_id, "phone": row["phone_e164"],
+              "ten": row["display_name"], "email": row["email_norm"], "hash": row["password_hash"],
+              "salt": row["password_salt"], "algo": row["password_algo"],
+              "acc_id_cu": row["acc_id_cu"] if row["acc_id_cu"] != acc_id else None}
+    else:
+        ph, t = chuan_hoa_sdt(sdt), chuan_hoa_ten(ten)
+        em = chuan_hoa_email(email) if email else None
+        if not ph or not t:
+            return 2, "Không còn đăng ký chờ cho subject này: cần --sdt và --ten."
+        h, sa, al = bam_mk(security.token_moi(32))  # mật khẩu ngẫu nhiên, không ai biết
+        pb = {"acc_id": acc_id, "subject": "cust:" + acc_id, "phone": ph, "ten": t, "email": em,
+              "hash": h, "salt": sa, "algo": al, "acc_id_cu": None}
+        tam = True
+    pb["nguoi"] = actor[:120]
+    co = db.one(conn, "SELECT subject, status, portal_code FROM customer_accounts WHERE phone_e164=?",
+                (pb["phone"],))
+    if co:
+        if co["subject"] == pb["subject"]:
+            return 0, f"Đã liên kết: {co['subject']} · {co['portal_code']} · {co['status']}."
+        return 1, f"SĐT đã thuộc tài khoản VIP ID khác ({co['subject']}); không đổi gì."
+    ket = tu_dong_thuc_hien_dong_bo(conn, pb)
+    _ghi_audit(conn, actor, "khach.ops.doi_soat_tu_dong", target_id=pb["subject"],
+               detail={"ket_qua": ket["kq"], "phone": che_sdt(pb["phone"]),
+                       "mat_khau_tam": tam})
+    if ket["kq"] == "kich_hoat":
+        acc = ket["acc"]
+        return 0, (f"Đã tạo tài khoản {acc['subject']} · {acc['portal_code']} "
+                   f"(crm {acc['crm_customer_id']})."
+                   + (" Mật khẩu ngẫu nhiên: nhân viên cấp link đặt lại cho khách." if tam else ""))
+    if ket["kq"] == "ban":
+        return 3, "CRM bận/lỗi — chưa đổi gì, thử lại sau."
+    return 1, f"CRM báo trùng ({ket['kq']}) cho subject này — không tạo tài khoản."
 
 
 # Token chuyển phiên dangky → dangnhap. Cookie là host-only nên dangky không đặt được phiên
