@@ -347,3 +347,86 @@ chối launch (mốc `revoked_at_ms` ở tương lai).
   path cho phép theo ranh giới `/`, không `\`, `//`, `.`/`..`, ký tự điều khiển hay mã hoá đánh lừa
   (`%2F %5C %2E %00`…). Hợp lệ ⇒ launch `…/portal/auth/launch?token=…&tiep=<chỉ path>` (CRM tự quyết);
   không hợp lệ ⇒ bỏ qua, như `vao-cong` mặc định.
+
+### §16 — Đăng ký tự kích hoạt (`COWORK_KHACH_TU_DONG`, owner chốt 09/11/2026)
+Căn cứ: `DE_XUAT_TU_DONG_DUYET.md` §5–6 (repo website). Mặc định **tắt** (`0`): luồng chờ nhân viên
+duyệt giữ nguyên từng chi tiết. Tắt cờ là rollback, không đổi dữ liệu (tài khoản đã tự kích hoạt vẫn
+đăng nhập bình thường).
+
+| Biến | Ý nghĩa |
+|---|---|
+| `COWORK_KHACH_TU_DONG` | `1` ⇒ đăng ký gọi CRM đồng bộ, CRM trả `kich_hoat` thì tạo tài khoản `hoat_dong` ngay |
+| `CRM_PORTAL_INTERNAL_URL` | Đích nội bộ CRM (vd `http://crm:3000` trong mạng docker). Production + cờ bật ⇒ **bắt buộc đặt tường minh** |
+| `COWORK_KHACH_TU_DONG_TIMEOUT` | Hạn chót tổng mỗi lời gọi CRM, giây (mặc định và tối đa 5) |
+| `COWORK_KHACH_HANDOFF_TTL` | Hạn token chuyển phiên dangky → dangnhap, giây (10–60, mặc định 60) |
+
+**Chặn khởi động khi cờ bật:** `CRM_PORTAL_INTERNAL_URL` phải là https, hoặc http CHỈ tới đích nội bộ
+(cùng quy tắc với CRM `lib/internal-url.js`: tên dịch vụ docker một nhãn, `localhost`/`*.localhost`,
+IPv4 127/8, 10/8, 172.16/12, 192.168/16, IPv6 `::1`, `fc00::/7`; không userinfo). Ở production còn bắt
+buộc biến này được đặt tường minh và `VIPID_PORTAL_SECRET` có sẵn (env hoặc tệp
+`VIPID_PORTAL_SECRET_FILE`, không tự sinh).
+
+**Luồng `POST /tai-khoan/dang-ky` (host dangky)** — sau CSRF/cùng nguồn, Turnstile, định dạng, pilot,
+giới hạn theo IP và trần toàn hệ thống (không đổi):
+1. Chuẩn hoá SĐT; VIP ID đã có tài khoản với SĐT đó (mọi trạng thái chưa giải phóng, kể cả
+   `cho_duyet`) ⇒ trang **"Số điện thoại này đã được đăng ký"** (409) với [Dùng số khác] [Đăng nhập]
+   [Quên mật khẩu]. **Không gọi CRM** (tài khoản kia đang chờ duyệt thì vẫn tăng
+   `phone_conflict_count` và xếp hàng cập nhật signup như luồng cũ).
+2. Băm mật khẩu (luồng KDF), rồi gọi CRM **đồng bộ** trong executor riêng (`khach-crm-dk`, tối đa 16
+   lời gọi đang chờ, vượt ⇒ bận): `POST {CRM_PORTAL_INTERNAL_URL}/api/internal/portal/dang-ky-tu-dong`,
+   ký HMAC `vipid->crm` canonical như mọi lời gọi ra (`X-Portal-Ts`, `X-Portal-Sig` trên
+   `vipid->crm.POST.<path>.<ts>.<body>`), `Idempotency-Key` = subject, body
+   `{subject, display_name, phone_e164, email|null}`. Host = host của `CRM_PORTAL_INTERNAL_URL`
+   (httpx tự đặt, như hàng đợi signup/thu-hoi), không proxy từ env, không theo chuyển hướng, không
+   chuyển tiếp header nào của trình duyệt.
+3. Kết quả (kiểm chặt hình dạng):
+   - `kich_hoat {crm_customer_id, portal_code}` ⇒ tạo tài khoản `hoat_dong`, `phone_verified_at=now`,
+     `phone_verified_method='tu_dong'`, audit `khach.dang_ky.tu_dong` ⇒ trang **"Tạo tài khoản thành
+     công · Mã khách hàng VGxxxx"** (201) với nút **Vào cổng khách hàng**.
+   - `trung/tai_khoan_cong` ⇒ như bước 1. `trung/ho_so_cu` ⇒ "Số này đã có hồ sơ khách hàng tại VIP
+     GROUP. Vui lòng gọi hoặc nhắn Zalo 0961 102 655…" + [Dùng số khác]. Không tạo tài khoản.
+   - HTTP ≠ 200 (503 `AUTO_APPROVE_OFF`, 401 chữ ký, 409 phát lại…), quá hạn, lỗi mạng, JSON sai, hình
+     dạng sai, `portal_code`/`crm_customer_id` sai ⇒ form đăng ký kèm "Hệ thống đang bận, vui lòng thử
+     lại sau ít phút." (503). Không tạo gì, không xếp hàng; audit `khach.dang_ky.tu_dong.crm_loi`
+     (lấy mẫu 1 dòng/phút).
+
+**Idempotency / hồ sơ CRM mồ côi.** Form "bận" mang `_sub` = subject đã ký (HMAC `SECRET_KEY`, gắn SĐT
++ cookie tiền-phiên của trình duyệt, hạn 30 phút). Khách thử lại cùng SĐT trên cùng trình duyệt ⇒ dùng
+**lại subject cũ** ⇒ CRM (idempotent theo subject) trả đúng kết quả cũ, không tạo khách thứ hai — kể cả
+khi lần trước CRM đã tạo khách nhưng VIP ID hết hạn chờ. Khi CRM trả `kich_hoat` mà VIP ID không lưu
+được (đua cùng SĐT, `portal_code`/`crm_customer_id` đã thuộc tài khoản khác, DB lỗi sau một lần thử
+lại) ⇒ không tạo, audit `khach.dang_ky.tu_dong.mo_coi` (subject, crm_customer_id, portal_code) + log
+`CANH_BAO`: vận hành đối soát và khoá/gộp hồ sơ CRM đó. Khách thấy trang trùng (nếu SĐT vừa có tài
+khoản) hoặc trang bận.
+
+**Đồng thời cùng SĐT.** `customer_accounts.phone_e164 UNIQUE` ⇒ chỉ một tài khoản; lượt thua thấy
+"đã được đăng ký" (và nếu đã qua CRM thì có audit mồ côi như trên — CRM thật khoá theo SĐT nên thực tế
+lượt thua nhận `trung/tai_khoan_cong`).
+
+**Chuyển phiên dangky → dangnhap (`POST /tai-khoan/nhan-phien`, chỉ host dangnhap).** Cookie host-only
+nên trang thành công trên dangky không đặt được phiên dangnhap. Trang này chứa một form POST (body, không
+nằm trên URL) sang `https://dangnhap…/tai-khoan/nhan-phien` với token
+`v1.<account_id>.<exp>.<nonce>.<HMAC SECRET_KEY>`:
+- **gắn tài khoản**: `account_id` nằm trong phần ký VÀ trong dòng DB `customer_handoff` (chỉ lưu
+  sha256 nonce); đổi tài khoản ⇒ sai chữ ký hoặc không khớp dòng;
+- **≤ 60 giây**: kiểm cả `exp` trong token (không được xa hơn TTL) lẫn `expires_at` trong DB;
+- **một lần**: `UPDATE … SET used_at WHERE used_at IS NULL` nguyên tử; phát lại ⇒ 400;
+- **chống login CSRF**: chỉ nhận `Origin` đúng bằng origin dangky (chế độ một host: cùng nguồn);
+  trang lạ không gửi được. CSP `form-action` chỉ mở thêm origin dangnhap cho riêng trang thành công;
+- tài khoản phải còn `hoat_dong` + đủ điều kiện (bị CRM khoá trong 60 giây đó ⇒ từ chối) và thuộc
+  pilot (khi pilot bật);
+- thành công ⇒ tạo phiên `vg_khach` + cookie thiết bị như đăng nhập thường, audit `khach.handoff`, rồi
+  303 thẳng sang launch token của CRM (vào cổng). Hết hạn/đã dùng ⇒ trang "Liên kết vào cổng đã hết
+  hạn…" + link đăng nhập; trang thành công cũng có link `dang-nhap?u=VGxxxx` (chỉ điền sẵn mã VG,
+  không bao giờ đưa SĐT hay mật khẩu lên URL).
+
+**Tài khoản tự kích hoạt** đăng nhập y như tài khoản được duyệt (`hoat_dong` + SĐT đã xác minh +
+`crm_customer_id`). Tài khoản `cho_duyet` có sẵn vẫn đi đường `ket-qua-duyet` cũ (lệnh backlog Q4 phía
+CRM gọi đúng đường đó).
+
+**CRM giả** (`scripts/khach_mock_crm.py`, `COWORK_KHACH_TU_DONG=1 ./scripts/khach-dev.sh --mock-crm`):
+SĐT đuôi 7 ⇒ `ho_so_cu`; đuôi 6 ⇒ 503 `AUTO_APPROVE_OFF`; SĐT đã cấp ⇒ `tai_khoan_cong`; còn lại ⇒
+`kich_hoat` VG1001, VG1002…; idempotent theo subject; `MOCK_AUTO_APPROVE=0` ⇒ mọi lời gọi 503.
+
+**Rủi ro owner đã chấp nhận** (§3 đề xuất): lộ "số này đã đăng ký" (giảm bằng Turnstile, 5 lượt/giờ/IP,
+trần 200/giờ; thông báo không nói tên hay mã khách); không xác minh chủ SĐT (Q3).
