@@ -170,6 +170,11 @@ class KhachHeaders(BaseHTTPMiddleware):
         form_dn = h.get("x-khach-form-dangnhap") == "1"
         if "x-khach-form-dangnhap" in h:
             del h["x-khach-form-dangnhap"]
+        if form_dn:
+            # Trang thành công POST chéo origin sang dangnhap: với 'same-origin' Chromium gửi
+            # Origin: null ⇒ /nhan-phien từ chối. Riêng trang này dùng strict-origin-when-cross-origin
+            # để trình duyệt gửi Origin thật của dangky (chỉ origin, không path — token nằm trong body).
+            h["Referrer-Policy"] = "strict-origin-when-cross-origin"
         dn = _origin(khach.url_dangnhap()) if form_dn else ""
         dich = " ".join(x for x in (dn, crm) if x)
         h["Content-Security-Policy"] = (
@@ -530,6 +535,8 @@ async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_k
         return pb
     if pb["kq"] == "trung_noi_bo":
         return _trang_trung(request, "tai_khoan_cong")
+    if pb["kq"] == "ho_so_cu":  # tài khoản đã đậu chờ Liên kết, cùng người đăng ký lại
+        return _trang_trung(request, "ho_so_cu")
     if pb["kq"] == "dang_xu_ly":  # dòng chờ của người khác (mật khẩu khác) còn hạn: không gọi CRM
         return _form_dang_ky(request, 503, loi=khach.THONG_BAO_DANG_XU_LY,
                              form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})

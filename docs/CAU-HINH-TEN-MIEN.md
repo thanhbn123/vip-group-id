@@ -383,8 +383,15 @@ giới hạn theo IP và trần toàn hệ thống (không đổi):
    - `kich_hoat {crm_customer_id, portal_code}` ⇒ tạo tài khoản `hoat_dong`, `phone_verified_at=now`,
      `phone_verified_method='tu_dong'`, audit `khach.dang_ky.tu_dong` ⇒ trang **"Tạo tài khoản thành
      công · Mã khách hàng VGxxxx"** (201) với nút **Vào cổng khách hàng**.
-   - `trung/tai_khoan_cong` ⇒ như bước 1. `trung/ho_so_cu` ⇒ "Số này đã có hồ sơ khách hàng tại VIP
-     GROUP. Vui lòng gọi hoặc nhắn Zalo 0961 102 655…" + [Dùng số khác]. Không tạo tài khoản.
+   - `trung/tai_khoan_cong` ⇒ như bước 1, không tạo tài khoản.
+   - `trung/ho_so_cu` ⇒ "Số này đã có hồ sơ khách hàng tại VIP GROUP. Vui lòng gọi hoặc nhắn Zalo
+     0961 102 655…" + [Dùng số khác]. **VIP ID đậu tài khoản `cho_duyet`** (`tu_dong_loai='ho_so_cu'`)
+     gắn ĐÚNG subject vừa gửi CRM, với mật khẩu/SĐT/họ tên/email khách nhập (CRM đã giữ dòng
+     `portal_signups` cho subject đó; VIP ID không gửi signup cũ). Owner Q1: nhân viên xác minh rồi bấm
+     **Liên kết** ⇒ CRM gửi `ket-qua-duyet` approved ⇒ đường duyệt có sẵn kích hoạt; rejected ⇒ giải
+     phóng SĐT. Đăng nhập trước khi Liên kết ⇒ trang "chờ duyệt" có sẵn. Đăng ký lại cùng SĐT khi đang
+     đậu: cùng mật khẩu ⇒ lại trang hồ sơ cũ; mật khẩu khác ⇒ trang "đang xử lý" chung (không chiếm,
+     không gọi CRM, không đổi tài khoản).
    - HTTP ≠ 200 (503 `AUTO_APPROVE_OFF`, 401 chữ ký, 409 phát lại…), quá hạn, lỗi mạng, JSON sai, hình
      dạng sai, `portal_code`/`crm_customer_id` sai ⇒ form đăng ký kèm "Hệ thống đang bận, vui lòng thử
      lại sau ít phút." (503). Không tạo gì, không xếp hàng; audit `khach.dang_ky.tu_dong.crm_loi`
@@ -453,7 +460,10 @@ nằm trên URL) sang `https://dangnhap…/tai-khoan/nhan-phien` với token
 - **≤ 60 giây**: kiểm cả `exp` trong token (không được xa hơn TTL) lẫn `expires_at` trong DB;
 - **một lần**: `UPDATE … SET used_at WHERE used_at IS NULL` nguyên tử; phát lại ⇒ 400;
 - **chống login CSRF**: chỉ nhận `Origin` đúng bằng origin dangky (chế độ một host: cùng nguồn);
-  trang lạ không gửi được. CSP `form-action` chỉ mở thêm origin dangnhap cho riêng trang thành công;
+  `null`, khachhang, dangnhap hay origin lạ ⇒ 403. CSP `form-action` chỉ mở thêm origin dangnhap cho
+  riêng trang thành công. **Riêng trang thành công** gửi `Referrer-Policy:
+  strict-origin-when-cross-origin` (mọi trang khác giữ `same-origin`): với `same-origin`, Chromium gửi
+  `Origin: null` khi POST chéo origin (E2E thật 09/11). Token nằm trong body, Referer chỉ mang origin;
 - tài khoản phải còn `hoat_dong` + đủ điều kiện (bị CRM khoá trong 60 giây đó ⇒ từ chối) và thuộc
   pilot (khi pilot bật);
 - thành công ⇒ tạo phiên `vg_khach` + cookie thiết bị như đăng nhập thường, audit `khach.handoff`, rồi

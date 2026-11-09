@@ -1042,6 +1042,15 @@ def tu_dong_chuan_bi(conn, *, ho_ten: str, sdt: str, email: str, mat_khau: str, 
                                            mat_khau=mat_khau, mat_khau_2=mat_khau_2,
                                            dong_y=dong_y, ip=ip, request=request)
     trung = db.one(conn, "SELECT * FROM customer_accounts WHERE phone_e164=?", (phone,))
+    if trung and trung["status"] == "cho_duyet" and trung.get("tu_dong_loai") == "ho_so_cu":
+        # Tài khoản đậu chờ nhân viên Liên kết hồ sơ cũ: cùng người (khớp mật khẩu) ⇒ lại trang hồ sơ
+        # cũ (hotline); người khác ⇒ trang 'đang xử lý' chung — không chiếm, không gọi CRM.
+        if kiem_mk(mat_khau, trung):
+            return {"kq": "ho_so_cu", "phone": phone}
+        _ghi_audit(conn, "khach:anon", "khach.dang_ky.tu_dong.dang_xu_ly", target_id=trung["subject"],
+                   detail={"phone": che_sdt(phone), "loai": "ho_so_cu"}, request=request,
+                   lay_mau=f"{ip}:{phone}")
+        return {"kq": "dang_xu_ly", "phone": phone}
     if trung:
         # Owner §16: báo công khai "đã được đăng ký" (không cân bằng thời gian). Tài khoản kia còn
         # chờ duyệt ⇒ vẫn đánh dấu xung đột (hàng đợi signup cũ) cho nhân viên/lệnh backlog Q4.
@@ -1189,6 +1198,8 @@ def tu_dong_luu(conn, pb: dict, crm: dict, request=None) -> dict:
     if crm["kq"] in ("tai_khoan_cong", "ho_so_cu"):
         _ghi_audit(conn, "khach:anon", "khach.dang_ky.tu_dong.trung", target_id=subject,
                    detail={"loai": crm["kq"], "phone": che_sdt(pb["phone"])}, request=request)
+        if crm["kq"] == "ho_so_cu":
+            _dau_cho_duyet_ho_so_cu(conn, pb, request)
         _xoa_dang_ky_cho(conn, pb["phone"], pb["acc_id"])  # trùng dứt khoát
         return {"kq": crm["kq"]}
     now = db.now_iso()
@@ -1241,6 +1252,28 @@ def tu_dong_luu(conn, pb: dict, crm: dict, request=None) -> dict:
                        "method": "tu_dong", "subject_cu": bool(pb.get("da_thu_cu")),
                        "boi": pb.get("nguoi", "tu_dong")}, request=request)
     return {"kq": "kich_hoat", "acc": acc, "handoff": tao_handoff(conn, acc)}
+
+
+def _dau_cho_duyet_ho_so_cu(conn, pb: dict, request=None) -> None:
+    """CRM báo `trung/ho_so_cu` (owner Q1: nhân viên xác minh rồi bấm Liên kết). CRM đã giữ dòng
+    portal_signups cho ĐÚNG subject này ⇒ VIP ID tạo tài khoản ở trạng thái `cho_duyet` gắn subject đó
+    (mật khẩu/SĐT/họ tên/email khách vừa nhập). Khi nhân viên Liên kết, CRM gửi ket-qua-duyet(approved)
+    ⇒ đường duyệt có sẵn kích hoạt; rejected ⇒ giải phóng SĐT. Không gửi signup cũ (CRM đã có dòng)."""
+    now = db.now_iso()
+    try:
+        conn.execute(
+            "INSERT INTO customer_accounts(id, subject, phone_e164, email_norm, display_name, "
+            "password_hash, password_salt, password_algo, status, consent_at, tu_dong_loai, "
+            "token_version, failed_attempts, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'cho_duyet',?,'ho_so_cu',1,0,?,?)",
+            (pb["acc_id"], pb["subject"], pb["phone"], pb["email"], pb["ten"], pb["hash"],
+             pb["salt"], pb["algo"], now, now, now))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()  # lượt song song cùng SĐT đã đậu trước: giữ tài khoản đó
+        return
+    _ghi_audit(conn, pb["subject"], "khach.dang_ky.tu_dong.ho_so_cu_cho_duyet",
+               target_id=pb["subject"], detail={"phone": che_sdt(pb["phone"])}, request=request)
 
 
 def tu_dong_thuc_hien_dong_bo(conn, pb: dict, request=None) -> dict:
@@ -1328,6 +1361,9 @@ def doi_soat_tu_dong(conn, ai: str, *, sdt: str | None = None, ten: str | None =
         return 3, "CRM bận/lỗi — chưa đổi gì, thử lại sau."
     if ket["kq"] == "tu_choi":
         return 1, "CRM từ chối dứt khoát subject này (SIGNUP_REJECTED/SUBJECT_HAS_USER) — không tạo."
+    if ket["kq"] == "ho_so_cu":
+        return 0, (f"CRM báo trùng hồ sơ cũ: đã tạo tài khoản CHỜ DUYỆT {pb['subject']}; nhân viên "
+                   "xác minh rồi bấm Liên kết ở CRM để kích hoạt.")
     return 1, f"CRM báo trùng ({ket['kq']}) cho subject này — không tạo tài khoản."
 
 

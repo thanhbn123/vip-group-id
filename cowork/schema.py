@@ -253,6 +253,7 @@ CREATE TABLE IF NOT EXISTS customer_accounts(
     phone_verified_at TEXT,
     phone_verified_by TEXT,
     phone_verified_method TEXT,
+    tu_dong_loai TEXT,
     crm_customer_id TEXT,
     customer_code TEXT,
     portal_code TEXT UNIQUE CHECK(portal_code IS NULL OR (

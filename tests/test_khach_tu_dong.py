@@ -320,8 +320,10 @@ def test_crm_tai_khoan_cong(td, crm_td):
     assert _so_tk() == 0 and len(crm_td.goi) == 1
 
 
-def test_crm_ho_so_cu(td, crm_td):
-    dkc, _ = td
+def test_crm_ho_so_cu_dau_cho_duyet_roi_lien_ket(td, crm_td):
+    """Owner Q1: hồ sơ cũ ⇒ VIP ID đậu tài khoản cho_duyet gắn đúng subject đã gửi CRM; nhân viên
+    Liên kết ⇒ CRM gửi ket-qua-duyet(approved) ⇒ kích hoạt, đăng nhập được."""
+    dkc, dnc = td
     crm_td.che_do = "ho_so_cu"
     r = dk(dkc, 7)
     assert r.status_code == 409
@@ -329,8 +331,73 @@ def test_crm_ho_so_cu(td, crm_td):
     assert "0961 102 655" in r.text and "Dùng số khác" in r.text
     assert "quen-mat-khau" not in r.text
     csp = _csp_sach(r)
-    assert DN not in csp
-    assert _so_tk() == 0
+    assert DN not in csp and r.headers["referrer-policy"] == "same-origin"
+    acc = acc_theo_sdt("+84900000007")
+    assert acc["status"] == "cho_duyet" and acc["tu_dong_loai"] == "ho_so_cu"
+    assert acc["subject"] == crm_td.goi[0]["body"]["subject"]
+    assert acc["crm_customer_id"] is None and acc["phone_verified_at"] is None
+    assert _cho("+84900000007") is None
+    assert _audit("khach.dang_ky.tu_dong.ho_so_cu_cho_duyet")
+    conn = db.connect()
+    try:  # CRM đã có dòng signup cho subject này ⇒ không xếp hàng signup cũ
+        assert db.scalar(conn, "SELECT COUNT(*) FROM crm_sync_pending") == 0
+    finally:
+        conn.close()
+    # Đăng nhập trước khi được Liên kết ⇒ trang chờ duyệt có sẵn.
+    r = dang_nhap(dnc, "0900000007")
+    assert r.status_code == 303 and r.headers["location"] == "/tai-khoan/cho-duyet"
+    # Đăng ký lại: cùng mật khẩu ⇒ lại trang hồ sơ cũ; mật khẩu khác ⇒ 'đang xử lý'. Không gọi CRM.
+    n = len(crm_td.goi)
+    r = dk(KC(DK), 7)
+    assert r.status_code == 409 and "đã có hồ sơ khách hàng" in r.text
+    ke = KC(DK)
+    r = ke.post("/tai-khoan/dang-ky", data=_form(ke, 7, mat_khau=MK_KHAC, mat_khau_2=MK_KHAC),
+                follow_redirects=False)
+    assert r.status_code == 503 and khach.THONG_BAO_DANG_XU_LY in r.text
+    assert len(crm_td.goi) == n
+    a2 = acc_theo_sdt("+84900000007")
+    assert a2["password_hash"] == acc["password_hash"] and a2["phone_conflict_count"] == 0
+    # Nhân viên Liên kết ⇒ CRM gửi ket-qua-duyet(approved) cho đúng subject.
+    r = duyet(dnc, acc["subject"], 7)
+    assert r.status_code == 200, r.text
+    a3 = acc_theo_sdt("+84900000007")
+    assert a3["status"] == "hoat_dong" and a3["phone_verified_method"] == "duyet_crm"
+    token_launch(dang_nhap(KC(DN), "0900000007"))
+
+
+def test_crm_ho_so_cu_tu_choi_giai_phong_sdt(td, crm_td):
+    dkc, dnc = td
+    crm_td.che_do = "ho_so_cu"
+    dk(dkc, 7)
+    acc = acc_theo_sdt("+84900000007")
+    from test_khach_p1 import goi_noi_bo
+    r = goi_noi_bo(dnc, "/api/internal/khach/ket-qua-duyet",
+                   {"subject": acc["subject"], "decision": "rejected", "reason": "không phải chủ"})
+    assert r.status_code == 200 and acc_theo_sdt("+84900000007") is None
+    crm_td.che_do = "kich_hoat"
+    assert dk(KC(DK), 7).status_code == 201  # SĐT được giải phóng, đăng ký lại được
+
+
+def test_trang_thanh_cong_referrer_policy_cho_origin_that(td, crm_td):
+    """E2E thật: với 'same-origin' Chromium gửi Origin: null khi POST chéo origin ⇒ trang thành công
+    phải dùng strict-origin-when-cross-origin; các trang khác giữ same-origin."""
+    dkc, dnc = td
+    assert dkc.get("/tai-khoan/dang-ky").headers["referrer-policy"] == "same-origin"
+    r = dk(dkc, 1)
+    assert r.status_code == 201
+    assert r.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+    csp = r.headers["content-security-policy"]
+    fa = re.search(r"form-action ([^;]+);", csp).group(1)
+    assert fa == f"'self' {DN} http://crm.localhost:8897"  # chỉ thêm đúng origin dangnhap
+    assert "x-khach-form-dangnhap" not in r.headers
+    t = _handoff(r.text)
+    for o in ("null", "https://khachhang.vipgroup.com.vn", "https://evil.example", DN):
+        assert _nhan(dnc, t, origin=o).status_code == 403, o
+    # Trình duyệt thật (strict-origin-when-cross-origin) gửi Origin = dangky ⇒ thành công.
+    r = dnc.post("/tai-khoan/nhan-phien", data={"t": t}, follow_redirects=False,
+                 headers={"origin": DK, "sec-fetch-site": "same-site", "referer": DK + "/"})
+    token_launch(r)
+    assert dnc.get("/tai-khoan/ho-so").headers["referrer-policy"] == "same-origin"
 
 
 # ------------------------------------------------------------------ CRM lỗi ⇒ không tạo gì
@@ -884,6 +951,19 @@ def test_crm_409_khac_van_la_ban(td, crm_td):
     dkc, _ = td
     crm_td.che_do = _tra(409, b'{"error":{"code":"PHAT_LAI","message":"x"}}')
     assert dk(dkc, 1).status_code == 503 and _cho() is not None
+
+
+def test_mock_crm_ho_so_cu_lien_ket_dang_nhap(td, mock_crm):
+    """Chuỗi đầy đủ với CRM giả qua HTTP: đăng ký → ho_so_cu → đậu cho_duyet → ket-qua-duyet
+    (Liên kết) → đăng nhập được."""
+    _, dnc = td
+    r = dk(KC(DK), 7)
+    assert r.status_code == 409 and "đã có hồ sơ" in r.text
+    acc = acc_theo_sdt("+84900000007")
+    assert acc["status"] == "cho_duyet"
+    assert dang_nhap(dnc, "0900000007").headers["location"] == "/tai-khoan/cho-duyet"
+    assert duyet(dnc, acc["subject"], 7).status_code == 200
+    token_launch(dang_nhap(KC(DN), "0900000007"))
 
 
 def test_mock_crm_409(td, mock_crm, monkeypatch):
