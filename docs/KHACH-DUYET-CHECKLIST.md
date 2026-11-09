@@ -25,5 +25,20 @@ Khách quên mật khẩu liên hệ hotline/Zalo (mặc định 0961 102 655):
    cấp link mới làm link cũ mất hiệu lực. Đặt lại xong, mọi phiên đăng nhập cũ bị đăng xuất.
 4. Không đọc link qua điện thoại cho người khác, không gửi tới số khác.
 
+## Trùng hồ sơ cũ (`ho_so_cu`) — đăng ký tự kích hoạt §16
+Khi bật `COWORK_KHACH_TU_DONG=1`, khách đăng ký bằng SĐT trùng **hồ sơ khách cũ** (chưa có tài khoản
+cổng) sẽ thấy "Số này đã có hồ sơ tại VIP GROUP… nhân viên xác minh và gửi link đặt mật khẩu tới số
+điện thoại trên hồ sơ". CRM hiện yêu cầu ở tab **"Trùng hồ sơ cũ"**; VIP ID giữ một tài khoản
+`cho_duyet` gắn subject đó. **Người đăng ký chưa chắc là chủ hồ sơ** — làm đúng thứ tự:
+1. **Gọi đúng SĐT ghi trên hồ sơ CRM** (không gọi số khách tự khai ở nơi khác).
+2. Xác nhận người nghe máy **chính là người vừa đăng ký** (họ tên, thời điểm đăng ký, thông tin trên
+   hồ sơ). Không xác nhận được ⇒ **Từ chối** (VIP ID giải phóng SĐT).
+3. Bấm **Liên kết** hồ sơ có sẵn. VIP ID kích hoạt tài khoản nhưng **thay mật khẩu khách tự đặt bằng
+   mật khẩu ngẫu nhiên** và đăng xuất mọi phiên (audit `khach.ho_so_cu.lien_ket_dat_lai_mk`): mật
+   khẩu lúc đăng ký **không còn đăng nhập được**.
+4. Bấm **"Cấp link đặt lại mật khẩu"** và gửi link **qua Zalo CHỈ tới SĐT trên hồ sơ CRM**. Link dùng
+   một lần, hạn 30 phút. Khách đặt mật khẩu mới rồi đăng nhập bằng SĐT hoặc mã VG.
+5. Không gửi link tới số khác, không đọc link qua điện thoại.
+
 ## Ghi nhận
 Mọi lần duyệt/từ chối/cấp link đều ghi audit ở cả CRM và VIP ID (`tenant_id='khach'`).

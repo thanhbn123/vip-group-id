@@ -100,6 +100,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     try:
         _dung_lai_customer_accounts(conn)
         _them_cot(conn, "customer_accounts", "phone_verified_method", "TEXT")
+        # §16: 'ho_so_cu' = tài khoản đậu ở cho_duyet vì CRM báo trùng hồ sơ cũ (chờ nhân viên Liên kết).
+        _them_cot(conn, "customer_accounts", "tu_dong_loai", "TEXT")
         _chuyen_cho_xac_minh_email(conn)
     except Exception as exc:  # noqa: BLE001 - lỗi realm khách không được làm sập realm nhân viên
         KHACH_LOI = str(exc)[:500]

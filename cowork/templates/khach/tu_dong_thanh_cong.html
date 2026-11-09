@@ -1,0 +1,15 @@
+{% extends "khach/base.html" %}
+{% block content %}
+<p class="kh-eyebrow">Đăng ký hoàn tất</p>
+<h1>Tạo tài khoản thành công</h1>
+<div class="kh-ma" role="status">
+  <span>Mã khách hàng</span>
+  <b>{{ acc.portal_code }}</b>
+</div>
+<p>Chào {{ acc.display_name }}, tài khoản cổng khách hàng VIP GROUP của bạn đã sẵn sàng. Lần sau, đăng nhập bằng số điện thoại hoặc mã <b>{{ acc.portal_code }}</b> và mật khẩu vừa đặt.</p>
+<form method="post" action="{{ url_nhan_phien }}" class="kh-form">
+  <input type="hidden" name="t" value="{{ handoff }}">
+  <button class="kh-btn" type="submit">Vào cổng khách hàng</button>
+</form>
+<p class="kh-muted kh-nho">Nút trên dùng được một lần trong 1 phút. Quá hạn, bạn chỉ cần <a href="{{ URL_DANGNHAP }}/tai-khoan/dang-nhap?u={{ acc.portal_code|urlencode }}">đăng nhập</a>.</p>
+{% endblock %}

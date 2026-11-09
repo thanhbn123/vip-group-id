@@ -280,6 +280,32 @@ def cmd_khach_dat_lai_moc(args) -> int:
     return 0
 
 
+def cmd_khach_doi_soat(args) -> int:
+    """Ops §16: hỏi lại CRM bằng subject đã lưu; CRM báo kich_hoat ⇒ tạo/liên kết tài khoản VIP ID.
+    Mã thoát: 0 đã tạo/đã liên kết · 1 trùng/không có dữ liệu · 2 tham số sai · 3 CRM bận."""
+    from . import khach
+    db.init_db()
+    if args.tao_moi:
+        print(khach.CANH_BAO_TAO_MOI)
+        if not args.yes:
+            try:
+                tra_loi = input("Gõ TAO MOI để tiếp tục: ")
+            except EOFError:
+                tra_loi = ""
+            if tra_loi.strip() != "TAO MOI":
+                print("Đã huỷ, không gọi CRM.")
+                return 1
+    conn = db.connect()
+    try:
+        rc, msg = khach.doi_soat_tu_dong(conn, args.ai, sdt=args.sdt, ten=args.ten,
+                                         email=args.email, tao_moi=args.tao_moi,
+                                         actor=f"cli:{os.environ.get('USER', 'ops')}")
+    finally:
+        conn.close()
+    print(msg)
+    return rc
+
+
 def cmd_khach_pilot(args) -> int:
     """Quản lý danh sách SĐT pilot (tệp COWORK_KHACH_PILOT_FILE; SĐT trong env chỉ liệt kê)."""
     from . import khach
@@ -380,6 +406,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Ops: đặt lại mốc thời gian thu hồi/launch của một khách về hiện tại")
     s.add_argument("ai", help="SĐT, mã khách VG… hoặc subject cust:…")
     s.set_defaults(func=cmd_khach_dat_lai_moc)
+
+    s = sub.add_parser("khach-doi-soat",
+                       help="Ops §16: đối soát đăng ký tự kích hoạt với CRM (tạo/liên kết tài khoản)")
+    s.add_argument("ai", help="SĐT (dùng đăng ký chờ đã lưu) hoặc subject cust:kh_…")
+    s.add_argument("--sdt", help="SĐT khi chỉ có subject (không còn đăng ký chờ)")
+    s.add_argument("--ten", help="Họ tên khi chỉ có subject")
+    s.add_argument("--email", help="Email (tuỳ chọn) khi chỉ có subject")
+    s.add_argument("--tao-moi", action="store_true",
+                   help="Cho phép gọi CRM khi KHÔNG có lượt đăng ký dở (có thể TẠO khách mới ở CRM)")
+    s.add_argument("--yes", action="store_true", help="Bỏ hỏi xác nhận của --tao-moi (chạy script)")
+    s.set_defaults(func=cmd_khach_doi_soat)
     return p
 
 

@@ -45,3 +45,10 @@ p{margin:0 0 12px}
 .kh-info dd{margin:0}
 .kh-break{word-break:break-all}
 @media (max-width:380px){.kh-info{grid-template-columns:1fr}.kh-info dd{margin-bottom:6px}}
+/* §16 — đăng ký tự kích hoạt */
+.kh-ma{display:flex;flex-direction:column;align-items:center;gap:2px;margin:16px 0;padding:16px;border:1px dashed var(--red);border-radius:12px;background:#fff5f6}
+.kh-ma span{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.kh-ma b{font-size:clamp(28px,8vw,36px);letter-spacing:.04em;color:var(--red)}
+.kh-actions{display:flex;flex-direction:column;gap:10px;margin:18px 0 6px}
+.kh-nho{font-size:14px}
+.kh-nowrap{white-space:nowrap}

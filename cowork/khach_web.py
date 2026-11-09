@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
@@ -67,7 +68,8 @@ class KhachHostDispatch:
 _DANGKY_DUONG = {"/", "/tai-khoan/dang-ky", "/tai-khoan/cho-duyet"}
 _DANGNHAP_DUONG = {"/", "/tai-khoan", "/tai-khoan/", "/tai-khoan/dang-nhap", "/tai-khoan/dang-xuat",
                    "/tai-khoan/ho-so", "/tai-khoan/doi-mat-khau", "/tai-khoan/quen-mat-khau",
-                   "/tai-khoan/dat-lai", "/tai-khoan/vao-cong", "/tai-khoan/cho-duyet"}
+                   "/tai-khoan/dat-lai", "/tai-khoan/vao-cong", "/tai-khoan/cho-duyet",
+                   "/tai-khoan/nhan-phien"}
 
 
 def duoc_phuc_vu(vai: str | None, path: str) -> bool:
@@ -133,14 +135,18 @@ async def _sai_host(scope, receive, send):
                             headers={"Cache-Control": "no-store"})(scope, receive, send)
 
 
-def _crm_origin() -> str:
+def _origin(url: str) -> str:
     try:
-        p = urlsplit(config.CRM_PORTAL_PUBLIC_URL)
+        p = urlsplit(url)
         if p.scheme in ("http", "https") and p.netloc:
             return f"{p.scheme}://{p.netloc}"
     except ValueError:
         pass
     return ""
+
+
+def _crm_origin() -> str:
+    return _origin(config.CRM_PORTAL_PUBLIC_URL)
 
 
 class KhachHeaders(BaseHTTPMiddleware):
@@ -160,9 +166,20 @@ class KhachHeaders(BaseHTTPMiddleware):
             del h["x-khach-turnstile"]
         script = f"script-src {TURNSTILE_ORIGIN}; frame-src {TURNSTILE_ORIGIN}; " if tt else \
             "script-src 'none'; frame-src 'none'; "
+        # §16: chỉ trang "tạo tài khoản thành công" (host dangky) được POST sang host dangnhap.
+        form_dn = h.get("x-khach-form-dangnhap") == "1"
+        if "x-khach-form-dangnhap" in h:
+            del h["x-khach-form-dangnhap"]
+        if form_dn:
+            # Trang thành công POST chéo origin sang dangnhap: với 'same-origin' Chromium gửi
+            # Origin: null ⇒ /nhan-phien từ chối. Riêng trang này dùng strict-origin-when-cross-origin
+            # để trình duyệt gửi Origin thật của dangky (chỉ origin, không path — token nằm trong body).
+            h["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        dn = _origin(khach.url_dangnhap()) if form_dn else ""
+        dich = " ".join(x for x in (dn, crm) if x)
         h["Content-Security-Policy"] = (
             "default-src 'none'; img-src 'self' data:; style-src 'self'; " + script +
-            f"font-src 'self'; connect-src 'none'; form-action 'self'{(' ' + crm) if crm else ''}; "
+            f"font-src 'self'; connect-src 'none'; form-action 'self'{(' ' + dich) if dich else ''}; "
             "frame-ancestors 'none'; base-uri 'none'; object-src 'none'")
         h["Cache-Control"] = "no-store"
         if auth.la_https(request):
@@ -410,7 +427,8 @@ def _form_dang_ky(request: Request, status: int = 200, **ctx) -> Response:
     tt = khach.turnstile_bat()
     resp = _render(request, "dang_ky.html", status, page_title="Đăng ký tài khoản",
                    thu_thach=tt, turnstile_site_key=config.KHACH_TURNSTILE_SITE_KEY,
-                   turnstile_action=khach.TURNSTILE_ACTION_DANG_KY, **ctx)
+                   turnstile_action=khach.TURNSTILE_ACTION_DANG_KY,
+                   tu_dong=khach.tu_dong_bat(), **ctx)
     if tt:
         resp.headers["x-khach-turnstile"] = "1"
     return resp
@@ -440,8 +458,112 @@ async def dang_ky(request: Request, ho_ten: str = Form(""), sdt: str = Form(""),
                                      loi="Bạn đã thử quá nhiều lần. Vui lòng đợi 1 phút rồi thử lại.")
             return _form_dang_ky(request, 400, form=form,
                                  loi="Vui lòng xác nhận bạn không phải máy rồi gửi lại.")
+    if khach.tu_dong_bat():
+        return await _dang_ky_tu_dong(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y)
     return await _chay_kdf(request, _dang_ky, request, ho_ten, sdt, email, mat_khau,
                            mat_khau_2, dong_y)
+
+
+# ------------------------------------------------------------------ §16 tự kích hoạt
+# Lời gọi CRM đồng bộ chạy trong executor RIÊNG (không chiếm luồng băm mật khẩu hay threadpool
+# mặc định). Bộ đếm là số LUỒNG thật đang chạy/chờ (giảm khi luồng xong, kể cả sau khi request đã
+# hết hạn chờ) ⇒ luồng treo không tích tụ quá trần; vượt trần ⇒ báo bận ngay, không xếp hàng.
+_crm_dk_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="khach-crm-dk")
+CRM_DK_DONG_THOI_TOI_DA = 16
+_crm_dk_dang_goi = 0
+_crm_dk_khoa = threading.Lock()
+
+
+def _crm_dk_xong(_fut) -> None:
+    global _crm_dk_dang_goi
+    with _crm_dk_khoa:
+        _crm_dk_dang_goi -= 1
+
+
+async def _goi_crm_dang_ky(pb: dict) -> dict:
+    global _crm_dk_dang_goi
+    with _crm_dk_khoa:
+        if _crm_dk_dang_goi >= CRM_DK_DONG_THOI_TOI_DA:
+            return {"kq": "ban", "ly_do": "quá nhiều lời gọi CRM đồng thời", "co_the": False}
+        _crm_dk_dang_goi += 1
+    fut = _crm_dk_pool.submit(khach.goi_crm_tu_dong, pb)
+    fut.add_done_callback(_crm_dk_xong)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(fut), config.KHACH_TU_DONG_TIMEOUT)
+    except asyncio.TimeoutError:
+        # Yêu cầu có thể đã tới CRM và được xử lý ⇒ "có thể mồ côi" (đăng ký chờ giữ subject).
+        return {"kq": "ban", "ly_do": f"quá hạn {config.KHACH_TU_DONG_TIMEOUT}s", "co_the": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"kq": "ban", "ly_do": type(exc).__name__, "co_the": True}
+
+
+def _tu_dong_chuan_bi(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y):
+    form = {"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]}
+    conn = db.connect()
+    try:
+        return khach.tu_dong_chuan_bi(conn, ho_ten=ho_ten, sdt=sdt, email=email,
+                                      mat_khau=mat_khau[:200], mat_khau_2=mat_khau_2[:200],
+                                      dong_y=dong_y == "1", ip=_ip_khoa(request), request=request)
+    except khach.KhachPilot:
+        return _trang_pilot(request)
+    except khach.KhachLoi as e:
+        return _form_dang_ky(request, e.status, loi=e.message, form=form)
+    finally:
+        conn.close()
+
+
+def _tu_dong_luu(request, pb: dict, crm: dict) -> dict:
+    conn = db.connect()
+    try:
+        return khach.tu_dong_luu(conn, pb, crm, request)
+    finally:
+        conn.close()
+
+
+def _trang_trung(request: Request, loai: str) -> Response:
+    """'tai_khoan_cong' ⇒ đã được đăng ký; 'ho_so_cu' ⇒ đã có hồ sơ, gọi/nhắn Zalo hotline."""
+    return _render(request, "tu_dong_trung.html", 409, page_title="Số điện thoại đã có",
+                   loai=loai, hotline=config.KHACH_HOTLINE)
+
+
+async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_khau_2,
+                           dong_y) -> Response:
+    """§16: kiểm trùng tại VIP ID → gọi CRM đồng bộ → chỉ `kich_hoat` mới tạo tài khoản."""
+    pb = await _chay_kdf(request, _tu_dong_chuan_bi, request, ho_ten, sdt, email, mat_khau,
+                         mat_khau_2, dong_y)
+    if isinstance(pb, Response):
+        return pb
+    if pb["kq"] == "trung_noi_bo":
+        return _trang_trung(request, "tai_khoan_cong")
+    if pb["kq"] == "ho_so_cu":  # tài khoản đã đậu chờ Liên kết, cùng người đăng ký lại
+        return _trang_trung(request, "ho_so_cu")
+    if pb["kq"] == "dang_xu_ly":  # dòng chờ của người khác (mật khẩu khác) còn hạn: không gọi CRM
+        return _form_dang_ky(request, 503, loi=khach.THONG_BAO_DANG_XU_LY,
+                             ho_tro=khach.THONG_BAO_HO_TRO.format(hotline=config.KHACH_HOTLINE),
+                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
+    crm = await _goi_crm_dang_ky(pb)
+    if crm["kq"] == "tai_khoan_cong":
+        # Đăng ký chờ cũ (đã hết hạn) có subject khác ⇒ CRM có thể đã tạo khách cho subject đó:
+        # thử lại MỘT lần bằng subject cũ (CRM idempotent ⇒ trả lại đúng kich_hoat cũ).
+        pb2 = khach.pb_subject_cu(pb)
+        if pb2:
+            crm2 = await _goi_crm_dang_ky(pb2)
+            if crm2["kq"] == "kich_hoat":
+                pb, crm = pb2, crm2
+    ket = await asyncio.to_thread(_tu_dong_luu, request, pb, crm)
+    if ket["kq"] in ("tai_khoan_cong", "ho_so_cu", "tu_choi"):
+        return _trang_trung(request, ket["kq"])
+    if ket["kq"] != "kich_hoat":
+        # Không tạo gì; đăng ký chờ (server, theo SĐT) giữ subject ⇒ thử lại từ BẤT KỲ trình duyệt
+        # nào cũng dùng lại subject đó (CRM idempotent).
+        return _form_dang_ky(request, 503, loi=khach.THONG_BAO_BAN,
+                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
+    acc = ket["acc"]
+    resp = _render(request, "tu_dong_thanh_cong.html", 201, page_title="Tạo tài khoản thành công",
+                   acc=acc, handoff=ket["handoff"],
+                   url_nhan_phien=khach.url_dangnhap() + "/tai-khoan/nhan-phien")
+    resp.headers["x-khach-form-dangnhap"] = "1"  # CSP form-action mở riêng host dangnhap
+    return resp
 
 
 def _dang_ky(request, ho_ten, sdt, email, mat_khau, mat_khau_2, dong_y) -> Response:
@@ -470,8 +592,10 @@ def cho_duyet(request: Request):
 
 
 @khach_app.get("/tai-khoan/dang-nhap")
-def dang_nhap_form(request: Request, tiep: str = ""):
+def dang_nhap_form(request: Request, tiep: str = "", u: str = ""):
     tiep = tiep if khach.kiem_tiep(tiep) else ""  # không hợp lệ ⇒ bỏ, về vao-cong mặc định
+    # §16: điền sẵn mã khách (chỉ mã VG hợp lệ — không đưa SĐT lên URL).
+    dien_san = khach.chuan_hoa_portal_code(u[:20]) or ""
     conn = db.connect()
     try:
         ctx = _ctx_phien(request, conn)
@@ -480,7 +604,57 @@ def dang_nhap_form(request: Request, tiep: str = ""):
     if ctx:
         return _render(request, "dang_nhap.html", page_title="Đăng nhập", tiep=tiep,
                        da_dang_nhap=ctx["account"], csrf=ctx["session"]["csrf_token"])
-    return _render(request, "dang_nhap.html", page_title="Đăng nhập", tiep=tiep)
+    return _render(request, "dang_nhap.html", page_title="Đăng nhập", tiep=tiep,
+                   dinh_danh=dien_san)
+
+
+def _nguon_handoff(request: Request) -> bool:
+    """POST chuyển phiên chỉ được đến từ trang của CHÍNH host dangky (hoặc cùng nguồn ở chế độ một
+    host): chặn trang lạ tự gửi token (login CSRF)."""
+    origin = request.headers.get("origin")
+    if origin is None:
+        return request.headers.get("sec-fetch-site") == "same-origin"
+    if origin == "null":
+        return False
+    cho_phep = {_origin(khach.url_dangky())}
+    try:
+        h = khach.chuan_hoa_host(urlsplit(origin).netloc)
+    except ValueError:
+        return False
+    if khach.vai_tro_host(request.headers.get("host")) == "tat_ca":
+        return _cung_nguon(request)
+    return origin in cho_phep and khach.vai_tro_host(h) == "dangky"
+
+
+def _nhan_phien(request: Request, t: str) -> Response:
+    conn = db.connect()
+    try:
+        acc = khach.tieu_handoff(conn, t)
+        if acc and not khach.pilot_cho_phep(acc["phone_e164"]):
+            return _trang_pilot(request)
+        if not acc:
+            return _render(request, "thong_bao.html", 400, page_title="Liên kết đã hết hạn",
+                           tieu_de="Liên kết vào cổng đã hết hạn hoặc đã được dùng",
+                           noi_dung="Tài khoản của bạn đã được tạo. Vui lòng đăng nhập bằng số điện "
+                                    "thoại hoặc mã khách hàng và mật khẩu vừa đặt.",
+                           link_dang_nhap=True)
+        sess, token = khach.tao_phien(conn, acc, web.ip_cua(request), _ua(request))
+        resp = _sang_crm(conn, request, acc, sess["id"])
+    finally:
+        conn.close()
+    _dat_cookie_phien(resp, request, token, acc)
+    return resp
+
+
+@khach_app.post("/tai-khoan/nhan-phien")
+async def nhan_phien(request: Request, t: str = Form("")):
+    """§16: nhận token chuyển phiên (POST từ trang thành công trên dangky) ⇒ tạo phiên dangnhap rồi
+    launch thẳng vào cổng khách hàng."""
+    if not khach.tu_dong_bat():
+        raise StarletteHTTPException(status_code=404)
+    if not _nguon_handoff(request):
+        return _loi_csrf(request)
+    return await asyncio.to_thread(_nhan_phien, request, t[:200])
 
 
 @khach_app.post("/tai-khoan/dang-nhap")
