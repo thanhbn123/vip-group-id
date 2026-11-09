@@ -539,6 +539,7 @@ async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_k
         return _trang_trung(request, "ho_so_cu")
     if pb["kq"] == "dang_xu_ly":  # dòng chờ của người khác (mật khẩu khác) còn hạn: không gọi CRM
         return _form_dang_ky(request, 503, loi=khach.THONG_BAO_DANG_XU_LY,
+                             ho_tro=khach.THONG_BAO_HO_TRO.format(hotline=config.KHACH_HOTLINE),
                              form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
     crm = await _goi_crm_dang_ky(pb)
     if crm["kq"] == "tai_khoan_cong":

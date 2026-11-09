@@ -954,6 +954,8 @@ PATH_TU_DONG = "/api/internal/portal/dang-ky-tu-dong"
 THONG_BAO_BAN = "Hệ thống đang bận, vui lòng thử lại sau ít phút."
 THONG_BAO_DANG_XU_LY = ("Hệ thống đang xử lý đăng ký trước đó cho số này, vui lòng thử lại sau "
                         "ít phút.")
+#: Dòng hotline đi kèm trang 'đang xử lý' (R12-2).
+THONG_BAO_HO_TRO = "Cần hỗ trợ, vui lòng gọi hoặc nhắn Zalo {hotline}."
 _CRM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 #: CRM từ chối dứt khoát subject: mã lỗi → hậu tố sự kiện audit.
 MA_TU_CHOI_CRM = {"SIGNUP_REJECTED": "signup_rejected", "SUBJECT_HAS_USER": "subject_has_user"}
@@ -2014,12 +2016,22 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
         if acc["status"] != "cho_duyet":
             return 409, {"ma": "XUNG_DOT", "thongBao": f"Trạng thái {acc['status']} không duyệt được."}
         now = db.now_iso()
+        # §16 R12-1: tài khoản đậu vì trùng HỒ SƠ CŨ do người đăng ký tự đặt mật khẩu — người đó chưa
+        # chắc là chủ hồ sơ. Khi nhân viên Liên kết: kích hoạt nhưng THAY mật khẩu bằng giá trị ngẫu
+        # nhiên không ai biết + tăng token_version (cookie thiết bị/phiên cũ vô hiệu). Khách đặt mật
+        # khẩu qua link do nhân viên cấp (tao-link-dat-lai), gửi Zalo tới SĐT TRÊN HỒ SƠ CRM.
+        ho_so_cu = acc.get("tu_dong_loai") == "ho_so_cu"
+        doi_mk = bam_mk(security.token_moi(32)) if ho_so_cu else None
         try:
             conn.execute(
                 "UPDATE customer_accounts SET status='hoat_dong', phone_verified_at=?, "
                 "phone_verified_by=?, phone_verified_method='duyet_crm', crm_customer_id=?, "
                 "customer_code=?, portal_code=?, updated_at=? WHERE id=? AND status='cho_duyet'",
                 (now, nguoi, crm_id, cust_code, code, now, acc["id"]))
+            if doi_mk:
+                conn.execute("UPDATE customer_accounts SET password_hash=?, password_salt=?, "
+                             "password_algo=?, token_version=token_version+1 WHERE id=?",
+                             (*doi_mk, acc["id"]))
             conn.commit()
         except sqlite3.IntegrityError:
             conn.rollback()
@@ -2027,6 +2039,11 @@ def ket_qua_duyet(conn, data: dict, request=None) -> tuple[int, dict]:
         _ghi_audit(conn, "crm", "khach.duyet", target_id=subject,
                    detail={"crm_customer_id": crm_id, "portal_code": code,
                            "phone_verified_by": nguoi, "method": "duyet_crm"}, request=request)
+        if ho_so_cu:
+            n = thu_hoi_moi_phien(conn, acc["id"], "Liên kết hồ sơ cũ: đặt lại mật khẩu")
+            _ghi_audit(conn, "crm", "khach.ho_so_cu.lien_ket_dat_lai_mk", target_id=subject,
+                       detail={"phien_thu_hoi": n, "portal_code": code}, request=request)
+            return 200, {"subject": subject, "status": "hoat_dong", "can_link_dat_lai": True}
         gui_email(conn, acc["id"], acc["email_norm"], "kich_hoat_xong",
                   "VIP GROUP — Tài khoản cổng khách hàng đã được kích hoạt",
                   f"Chào {acc['display_name']},\n\nTài khoản của bạn đã được kích hoạt.\n"

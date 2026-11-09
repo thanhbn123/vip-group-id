@@ -359,6 +359,7 @@ duyệt giữ nguyên từng chi tiết. Tắt cờ là rollback, không đổi 
 | `CRM_PORTAL_INTERNAL_URL` | Đích nội bộ CRM (vd `http://crm:3000` trong mạng docker). Production + cờ bật ⇒ **bắt buộc đặt tường minh** |
 | `COWORK_KHACH_TU_DONG_TIMEOUT` | Hạn chót tổng mỗi lời gọi CRM, giây (mặc định và tối đa 5) |
 | `COWORK_KHACH_HANDOFF_TTL` | Hạn token chuyển phiên dangky → dangnhap, giây (10–60, mặc định 60) |
+| `COWORK_KHACH_TU_DONG_CHO_GIO` | TTL trượt của đăng ký chờ phía server, giờ (mặc định 2) |
 
 **Chặn khởi động khi cờ bật:** `CRM_PORTAL_INTERNAL_URL` phải là https, hoặc http CHỈ tới đích nội bộ
 (cùng quy tắc với CRM `lib/internal-url.js`: tên dịch vụ docker một nhãn, `localhost`/`*.localhost`,
@@ -384,12 +385,14 @@ giới hạn theo IP và trần toàn hệ thống (không đổi):
      `phone_verified_method='tu_dong'`, audit `khach.dang_ky.tu_dong` ⇒ trang **"Tạo tài khoản thành
      công · Mã khách hàng VGxxxx"** (201) với nút **Vào cổng khách hàng**.
    - `trung/tai_khoan_cong` ⇒ như bước 1, không tạo tài khoản.
-   - `trung/ho_so_cu` ⇒ "Số này đã có hồ sơ khách hàng tại VIP GROUP. Vui lòng gọi hoặc nhắn Zalo
-     0961 102 655…" + [Dùng số khác]. **VIP ID đậu tài khoản `cho_duyet`** (`tu_dong_loai='ho_so_cu'`)
+   - `trung/ho_so_cu` ⇒ "Số này đã có hồ sơ tại VIP GROUP. Vui lòng gọi hoặc nhắn Zalo 0961 102 655:
+     nhân viên xác minh và gửi link đặt mật khẩu tới số điện thoại trên hồ sơ." + [Dùng số khác]. **VIP ID đậu tài khoản `cho_duyet`** (`tu_dong_loai='ho_so_cu'`)
      gắn ĐÚNG subject vừa gửi CRM, với mật khẩu/SĐT/họ tên/email khách nhập (CRM đã giữ dòng
      `portal_signups` cho subject đó; VIP ID không gửi signup cũ). Owner Q1: nhân viên xác minh rồi bấm
-     **Liên kết** ⇒ CRM gửi `ket-qua-duyet` approved ⇒ đường duyệt có sẵn kích hoạt; rejected ⇒ giải
-     phóng SĐT. Đăng nhập trước khi Liên kết ⇒ trang "chờ duyệt" có sẵn. Đăng ký lại cùng SĐT khi đang
+     **Liên kết** ⇒ CRM gửi `ket-qua-duyet` approved ⇒ kích hoạt **và thay mật khẩu bằng giá trị ngẫu
+     nhiên + tăng `token_version`** (R12-1: người đăng ký chưa chắc là chủ hồ sơ; mật khẩu lúc đăng ký
+     hết dùng được; audit `khach.ho_so_cu.lien_ket_dat_lai_mk`); nhân viên cấp link đặt lại và gửi Zalo
+     CHỈ tới SĐT trên hồ sơ CRM (xem `docs/KHACH-DUYET-CHECKLIST.md`). Rejected ⇒ giải phóng SĐT. Đăng nhập trước khi Liên kết ⇒ trang "chờ duyệt" có sẵn. Đăng ký lại cùng SĐT khi đang
      đậu: cùng mật khẩu ⇒ lại trang hồ sơ cũ; mật khẩu khác ⇒ trang "đang xử lý" chung (không chiếm,
      không gọi CRM, không đổi tài khoản).
    - HTTP ≠ 200 (503 `AUTO_APPROVE_OFF`, 401 chữ ký, 409 phát lại…), quá hạn, lỗi mạng, JSON sai, hình
@@ -400,11 +403,12 @@ giới hạn theo IP và trần toàn hệ thống (không đổi):
 **Đăng ký chờ phía server (chống khoá khách ra ngoài — review vòng 10 P1).** Trước khi gọi CRM,
 VIP ID ghi `customer_tu_dong_cho` khoá theo **SĐT đã chuẩn hoá** (một giao dịch ghi): subject, họ tên,
 email, băm mật khẩu của lần thử mới nhất, `attempts`, `last_attempt`, `expires_at` (TTL trượt
-`COWORK_KHACH_TU_DONG_CHO_GIO`, mặc định 24 giờ).
+`COWORK_KHACH_TU_DONG_CHO_GIO`, mặc định **2 giờ**).
 - **Chỉ cùng người mới dùng lại subject** (vòng 11 P2-1): còn hạn **và** mật khẩu lần thử khớp băm đã
   lưu ⇒ lần thử lại (mọi trình duyệt) dùng **lại subject** ⇒ CRM idempotent trả lại đúng `kich_hoat`
   cũ dù lần trước CRM đã commit nhưng trả lời sau hạn chót 5 s. Mật khẩu **khác** trong lúc dòng còn
-  hạn ⇒ "Hệ thống đang xử lý đăng ký trước đó cho số này, vui lòng thử lại sau ít phút" (503): không
+  hạn ⇒ "Hệ thống đang xử lý đăng ký trước đó cho số này, vui lòng thử lại sau ít phút" + dòng
+  "Cần hỗ trợ, vui lòng gọi hoặc nhắn Zalo 0961 102 655." (503): không
   gọi CRM, không tạo gì, không đổi dòng (audit `khach.dang_ky.tu_dong.dang_xu_ly`, lấy mẫu) — người
   khác không thừa hưởng hồ sơ CRM của người trước.
 - Hết hạn ⇒ subject mới. Subject cũ giữ ở `acc_id_cu` **chỉ khi khớp mật khẩu**; CRM trả

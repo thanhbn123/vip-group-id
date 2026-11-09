@@ -327,8 +327,10 @@ def test_crm_ho_so_cu_dau_cho_duyet_roi_lien_ket(td, crm_td):
     crm_td.che_do = "ho_so_cu"
     r = dk(dkc, 7)
     assert r.status_code == 409
-    assert "Số này đã có hồ sơ khách hàng tại VIP GROUP" in r.text
-    assert "0961 102 655" in r.text and "Dùng số khác" in r.text
+    assert "Số này đã có hồ sơ tại VIP GROUP" in r.text
+    assert ("Vui lòng gọi hoặc nhắn Zalo <b class=\"kh-nowrap\">0961 102 655</b>: nhân viên xác minh "
+            "và gửi link đặt mật khẩu tới số điện thoại trên hồ sơ.") in r.text
+    assert "Dùng số khác" in r.text
     assert "quen-mat-khau" not in r.text
     csp = _csp_sach(r)
     assert DN not in csp and r.headers["referrer-policy"] == "same-origin"
@@ -349,7 +351,7 @@ def test_crm_ho_so_cu_dau_cho_duyet_roi_lien_ket(td, crm_td):
     # Đăng ký lại: cùng mật khẩu ⇒ lại trang hồ sơ cũ; mật khẩu khác ⇒ 'đang xử lý'. Không gọi CRM.
     n = len(crm_td.goi)
     r = dk(KC(DK), 7)
-    assert r.status_code == 409 and "đã có hồ sơ khách hàng" in r.text
+    assert r.status_code == 409 and "Số này đã có hồ sơ tại VIP GROUP" in r.text
     ke = KC(DK)
     r = ke.post("/tai-khoan/dang-ky", data=_form(ke, 7, mat_khau=MK_KHAC, mat_khau_2=MK_KHAC),
                 follow_redirects=False)
@@ -357,12 +359,60 @@ def test_crm_ho_so_cu_dau_cho_duyet_roi_lien_ket(td, crm_td):
     assert len(crm_td.goi) == n
     a2 = acc_theo_sdt("+84900000007")
     assert a2["password_hash"] == acc["password_hash"] and a2["phone_conflict_count"] == 0
-    # Nhân viên Liên kết ⇒ CRM gửi ket-qua-duyet(approved) cho đúng subject.
+    # Nhân viên Liên kết ⇒ CRM gửi ket-qua-duyet(approved) cho đúng subject ⇒ kích hoạt, NHƯNG mật
+    # khẩu người đăng ký tự đặt bị thay (R12-1) + token_version tăng.
     r = duyet(dnc, acc["subject"], 7)
     assert r.status_code == 200, r.text
+    assert r.json()["data"]["can_link_dat_lai"] is True
     a3 = acc_theo_sdt("+84900000007")
     assert a3["status"] == "hoat_dong" and a3["phone_verified_method"] == "duyet_crm"
-    token_launch(dang_nhap(KC(DN), "0900000007"))
+    assert a3["password_hash"] != acc["password_hash"]
+    assert a3["token_version"] == acc["token_version"] + 1
+    assert len(_audit("khach.ho_so_cu.lien_ket_dat_lai_mk")) == 1
+    r = dang_nhap(KC(DN), "0900000007")
+    assert r.status_code == 401  # mật khẩu lúc đăng ký không còn dùng được
+    # Duyệt lại (CRM gửi lại) idempotent: không đổi mật khẩu lần nữa.
+    assert duyet(dnc, acc["subject"], 7).json()["data"]["idempotent"] is True
+    assert acc_theo_sdt("+84900000007")["password_hash"] == a3["password_hash"]
+    # Nhân viên cấp link đặt lại (gửi Zalo tới SĐT trên hồ sơ) ⇒ khách đặt mật khẩu ⇒ đăng nhập.
+    _dat_mk_qua_link(dnc, acc["subject"])
+    token_launch(dang_nhap(KC(DN), "0900000007", MK_MOI_HSC))
+
+
+MK_MOI_HSC = "HoSoCu!Passw0rd-42"
+
+
+def _dat_mk_qua_link(dnc, subject: str) -> None:
+    from test_khach_p1 import link_dat_lai
+    t = link_dat_lai(dnc, subject)
+    c = KC(DN)
+    r = c.post("/tai-khoan/dat-lai", data={
+        "t": t, "mat_khau": MK_MOI_HSC, "mat_khau_2": MK_MOI_HSC,
+        "_csrf": csrf_tu(c.get("/tai-khoan/dat-lai?t=" + t).text)}, follow_redirects=False)
+    assert r.status_code == 200 and "Đã đặt mật khẩu mới" in r.text, r.text[:300]
+
+
+def test_ho_so_cu_lien_ket_thu_hoi_thiet_bi_va_phien(td, crm_td):
+    """Cookie thiết bị tin cậy (gắn token_version) cũ không còn hợp lệ sau Liên kết."""
+    dkc, dnc = td
+    crm_td.che_do = "ho_so_cu"
+    dk(dkc, 7)
+    acc = acc_theo_sdt("+84900000007")
+    tb = khach.tao_thiet_bi(acc)
+    assert khach.thiet_bi_hop_le(tb, acc)
+    assert duyet(dnc, acc["subject"], 7).status_code == 200
+    assert not khach.thiet_bi_hop_le(tb, acc_theo_sdt("+84900000007"))
+
+
+def test_duyet_thuong_khong_doi_mat_khau(hai_host, crm_td):
+    """Luồng chờ duyệt cũ (không phải ho_so_cu) giữ nguyên mật khẩu khách khi được duyệt."""
+    dkc, dnc = hai_host
+    assert dk(dkc, 1).status_code == 303
+    acc = acc_theo_sdt("+84900000001")
+    r = duyet(dnc, acc["subject"], 1)
+    assert "can_link_dat_lai" not in r.json()["data"]
+    assert _audit("khach.ho_so_cu.lien_ket_dat_lai_mk") == []
+    token_launch(dang_nhap(dnc, "0900000001"))
 
 
 def test_crm_ho_so_cu_tu_choi_giai_phong_sdt(td, crm_td):
@@ -559,6 +609,7 @@ def test_nguoi_khac_cung_sdt_khong_thua_huong_ho_so_crm(td, crm_td, monkeypatch)
     r = ke.post("/tai-khoan/dang-ky", data=_form(ke, 1, ho_ten="Kẻ Lạ", mat_khau=MK_KHAC,
                                                  mat_khau_2=MK_KHAC), follow_redirects=False)
     assert r.status_code == 503 and khach.THONG_BAO_DANG_XU_LY in r.text
+    assert "Cần hỗ trợ, vui lòng gọi hoặc nhắn Zalo 0961 102 655." in r.text
     _csp_sach(r)
     assert len(crm_td.goi) == n and _so_tk() == 0  # không gọi CRM, không tạo
     assert _cho()["display_name"] == "Khách Tự Động 1" and _cho()["attempts"] == 1  # không đổi dòng
@@ -963,7 +1014,9 @@ def test_mock_crm_ho_so_cu_lien_ket_dang_nhap(td, mock_crm):
     assert acc["status"] == "cho_duyet"
     assert dang_nhap(dnc, "0900000007").headers["location"] == "/tai-khoan/cho-duyet"
     assert duyet(dnc, acc["subject"], 7).status_code == 200
-    token_launch(dang_nhap(KC(DN), "0900000007"))
+    assert dang_nhap(KC(DN), "0900000007").status_code == 401  # mật khẩu đăng ký bị thay
+    _dat_mk_qua_link(dnc, acc["subject"])
+    token_launch(dang_nhap(KC(DN), "0900000007", MK_MOI_HSC))
 
 
 def test_mock_crm_409(td, mock_crm, monkeypatch):
@@ -972,3 +1025,14 @@ def test_mock_crm_409(td, mock_crm, monkeypatch):
         r = dk(KC(DK), n)
         assert r.status_code == 409 and "Không thể tạo tài khoản tự động" in r.text, n
     assert _so_tk() == 0
+
+
+def test_ttl_dang_ky_cho_mac_dinh_hai_gio():
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k != "COWORK_KHACH_TU_DONG_CHO_GIO"}
+    out = subprocess.run([sys.executable, "-c", "from cowork import config; "
+                          "print(config.KHACH_TU_DONG_CHO_GIO)"], env=env, capture_output=True,
+                         text=True, cwd=str(Path(__file__).resolve().parent.parent))
+    assert out.stdout.strip() == "2", out.stderr[-300:]
