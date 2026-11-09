@@ -1,6 +1,13 @@
 {% extends "khach/base.html" %}
 {% block content %}
-{% if loai == "ho_so_cu" %}
+{% if loai == "tu_choi" %}
+<p class="kh-eyebrow">Cần hỗ trợ</p>
+<h1>Không thể tạo tài khoản tự động cho số này</h1>
+<p>Vui lòng gọi hoặc nhắn Zalo <b class="kh-nowrap">{{ hotline }}</b>.</p>
+<div class="kh-actions">
+  <a class="kh-btn" href="{{ URL_DANGKY }}/tai-khoan/dang-ky">Dùng số khác</a>
+</div>
+{% elif loai == "ho_so_cu" %}
 <p class="kh-eyebrow">Đã có hồ sơ</p>
 <h1>Số này đã có hồ sơ khách hàng tại VIP GROUP</h1>
 <p>Vui lòng gọi hoặc nhắn Zalo <b class="kh-nowrap">{{ hotline }}</b> để được kích hoạt tài khoản.</p>

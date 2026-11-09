@@ -285,10 +285,20 @@ def cmd_khach_doi_soat(args) -> int:
     Mã thoát: 0 đã tạo/đã liên kết · 1 trùng/không có dữ liệu · 2 tham số sai · 3 CRM bận."""
     from . import khach
     db.init_db()
+    if args.tao_moi:
+        print(khach.CANH_BAO_TAO_MOI)
+        if not args.yes:
+            try:
+                tra_loi = input("Gõ TAO MOI để tiếp tục: ")
+            except EOFError:
+                tra_loi = ""
+            if tra_loi.strip() != "TAO MOI":
+                print("Đã huỷ, không gọi CRM.")
+                return 1
     conn = db.connect()
     try:
         rc, msg = khach.doi_soat_tu_dong(conn, args.ai, sdt=args.sdt, ten=args.ten,
-                                         email=args.email,
+                                         email=args.email, tao_moi=args.tao_moi,
                                          actor=f"cli:{os.environ.get('USER', 'ops')}")
     finally:
         conn.close()
@@ -403,6 +413,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sdt", help="SĐT khi chỉ có subject (không còn đăng ký chờ)")
     s.add_argument("--ten", help="Họ tên khi chỉ có subject")
     s.add_argument("--email", help="Email (tuỳ chọn) khi chỉ có subject")
+    s.add_argument("--tao-moi", action="store_true",
+                   help="Cho phép gọi CRM khi KHÔNG có lượt đăng ký dở (có thể TẠO khách mới ở CRM)")
+    s.add_argument("--yes", action="store_true", help="Bỏ hỏi xác nhận của --tao-moi (chạy script)")
     s.set_defaults(func=cmd_khach_doi_soat)
     return p
 

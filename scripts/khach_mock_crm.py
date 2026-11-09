@@ -5,6 +5,7 @@
 - POST /api/internal/portal/dang-ky-tu-dong (§16): HMAC như trên; hành vi TẤT ĐỊNH cho dev/test:
     * SĐT kết thúc 7 ⇒ {trang_thai:'trung', loai:'ho_so_cu'} (hồ sơ cũ chưa có tài khoản cổng);
     * SĐT kết thúc 6 ⇒ 503 AUTO_APPROVE_OFF (mô phỏng CRM tắt cờ/bận);
+    * SĐT kết thúc 5 ⇒ 409 SIGNUP_REJECTED; kết thúc 4 ⇒ 409 SUBJECT_HAS_USER (như CRM 5e04abe);
     * SĐT đã được cấp tài khoản cổng (trong bộ nhớ) ⇒ {trang_thai:'trung', loai:'tai_khoan_cong'};
     * còn lại ⇒ {trang_thai:'kich_hoat', crm_customer_id, portal_code: VG1001, VG1002…};
     * idempotent theo subject (gọi lại trả đúng kết quả cũ); khoá chung ⇒ đồng thời cùng SĐT chỉ
@@ -50,13 +51,18 @@ HOST_NHAN: list[str] = []
 
 
 def dang_ky_tu_dong(b: dict) -> tuple[int, dict]:
+    # Lỗi theo đúng hình dạng CRM: {error:{code, message, details}}.
     if os.environ.get("MOCK_AUTO_APPROVE", "1") == "0":
-        return 503, {"ok": False, "error": {"code": "AUTO_APPROVE_OFF"}}
+        return 503, {"error": {"code": "AUTO_APPROVE_OFF", "message": "tắt"}}
     sub, ph = b.get("subject"), b.get("phone_e164")
     if not isinstance(sub, str) or not sub.startswith("cust:") or not isinstance(ph, str):
-        return 422, {"ok": False, "error": {"code": "INVALID"}}
+        return 422, {"error": {"code": "SIGNUP_INVALID", "message": "sai"}}
     if ph.endswith("6"):
-        return 503, {"ok": False, "error": {"code": "AUTO_APPROVE_OFF"}}
+        return 503, {"error": {"code": "AUTO_APPROVE_OFF", "message": "tắt"}}
+    if ph.endswith("5"):
+        return 409, {"error": {"code": "SIGNUP_REJECTED", "message": "đã bị từ chối"}}
+    if ph.endswith("4"):
+        return 409, {"error": {"code": "SUBJECT_HAS_USER", "message": "gắn user khác"}}
     with TU_DONG_KHOA:
         if sub in TU_DONG_THEO_SUBJECT:
             return 200, {"ok": True, "data": TU_DONG_THEO_SUBJECT[sub]}

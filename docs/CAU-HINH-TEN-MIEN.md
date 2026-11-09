@@ -394,35 +394,47 @@ giới hạn theo IP và trần toàn hệ thống (không đổi):
 VIP ID ghi `customer_tu_dong_cho` khoá theo **SĐT đã chuẩn hoá** (một giao dịch ghi): subject, họ tên,
 email, băm mật khẩu của lần thử mới nhất, `attempts`, `last_attempt`, `expires_at` (TTL trượt
 `COWORK_KHACH_TU_DONG_CHO_GIO`, mặc định 24 giờ).
-- Còn hạn ⇒ **mọi** lần thử lại cho SĐT đó (mọi trình duyệt) dùng **lại subject** ⇒ CRM idempotent theo
-  subject trả lại đúng `kich_hoat` cũ dù lần trước CRM đã commit nhưng trả lời sau hạn chót 5 s. Không
-  thêm rủi ro: owner đã chấp nhận việc đăng ký bằng SĐT của người khác (Q3).
-- Hết hạn ⇒ subject mới; subject cũ giữ ở `acc_id_cu`. CRM trả `trung/tai_khoan_cong` cho subject mới
-  ⇒ VIP ID thử lại **một lần** bằng subject cũ; CRM trả `kich_hoat` ⇒ kích hoạt bằng subject cũ.
-- Xoá dòng khi thành công hoặc trùng dứt khoát (`tai_khoan_cong`/`ho_so_cu`). Dòng không ai đụng tới
-  quá 30 × TTL bị dọn (subject vẫn còn trong audit).
-- Thử lại với họ tên/email/mật khẩu khác: VIP ID lưu giá trị của **lần gọi thành công** (ý định hiện
-  tại). CRM (idempotent) có thể vẫn giữ họ tên/email của lần đầu — lệch này được chấp nhận; hồ sơ CRM
-  là nguồn đúng về họ tên, nhân viên sửa ở CRM.
+- **Chỉ cùng người mới dùng lại subject** (vòng 11 P2-1): còn hạn **và** mật khẩu lần thử khớp băm đã
+  lưu ⇒ lần thử lại (mọi trình duyệt) dùng **lại subject** ⇒ CRM idempotent trả lại đúng `kich_hoat`
+  cũ dù lần trước CRM đã commit nhưng trả lời sau hạn chót 5 s. Mật khẩu **khác** trong lúc dòng còn
+  hạn ⇒ "Hệ thống đang xử lý đăng ký trước đó cho số này, vui lòng thử lại sau ít phút" (503): không
+  gọi CRM, không tạo gì, không đổi dòng (audit `khach.dang_ky.tu_dong.dang_xu_ly`, lấy mẫu) — người
+  khác không thừa hưởng hồ sơ CRM của người trước.
+- Hết hạn ⇒ subject mới. Subject cũ giữ ở `acc_id_cu` **chỉ khi khớp mật khẩu**; CRM trả
+  `trung/tai_khoan_cong` cho subject mới ⇒ thử lại **một lần** bằng subject cũ; `kich_hoat` ⇒ kích hoạt.
+- Xoá dòng khi thành công hoặc kết quả dứt khoát (`tai_khoan_cong`/`ho_so_cu`/409 CRM bên dưới). Dòng
+  không ai thử lại quá **2 × TTL** bị xoá (subject vẫn còn trong audit).
+- Thử lại (cùng mật khẩu) với họ tên/email khác: VIP ID lưu giá trị của **lần gọi thành công**. CRM
+  (idempotent) có thể vẫn giữ họ tên/email của lần đầu — lệch này được chấp nhận; hồ sơ CRM là nguồn
+  đúng về họ tên, nhân viên sửa ở CRM.
+
+**CRM từ chối dứt khoát (CRM 5e04abe).** HTTP 409 `{error:{code, message, details}}` với
+`code='SIGNUP_REJECTED'` (đăng ký của subject đã bị nhân viên từ chối) hoặc `'SUBJECT_HAS_USER'`
+(subject gắn với user CRM không phải khách) ⇒ không tạo tài khoản, xoá đăng ký chờ (lần sau subject
+mới), audit `khach.dang_ky.tu_dong.signup_rejected` / `…subject_has_user`, trang "Không thể tạo tài
+khoản tự động cho số này. Vui lòng gọi hoặc nhắn Zalo 0961 102 655." + [Dùng số khác]. Mọi 409 khác
+(vd `PHAT_LAI`) vẫn là "bận". CRM giả: SĐT đuôi 5 ⇒ `SIGNUP_REJECTED`, đuôi 4 ⇒ `SUBJECT_HAS_USER`.
 
 **Phân loại lỗi CRM (audit).**
 - `khach.dang_ky.tu_dong.co_the_mo_coi` (KHÔNG lấy mẫu, kèm subject + `phoneSha256`): CRM **có thể**
   đã tạo khách — quá hạn chót, quá hạn đọc, đứt kết nối sau khi gửi, 5xx khác 503, 200 sai hình dạng.
 - `khach.dang_ky.tu_dong.crm_loi` (lấy mẫu 1 dòng/phút): CRM chắc chắn chưa tạo — không kết nối được,
-  4xx (401 chữ ký, 409 phát lại…), 503 `AUTO_APPROVE_OFF`.
+  4xx (401 chữ ký, 409 phát lại…) trừ hai mã 409 dứt khoát ở trên, 503 `AUTO_APPROVE_OFF`.
 - `khach.dang_ky.tu_dong.mo_coi`: CRM trả `kich_hoat` mà VIP ID không lưu được (mã VG/crm id đã thuộc
   tài khoản khác, DB lỗi sau một lần thử lại, hoặc SĐT vừa được subject KHÁC giành). Lượt song song
   cùng subject (nhờ đăng ký chờ) không bị ghi mồ côi.
 
-**Đối soát (ops):** `python -m cowork.cli khach-doi-soat <SĐT|cust:kh_…> [--sdt … --ten … --email …]`
-- Hỏi lại CRM bằng **cùng endpoint, subject đã lưu** (CRM idempotent). CRM báo `kich_hoat` ⇒ tạo tài
-  khoản `hoat_dong` (`phone_verified_by=cli:<user>`, audit `khach.ops.doi_soat_tu_dong`) với mật khẩu
-  khách đã đặt ở lần thử cuối. In kết quả.
-- Theo subject (lấy từ audit `co_the_mo_coi`) khi không còn đăng ký chờ: cần `--sdt` và `--ten`; tài
-  khoản tạo với mật khẩu ngẫu nhiên ⇒ nhân viên cấp link đặt lại (đường hotline/Zalo hiện có). Lưu ý:
-  nếu CRM chưa từng thấy subject đó, lời gọi sẽ **tạo** khách ở CRM (hoàn tất đăng ký thay khách).
-- Mã thoát: 0 đã tạo / đã liên kết (chạy lại an toàn) · 1 trùng hoặc không có dữ liệu · 2 tham số sai ·
-  3 CRM bận. SĐT đã thuộc tài khoản VIP ID có subject khác ⇒ không đổi gì.
+**Đối soát (ops):** `python -m cowork.cli khach-doi-soat <SĐT|cust:kh_…> [--tao-moi [--yes] --sdt … --ten … --email …]`
+- Có lượt đăng ký dở (dòng chờ, theo SĐT hoặc subject) ⇒ hỏi lại CRM bằng **cùng endpoint, subject đã
+  lưu** (CRM idempotent). `kich_hoat` ⇒ tạo tài khoản `hoat_dong` (`phone_verified_by=cli:<user>`,
+  audit `khach.ops.doi_soat_tu_dong`) với mật khẩu khách đã đặt. In kết quả.
+- **Không có lượt dở** ⇒ mặc định CHỈ TRA CỨU: rc 1 "Không có lượt đăng ký dở", **không gọi CRM**.
+  Endpoint CRM không có chế độ chỉ-tra-cứu, nên muốn gọi với một subject trần (lấy từ audit
+  `co_the_mo_coi`) phải thêm `--tao-moi --sdt … --ten …`; CLI in CẢNH BÁO (nếu CRM chưa có subject
+  này sẽ TẠO khách mới) và đòi gõ `TAO MOI` (hoặc `--yes` khi chạy script). Tài khoản tạo với mật khẩu
+  ngẫu nhiên ⇒ nhân viên cấp link đặt lại (đường hotline/Zalo hiện có).
+- Mã thoát: 0 đã tạo / đã liên kết (chạy lại an toàn) · 1 trùng, CRM từ chối, không có lượt dở hoặc
+  huỷ xác nhận · 2 tham số sai · 3 CRM bận. SĐT đã thuộc tài khoản VIP ID có subject khác ⇒ không đổi gì.
 
 **Giới hạn luồng gọi CRM.** Mỗi pha httpx (connect/write/read/pool) ≤ `COWORK_KHACH_TU_DONG_TIMEOUT`
 (≤ 5 s) **và** hạn chót tổng: thân phản hồi đọc dạng luồng, quá hạn tổng hoặc quá 16 KB ⇒ dừng (CRM

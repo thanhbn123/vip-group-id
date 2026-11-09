@@ -460,16 +460,94 @@ def test_verifier_crm_ghi_roi_tra_loi_sau_han_chot_thu_lai_trinh_duyet_khac(td, 
     assert json.loads(_audit("khach.dang_ky.tu_dong.co_the_mo_coi")[0]["detail"])
     time.sleep(0.7)
     crm.tre_sau_commit = 0.0
-    moi = KC(DK)  # trình duyệt khác, mật khẩu khác (ý định hiện tại)
-    r = moi.post("/tai-khoan/dang-ky", data=_form(moi, 1, mat_khau="Moi!Passw0rd-777",
-                                                  mat_khau_2="Moi!Passw0rd-777"),
+    moi = KC(DK)  # trình duyệt khác, CÙNG mật khẩu (cùng người), họ tên mới
+    r = moi.post("/tai-khoan/dang-ky", data=_form(moi, 1, ho_ten="Tên Mới Sửa"),
                  follow_redirects=False)
     assert r.status_code == 201 and "VG1001" in r.text
     assert crm_td.goi[-1]["body"]["subject"] == s1
     acc = acc_theo_sdt("+84900000001")
     assert acc["subject"] == s1 and acc["crm_customer_id"] == "crm-that-1001"
+    assert acc["display_name"] == "Tên Mới Sửa"  # giá trị của lần gọi thành công
     assert _cho() is None  # thành công ⇒ xoá đăng ký chờ
-    token_launch(dang_nhap(dnc, "0900000001", "Moi!Passw0rd-777"))  # mật khẩu của lần thành công
+    token_launch(dang_nhap(dnc, "0900000001"))
+
+
+MK_KHAC = "Ke!La-Passw0rd-999"
+
+
+def test_nguoi_khac_cung_sdt_khong_thua_huong_ho_so_crm(td, crm_td, monkeypatch):
+    """Vòng 11 P2-1: nạn nhân quá hạn chờ (CRM đã tạo khách) ⇒ kẻ khác cùng SĐT, mật khẩu khác, trong
+    TTL ⇒ trang 'đang xử lý' (không gọi CRM, không tạo gì); nạn nhân thử lại bằng mật khẩu của mình ⇒
+    kích hoạt."""
+    dkc, dnc = td
+    monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.5)
+    crm = CrmThat()
+    crm.tre_sau_commit = 1.0
+    crm_td.che_do = crm
+    assert dk(dkc, 1).status_code == 503
+    time.sleep(0.7)
+    crm.tre_sau_commit = 0.0
+    n = len(crm_td.goi)
+    ke = KC(DK)
+    r = ke.post("/tai-khoan/dang-ky", data=_form(ke, 1, ho_ten="Kẻ Lạ", mat_khau=MK_KHAC,
+                                                 mat_khau_2=MK_KHAC), follow_redirects=False)
+    assert r.status_code == 503 and khach.THONG_BAO_DANG_XU_LY in r.text
+    _csp_sach(r)
+    assert len(crm_td.goi) == n and _so_tk() == 0  # không gọi CRM, không tạo
+    assert _cho()["display_name"] == "Khách Tự Động 1" and _cho()["attempts"] == 1  # không đổi dòng
+    assert _audit("khach.dang_ky.tu_dong.dang_xu_ly")
+    assert dang_nhap(dnc, "0900000001", MK_KHAC).status_code == 401
+    r = dk(KC(DK), 1)  # nạn nhân, mật khẩu của mình, trình duyệt khác
+    assert r.status_code == 201
+    token_launch(dang_nhap(dnc, "0900000001"))
+
+
+def test_het_han_nguoi_khac_khong_dung_subject_cu(td, crm_td, monkeypatch):
+    """Hết TTL: người khác (mật khẩu khác) dùng subject MỚI và KHÔNG được dự phòng subject cũ."""
+    dkc, _ = td
+    monkeypatch.setattr(config, "KHACH_TU_DONG_TIMEOUT", 0.5)
+    crm = CrmThat()
+    crm.tre_sau_commit = 1.0
+    crm_td.che_do = crm
+    assert dk(dkc, 1).status_code == 503
+    s1 = crm_td.goi[0]["body"]["subject"]
+    time.sleep(0.7)
+    crm.tre_sau_commit = 0.0
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE customer_tu_dong_cho SET expires_at='2000-01-01T00:00:00+07:00'")
+        conn.commit()
+    finally:
+        conn.close()
+    ke = KC(DK)
+    r = ke.post("/tai-khoan/dang-ky", data=_form(ke, 1, mat_khau=MK_KHAC, mat_khau_2=MK_KHAC),
+                follow_redirects=False)
+    assert r.status_code == 409 and "đã được đăng ký" in r.text  # CRM: SĐT thuộc s1
+    assert all(g["body"]["subject"] != s1 for g in crm_td.goi[1:])  # không thử s1
+    assert _so_tk() == 0
+
+
+def test_don_dang_ky_cho_sau_hai_lan_ttl(td, crm_td):
+    dkc, _ = td
+    crm_td.che_do = _tra(503, b"{}")
+    dk(dkc, 1)
+    dk(dkc, 2)
+    conn = db.connect()
+    try:
+        gio = config.KHACH_TU_DONG_CHO_GIO
+        tu = (khach._bay_gio() - khach.timedelta(hours=2 * gio, minutes=1)).isoformat()
+        ngay = (khach._bay_gio() - khach.timedelta(hours=2 * gio - 1)).isoformat()
+        conn.execute("UPDATE customer_tu_dong_cho SET last_attempt=?, expires_at=? "
+                     "WHERE phone_e164='+84900000001'", (tu, tu))
+        conn.execute("UPDATE customer_tu_dong_cho SET last_attempt=?, expires_at=? "
+                     "WHERE phone_e164='+84900000002'", (ngay, ngay))
+        conn.commit()
+    finally:
+        conn.close()
+    dk(dkc, 3)  # lần ghi kế tiếp dọn dòng quá 2 × TTL
+    assert _cho("+84900000001") is None
+    assert _cho("+84900000002") is not None  # mới quá 1 × TTL: giữ (dự phòng subject cũ)
+    assert khach.CHO_DON_SAU_TTL == 2
 
 
 def test_dang_ky_cho_het_han_subject_moi_va_du_phong_subject_cu(td, crm_td, monkeypatch):
@@ -564,22 +642,34 @@ def test_cli_doi_soat_theo_sdt_tao_tai_khoan_mat_khau_cua_khach(td, crm_td, monk
     assert rc == 0 and "Đã liên kết" in out  # chạy lại: idempotent
 
 
-def test_cli_doi_soat_theo_subject_khong_con_dang_ky_cho(td, crm_td):
+def test_cli_doi_soat_theo_subject_khong_con_dang_ky_cho(td, crm_td, monkeypatch):
     dkc, dnc = td
     crm = CrmThat()
     crm_td.che_do = crm
     sub = "cust:kh_" + "a" * 26
     crm({"subject": sub, "phone_e164": "+84900000002"})  # CRM đã có khách cho subject này
-    assert _cli(sub)[0] == 2  # thiếu --sdt/--ten
-    assert _cli("cust:sai")[0] == 2
+    n = len(crm_td.goi)
+    rc, out = _cli(sub)  # mặc định chỉ tra cứu: không gọi CRM
+    assert rc == 1 and "không có lượt đăng ký dở" in out.lower() and len(crm_td.goi) == n
     rc, out = _cli(sub, "--sdt", "0900000002", "--ten", "Khách Đối Soát")
+    assert rc == 1 and len(crm_td.goi) == n and _so_tk() == 0  # thiếu --tao-moi
+    assert _cli("cust:sai")[0] == 2
+    assert _cli(sub, "--tao-moi", "--yes")[0] == 2  # thiếu --sdt/--ten
+    # --tao-moi không --yes: hỏi xác nhận; trả lời sai ⇒ huỷ, không gọi CRM.
+    monkeypatch.setattr("builtins.input", lambda _p="": "khong")
+    rc, out = _cli(sub, "--tao-moi", "--sdt", "0900000002", "--ten", "Khách Đối Soát")
+    assert rc == 1 and "CẢNH BÁO" in out and "Đã huỷ" in out and len(crm_td.goi) == n
+    monkeypatch.setattr("builtins.input", lambda _p="": "TAO MOI")
+    rc, out = _cli(sub, "--tao-moi", "--sdt", "0900000002", "--ten", "Khách Đối Soát")
     assert rc == 0 and "Mật khẩu ngẫu nhiên" in out
     acc = acc_theo_sdt("+84900000002")
     assert acc["subject"] == sub and acc["portal_code"] == "VG1001"
     assert dang_nhap(dnc, "0900000002").status_code == 401  # không ai biết mật khẩu
     # Subject khác cho SĐT đã có tài khoản ⇒ không đổi gì.
-    rc, out = _cli("cust:kh_" + "b" * 26, "--sdt", "0900000002", "--ten", "X Y")
+    rc, out = _cli("cust:kh_" + "b" * 26, "--tao-moi", "--yes", "--sdt", "0900000002",
+                   "--ten", "X Y")
     assert rc == 1 and "tài khoản VIP ID khác" in out
+    assert "lượt đăng ký dở" in _cli("0900000008")[1]  # SĐT không có lượt dở ⇒ rc 1
 
 
 def test_cli_doi_soat_crm_bao_trung_hoac_ban(td, crm_td):
@@ -590,6 +680,11 @@ def test_cli_doi_soat_crm_bao_trung_hoac_ban(td, crm_td):
     crm_td.che_do = "tai_khoan_cong"
     rc, out = _cli("0900000001")
     assert rc == 1 and "trùng" in out and _so_tk() == 0
+    crm_td.che_do = _tra(503, b"{}")
+    dk(dkc, 1)  # lượt dở mới (lượt trước đã bị xoá vì trùng dứt khoát)
+    crm_td.che_do = _tra(409, b'{"error":{"code":"SIGNUP_REJECTED","message":"x"}}')
+    rc, out = _cli("0900000001")
+    assert rc == 1 and "từ chối dứt khoát" in out and _so_tk() == 0 and _cho() is None
 
 
 # ------------------------------------------------------------------ hạn chót tổng của HTTP
@@ -761,3 +856,39 @@ def test_kiem_cau_hinh_tu_dong(hai_host, monkeypatch, tmp_path):
     assert khach._loi_cau_hinh_tu_dong() == []
     monkeypatch.setattr(config, "KHACH_TU_DONG", False)
     monkeypatch.setattr(config, "ENV", "test")
+
+
+# ------------------------------------------------------------------ CRM 409 từ chối dứt khoát
+@pytest.mark.parametrize("ma,su_kien", [("SIGNUP_REJECTED", "signup_rejected"),
+                                        ("SUBJECT_HAS_USER", "subject_has_user")])
+def test_crm_409_tu_choi_dut_khoat(td, crm_td, ma, su_kien):
+    dkc, _ = td
+    crm_td.che_do = _tra(503, b"{}")
+    dk(dkc, 1)
+    s1 = _cho()["acc_id"]
+    body = json.dumps({"error": {"code": ma, "message": "x", "details": None}}).encode()
+    crm_td.che_do = _tra(409, body)
+    r = dk(dkc, 1)
+    assert r.status_code == 409
+    assert "Không thể tạo tài khoản tự động cho số này" in r.text and "0961 102 655" in r.text
+    _csp_sach(r)
+    assert _so_tk() == 0 and _cho() is None  # xoá đăng ký chờ
+    assert len(_audit("khach.dang_ky.tu_dong." + su_kien)) == 1
+    assert _audit(CL)[1:] == [] and _audit(MC) == []  # chỉ lần 503 trước đó; 409 không coi là bận
+    crm_td.che_do = "kich_hoat"
+    assert dk(dkc, 1).status_code == 201
+    assert crm_td.goi[-1]["body"]["subject"] != "cust:" + s1  # lần sau dùng subject mới
+
+
+def test_crm_409_khac_van_la_ban(td, crm_td):
+    dkc, _ = td
+    crm_td.che_do = _tra(409, b'{"error":{"code":"PHAT_LAI","message":"x"}}')
+    assert dk(dkc, 1).status_code == 503 and _cho() is not None
+
+
+def test_mock_crm_409(td, mock_crm, monkeypatch):
+    monkeypatch.setattr(config, "KHACH_SIGNUP_IP_PER_HOUR", 50)
+    for n in (5, 4):
+        r = dk(KC(DK), n)
+        assert r.status_code == 409 and "Không thể tạo tài khoản tự động" in r.text, n
+    assert _so_tk() == 0

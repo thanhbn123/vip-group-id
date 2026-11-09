@@ -530,6 +530,9 @@ async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_k
         return pb
     if pb["kq"] == "trung_noi_bo":
         return _trang_trung(request, "tai_khoan_cong")
+    if pb["kq"] == "dang_xu_ly":  # dòng chờ của người khác (mật khẩu khác) còn hạn: không gọi CRM
+        return _form_dang_ky(request, 503, loi=khach.THONG_BAO_DANG_XU_LY,
+                             form={"ho_ten": ho_ten[:100], "sdt": sdt[:30], "email": email[:254]})
     crm = await _goi_crm_dang_ky(pb)
     if crm["kq"] == "tai_khoan_cong":
         # Đăng ký chờ cũ (đã hết hạn) có subject khác ⇒ CRM có thể đã tạo khách cho subject đó:
@@ -540,7 +543,7 @@ async def _dang_ky_tu_dong(request: Request, ho_ten, sdt, email, mat_khau, mat_k
             if crm2["kq"] == "kich_hoat":
                 pb, crm = pb2, crm2
     ket = await asyncio.to_thread(_tu_dong_luu, request, pb, crm)
-    if ket["kq"] in ("tai_khoan_cong", "ho_so_cu"):
+    if ket["kq"] in ("tai_khoan_cong", "ho_so_cu", "tu_choi"):
         return _trang_trung(request, ket["kq"])
     if ket["kq"] != "kich_hoat":
         # Không tạo gì; đăng ký chờ (server, theo SĐT) giữ subject ⇒ thử lại từ BẤT KỲ trình duyệt
